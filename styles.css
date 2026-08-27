@@ -23,4 +23,26 @@
 .team-core-destructive-button:hover { filter: brightness(1.08); }
 .team-core-update-notes { margin-top: .4em; color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .team-core-update-actions { display: flex; justify-content: flex-end; gap: .5em; margin-top: .7em; }
-@media (max-width: 600px) { .team-core-summary-grid { grid-template-columns: 1fr; } .team-core-history-view { padding: .75em; } }
+.team-core-settings .setting-item:not(.setting-item-heading) { align-items: center; gap: 1rem; }
+.team-core-settings .setting-item:not(.setting-item-heading) > .setting-item-info { min-width: 10rem; }
+.team-core-settings .setting-item:not(.setting-item-heading) > .setting-item-control { flex: 0 1 36rem; width: min(58%, 36rem); }
+.team-core-settings .setting-item-control input[type="text"],
+.team-core-settings .setting-item-control input[type="password"],
+.team-core-settings .setting-item-control input[type="number"] { width: 100%; min-width: 0; max-width: none; }
+.team-core-settings .team-core-config-transfer > .setting-item-control { display: grid; grid-template-columns: minmax(12rem, 1fr) auto auto; gap: .5rem; flex-basis: 46rem; width: min(72%, 46rem); max-width: 46rem; }
+.team-core-config-input { grid-column: 1; }
+.team-core-config-action { white-space: nowrap; }
+@media (max-width: 720px) {
+  .team-core-settings .setting-item:not(.setting-item-heading) { align-items: stretch; flex-direction: column; gap: .55rem; }
+  .team-core-settings .setting-item:not(.setting-item-heading) > .setting-item-control,
+  .team-core-settings .team-core-config-transfer > .setting-item-control { flex-basis: auto; width: 100%; max-width: none; }
+}
+@media (max-width: 520px) {
+  .team-core-settings .team-core-config-transfer > .setting-item-control { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .team-core-config-input { grid-column: 1 / -1; }
+  .team-core-config-action { width: 100%; }
+}
+@media (max-width: 600px) {
+  .team-core-summary-grid { grid-template-columns: 1fr; }
+  .team-core-history-view { padding: .75em; }
+}

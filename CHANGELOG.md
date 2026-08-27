@@ -2,6 +2,11 @@
 
 All notable changes to Oldeng Team Core are documented in this file.
 
+## 0.1.6 - 2026-08-28
+
+- Reworked quick configuration import/export into one aligned responsive row.
+- Widened and aligned settings inputs across Git, S3, and synchronization sections.
+
 ## 0.1.5 - 2026-08-28
 
 - Fixed remote attachment restoration when a new Vault uses the same Git username as the original uploader.

@@ -129,6 +129,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass("team-core-settings");
     new Setting(containerEl).setName("Git").setHeading();
     this.text("Git 远端 URL", "gitUrl", false);
     this.text("个人 username", "gitUsername", false);
@@ -144,16 +145,19 @@ export class TeamCoreSettingTab extends PluginSettingTab {
       .setDesc("发现新版本后请通过 Obsidian 社区插件功能更新")
       .addButton((button) => button.setButtonText("检查更新").onClick(() => void this.teamPlugin.checkForPluginUpdate(true)));
     new Setting(containerEl).setName("快速导入 / 导出").setHeading();
-    const textarea = containerEl.createEl("textarea", { placeholder: "粘贴配置字符串" });
-    textarea.rows = 4;
-    const importButton = containerEl.createEl("button", { text: "导入配置" });
+    const transfer = new Setting(containerEl).setName("配置字符串").setClass("team-core-config-transfer");
+    const configInput = transfer.controlEl.createEl("input", { type: "text", placeholder: "粘贴配置字符串", cls: "team-core-config-input" });
+    configInput.setAttr("aria-label", "配置字符串");
+    const importButton = transfer.controlEl.createEl("button", { text: "导入配置", cls: "team-core-config-action" });
+    importButton.type = "button";
     importButton.addEventListener("click", () => {
       try {
-        this.teamPlugin.teamCoreSettings = importSettings(textarea.value, this.teamPlugin.teamCoreSettings);
+        this.teamPlugin.teamCoreSettings = importSettings(configInput.value, this.teamPlugin.teamCoreSettings);
         void this.teamPlugin.saveSettings().then(() => { new Notice("配置已导入"); this.display(); });
       } catch (error) { new Notice(error instanceof Error ? error.message : "配置导入失败"); }
     });
-    const exportButton = containerEl.createEl("button", { text: "复制导出字符串" });
+    const exportButton = transfer.controlEl.createEl("button", { text: "复制导出字符串", cls: "team-core-config-action" });
+    exportButton.type = "button";
     exportButton.addEventListener("click", () => void navigator.clipboard.writeText(exportSettings(this.teamPlugin.teamCoreSettings)).then(() => new Notice("配置字符串已复制")));
   }
 
