@@ -35,6 +35,14 @@ interface AttachmentPlan {
   requiresUpload: boolean;
 }
 
+export function shouldMaterializeRemoteAttachment(previous: AssetManifestEntry | undefined, current: AssetManifestEntry, localFileExists: boolean): boolean {
+  return !localFileExists || !previous || previous.sha256 !== current.sha256 || previous.size !== current.size;
+}
+
+export function shouldProtectMismatchedLocalAttachment(localFileExists: boolean, uploadedBy: string, username: string): boolean {
+  return localFileExists && uploadedBy === username;
+}
+
 export class SyncCoordinator {
   private state: SyncState = "uninitialized";
   private pendingFiles = new Set<string>();
@@ -515,7 +523,8 @@ export class SyncCoordinator {
   private async materializeRemoteAttachments(before: AssetManifest, after: AssetManifest): Promise<void> {
     const entries = Object.entries(after.files).filter(([path, entry]) => {
       const previous = before.files[path];
-      return !previous || previous.sha256 !== entry.sha256 || previous.size !== entry.size;
+      const localFileExists = this.app.vault.getAbstractFileByPath(path) instanceof TFile;
+      return shouldMaterializeRemoteAttachment(previous, entry, localFileExists);
     });
     if (!entries.length) return;
     const vault = createVaultAdapter(this.app.vault.adapter);
@@ -531,7 +540,7 @@ export class SyncCoordinator {
         this.advanceProgress(path);
         continue;
       }
-      if (entry.uploadedBy === username) {
+      if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, username)) {
         this.logger.warn("Local attachment differs from same-user manifest entry", { path });
         this.advanceProgress(path);
         continue;

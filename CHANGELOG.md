@@ -2,6 +2,11 @@
 
 All notable changes to Oldeng Team Core are documented in this file.
 
+## 0.1.5 - 2026-08-28
+
+- Fixed remote attachment restoration when a new Vault uses the same Git username as the original uploader.
+- Retried unchanged manifest entries whose local attachment files are still missing without rehashing existing attachments.
+
 ## 0.1.4 - 2026-08-27
 
 - Renamed the public and user-visible plugin name to Oldeng Team Core.

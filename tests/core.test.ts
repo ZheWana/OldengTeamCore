@@ -7,6 +7,7 @@ import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
 import { GitRepository, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
+import { shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
@@ -234,6 +235,27 @@ describe("S3 transport", () => {
   it("does not repeat a bucket already present in a virtual-hosted endpoint", () => {
     const transport = new S3Transport(settings({ s3Endpoint: "https://team-kb.s3.example.test/" }), { debug() {}, warn() {}, error() {} });
     expect(transport.objectUrl("a".repeat(64))).toBe("https://team-kb.s3.example.test/vault/sha256/" + "a".repeat(64));
+  });
+});
+
+describe("remote attachment materialization", () => {
+  const entry = {
+    sha256: "a".repeat(64),
+    size: 10,
+    mime: "image/png",
+    uploadedAt: "2026-08-28T00:00:00.000Z",
+    uploadedBy: "wangzhe"
+  };
+
+  it("retries an unchanged manifest entry when the local attachment is missing", () => {
+    expect(shouldMaterializeRemoteAttachment(entry, entry, false)).toBe(true);
+    expect(shouldMaterializeRemoteAttachment(entry, entry, true)).toBe(false);
+  });
+
+  it("downloads a missing same-user attachment but protects an existing mismatched file", () => {
+    expect(shouldProtectMismatchedLocalAttachment(false, "wangzhe", "wangzhe")).toBe(false);
+    expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "wangzhe")).toBe(true);
+    expect(shouldProtectMismatchedLocalAttachment(true, "other-user", "wangzhe")).toBe(false);
   });
 });
 
