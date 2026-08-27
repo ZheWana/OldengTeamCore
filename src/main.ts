@@ -79,7 +79,7 @@ export default class TeamCorePlugin extends Plugin {
       if (compareVersions(index.latest.version, current) > 0) {
         this.showUpdateNotice(index.latest, current, manual);
       } else if (manual) {
-        new Notice(`Team Core 已是最新版本（${current}）`);
+        new Notice(`Oldeng Team Core 已是最新版本（${current}）`);
       }
     } catch (error) {
       this.logger.warn("Plugin update check failed", error);
@@ -92,7 +92,7 @@ export default class TeamCorePlugin extends Plugin {
     this.notifiedVersion = release.version;
     const fragment = createFragment();
     const message = fragment.createDiv();
-    message.setText(`Team Core 有新版本：${current} → ${release.version}`);
+    message.setText(`Oldeng Team Core 有新版本：${current} → ${release.version}`);
     if (release.notes.trim()) {
       const notes = fragment.createDiv();
       notes.addClass("team-core-update-notes");
@@ -115,7 +115,7 @@ export default class TeamCorePlugin extends Plugin {
     const progress = snapshot.progress;
     const progressLabel = progress && progress.total > 0 ? `${progress.phase} ${progress.current}/${progress.total}` : progress?.phase;
     const progressText = progressLabel ? ` · ${progressLabel}` : "";
-    this.statusText.setText(`Team Core：${state}${progressText}${author}`);
+    this.statusText.setText(`Oldeng Team Core：${state}${progressText}${author}`);
     if (progress && progress.total > 0) {
       this.statusProgress.max = progress.total;
       this.statusProgress.value = progress.current;
@@ -180,7 +180,7 @@ export default class TeamCorePlugin extends Plugin {
     new ClearRemoteConfirmationModal(this.app, this.teamCoreSettings, async () => {
       const result = await this.coordinator.clearRemoteData();
       const git = result.deletedGitBranch ? "远端 Git main 已删除" : "远端 Git main 原本为空";
-      new Notice(`测试数据已清空：${git}，删除 ${result.deletedS3Objects} 个 Team Core 附件对象。本地笔记和附件已保留。`, 10_000);
+      new Notice(`测试数据已清空：${git}，删除 ${result.deletedS3Objects} 个 Oldeng Team Core 附件对象。本地笔记和附件已保留。`, 10_000);
     }).open();
   }
 
@@ -199,7 +199,7 @@ class ClearRemoteConfirmationModal extends Modal {
   onOpen(): void {
     this.titleEl.setText("确认清空远端测试数据");
     this.contentEl.empty();
-    this.contentEl.createEl("p", { text: "此操作不可撤销。将删除远端 Git main，并删除当前 S3 Prefix 下由 Team Core 管理的全部附件对象。" });
+    this.contentEl.createEl("p", { text: "此操作不可撤销。将删除远端 Git main，并删除当前 S3 Prefix 下由 Oldeng Team Core 管理的全部附件对象。" });
     const targets = this.contentEl.createEl("ul", { cls: "team-core-clear-targets" });
     targets.createEl("li", { text: `Git：${safeRemoteLabel(this.settings.gitUrl)}` });
     targets.createEl("li", { text: `S3：${this.settings.s3Bucket || "未配置"}/${[this.settings.s3Prefix.replace(/^\/+|\/+$/g, ""), "sha256/"].filter(Boolean).join("/")}` });

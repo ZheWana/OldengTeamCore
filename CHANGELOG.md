@@ -1,6 +1,11 @@
 # Changelog
 
-All notable changes to Team Core are documented in this file.
+All notable changes to Oldeng Team Core are documented in this file.
+
+## 0.1.4 - 2026-08-27
+
+- Renamed the public and user-visible plugin name to Oldeng Team Core.
+- Kept the stable `team-core` plugin ID and installation path so existing settings and installations continue to work.
 
 ## 0.1.3 - 2026-08-27
 
@@ -16,4 +21,4 @@ All notable changes to Team Core are documented in this file.
 - Added synchronization progress, file history, attachment audit, and diagnostics.
 - Added the local-only `私人笔记/` folder.
 - Added release-index update reminders without self-installation.
-- Added guarded remote test cleanup for Git and Team Core-managed S3 objects.
+- Added guarded remote test cleanup for Git and Oldeng Team Core-managed S3 objects.

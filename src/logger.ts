@@ -15,14 +15,14 @@ export class PluginLogger implements Logger {
   constructor(private readonly enabled: () => boolean = () => true) {}
 
   debug(message: string, details?: unknown): void {
-    if (this.enabled()) console.debug(`[Team Core] ${message}`, redact(details));
+    if (this.enabled()) console.debug(`[Oldeng Team Core] ${message}`, redact(details));
   }
 
   warn(message: string, details?: unknown): void {
-    console.warn(`[Team Core] ${message}`, redact(details));
+    console.warn(`[Oldeng Team Core] ${message}`, redact(details));
   }
 
   error(message: string, details?: unknown): void {
-    console.error(`[Team Core] ${message}`, redact(details));
+    console.error(`[Oldeng Team Core] ${message}`, redact(details));
   }
 }

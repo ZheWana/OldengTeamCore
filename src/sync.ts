@@ -342,7 +342,7 @@ export class SyncCoordinator {
       if (this.isOffline(error)) this.setState("offline");
       else {
         this.setState("error");
-        this.callbacks.onNotice(`Team Core 同步失败：${this.lastError}`);
+        this.callbacks.onNotice(`Oldeng Team Core 同步失败：${this.lastError}`);
       }
       this.logger.error("Synchronization failed", { error: this.lastError });
     }

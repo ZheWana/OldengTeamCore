@@ -1,8 +1,8 @@
-# Team Core
+# Oldeng Team Core
 
-Team Core is a cross-platform Obsidian plugin for synchronizing a small team's Markdown knowledge base through Git while storing attachments in S3-compatible object storage.
+Oldeng Team Core is a cross-platform Obsidian plugin for synchronizing a small team's Markdown knowledge base through Git while storing attachments in S3-compatible object storage.
 
-Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown 笔记使用 Git 保留历史，附件使用兼容 S3 的对象存储，并在桌面端和移动端使用同一套插件代码。
+Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown 笔记使用 Git 保留历史，附件使用兼容 S3 的对象存储，并在桌面端和移动端使用同一套插件代码。
 
 ## Features
 
@@ -13,7 +13,7 @@ Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown 笔记使
 - Shows phase and numeric progress during synchronization.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
 - Provides explicit initialization, remote import, attachment normalization, diagnostics, and conflict states.
-- Checks the Team Core release index and reminds users when a newer version is available. Obsidian remains responsible for installing updates.
+- Checks the Oldeng Team Core release index and reminds users when a newer version is available. Obsidian remains responsible for installing updates.
 
 ## Requirements
 
@@ -26,7 +26,7 @@ Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown 笔记使
 
 ### Community plugins
 
-After Team Core is accepted into the Obsidian Community directory, install and update it from **Settings → Community plugins**.
+After Oldeng Team Core is accepted into the Obsidian Community directory, install and update it from **Settings → Community plugins**.
 
 ### Manual installation
 
@@ -36,11 +36,11 @@ Download `main.js`, `manifest.json`, and `styles.css` from the matching [GitHub 
 <Vault>/.obsidian/plugins/team-core/
 ```
 
-Restart Obsidian, then enable **Team Core** under Community plugins.
+Restart Obsidian, then enable **Oldeng Team Core** under Community plugins.
 
 ## Configuration
 
-Open **Settings → Team Core** and configure:
+Open **Settings → Oldeng Team Core** and configure:
 
 - the Git repository URL, member username, and shared Git password;
 - S3 endpoint, region, bucket, prefix, Access Key, and Secret Key;
@@ -50,26 +50,26 @@ The quick export string contains shared Git and S3 secrets. Treat it as a passwo
 
 ## Private notes
 
-Team Core automatically creates `私人笔记/`. That exact folder and all of its descendants remain local. A similarly named folder such as `私人笔记备份/` is not private and will be synchronized normally.
+Oldeng Team Core automatically creates `私人笔记/`. That exact folder and all of its descendants remain local. A similarly named folder such as `私人笔记备份/` is not private and will be synchronized normally.
 
 ## Attachment model
 
-Files under `assets/` are not committed to Git. Team Core hashes changed or explicitly normalized attachments, uploads immutable objects to the configured S3 prefix, and commits `.team/assets-manifest.json` only after each required object is available. Ordinary synchronization is incremental; use **规范化全部附件** only for initial migration or recovery after external file changes.
+Files under `assets/` are not committed to Git. Oldeng Team Core hashes changed or explicitly normalized attachments, uploads immutable objects to the configured S3 prefix, and commits `.team/assets-manifest.json` only after each required object is available. Ordinary synchronization is incremental; use **规范化全部附件** only for initial migration or recovery after external file changes.
 
 ## Network and privacy disclosure
 
-Team Core makes network requests only for its stated synchronization and update-check features:
+Oldeng Team Core makes network requests only for its stated synchronization and update-check features:
 
 - the user-configured Git Smart HTTP server receives Git authentication and Markdown repository traffic;
 - the user-configured S3-compatible service receives attachment requests signed with the configured S3 credentials;
 - `https://zhewana.cn/team-core-plugin/index.json` is requested at startup and every six hours to check the latest plugin version;
 - the GitHub Releases page opens only when the user selects **查看发布页**.
 
-Team Core does not include client-side telemetry or advertising. Credentials are stored in Obsidian's local plugin data under `.obsidian/plugins/team-core/data.json` and are never committed by Team Core. Server operators remain responsible for their Git and S3 privacy, retention, access-control, and logging policies.
+Oldeng Team Core does not include client-side telemetry or advertising. Credentials are stored in Obsidian's local plugin data under `.obsidian/plugins/team-core/data.json` and are never committed by Oldeng Team Core. Server operators remain responsible for their Git and S3 privacy, retention, access-control, and logging policies.
 
 ## Destructive test command
 
-During the current testing phase, **测试：清空远端 Git 与 S3** can delete the configured remote Git `main` ref and all Team Core-managed objects under the configured S3 `prefix/sha256/`. It requires an explicit destructive confirmation. Git and S3 deletion cannot be atomic. Use it only against test data with a verified backup.
+During the current testing phase, **测试：清空远端 Git 与 S3** can delete the configured remote Git `main` ref and all Oldeng Team Core-managed objects under the configured S3 `prefix/sha256/`. It requires an explicit destructive confirmation. Git and S3 deletion cannot be atomic. Use it only against test data with a verified backup.
 
 ## Development
 
@@ -88,7 +88,7 @@ Production output is written to `dist/`. Unit tests cover configuration, hashing
 3. Push the commit and a tag whose name exactly matches `manifest.json`, without a `v` prefix.
 4. GitHub Actions verifies and publishes `main.js`, `manifest.json`, and `styles.css` as release assets.
 
-The separate Team Core server publisher retains only the latest and immediately previous static packages for manual recovery. The plugin never installs or overwrites itself.
+The separate Oldeng Team Core server publisher retains only the latest and immediately previous static packages for manual recovery. The plugin never installs or overwrites itself.
 
 ## License
 

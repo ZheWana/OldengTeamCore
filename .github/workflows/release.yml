@@ -37,6 +37,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
-            --title "Team Core $GITHUB_REF_NAME" \
+            --title "Oldeng Team Core $GITHUB_REF_NAME" \
             --generate-notes \
             dist/main.js dist/manifest.json dist/styles.css

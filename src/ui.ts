@@ -14,7 +14,7 @@ export class TeamCoreHistoryView extends ItemView {
   }
 
   getViewType(): string { return HISTORY_VIEW_TYPE; }
-  getDisplayText(): string { return "Team Core 历史"; }
+  getDisplayText(): string { return "Oldeng Team Core 历史"; }
   getIcon(): string { return "git-commit-horizontal"; }
 
   async onOpen(): Promise<void> { await this.render(); }
@@ -31,7 +31,7 @@ export class TeamCoreHistoryView extends ItemView {
     auditButton.addEventListener("click", () => void this.renderAudit(container));
     const settings = this.getSettings();
     if (!settings.gitUrl) {
-      container.createEl("p", { text: "请先在 Team Core 设置中配置 Git 和 S3。" });
+      container.createEl("p", { text: "请先在 Oldeng Team Core 设置中配置 Git 和 S3。" });
       return;
     }
     const repo = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, consoleLogger(), this.app.vault.configDir);

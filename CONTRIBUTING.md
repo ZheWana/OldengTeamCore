@@ -15,7 +15,7 @@ Use `npm run dev` for a development bundle with an inline source map. Install th
 
 - Keep changes focused and cross-platform. Runtime code must not depend on Node.js, Electron, or a system Git executable.
 - Add or update tests for behavior changes.
-- Do not commit credentials, exported Team Core configuration strings, Vault data, or generated `dist/` files.
+- Do not commit credentials, exported Oldeng Team Core configuration strings, Vault data, or generated `dist/` files.
 - Run `npm run check` before opening a pull request.
 - Document user-visible changes in `CHANGELOG.md`.
 

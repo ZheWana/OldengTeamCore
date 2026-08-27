@@ -134,7 +134,7 @@ export class S3Transport {
   async deleteManagedObjects(keys: readonly string[], onDeleted?: (key: string) => void): Promise<void> {
     const prefix = this.managedObjectPrefix();
     for (const key of keys) {
-      if (!key.startsWith(prefix)) throw new S3PermanentError(`Refusing to delete object outside Team Core prefix: ${key}`);
+      if (!key.startsWith(prefix)) throw new S3PermanentError(`Refusing to delete object outside Oldeng Team Core prefix: ${key}`);
       const response = await this.request("DELETE", key);
       if (response.status !== 404 && (response.status < 200 || response.status >= 300)) throw await this.httpError("DELETE", key, response);
       onDeleted?.(key);
