@@ -2,6 +2,13 @@
 
 All notable changes to Team Core are documented in this file.
 
+## 0.1.3 - 2026-08-27
+
+- Prepared metadata and source for Obsidian Community directory submission.
+- Respected custom Obsidian configuration-directory names in all synchronization filters.
+- Kept update checks reminder-only to comply with Community plugin policy.
+- Updated and audited the public development toolchain.
+
 ## 0.1.2 - 2026-08-27
 
 - Added cross-platform Git and S3 knowledge-base synchronization.

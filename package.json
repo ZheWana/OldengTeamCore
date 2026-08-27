@@ -1,6 +1,6 @@
 {
   "name": "team-core",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Cross-platform Obsidian Team Core collaboration plugin",
   "main": "main.js",
   "type": "module",
