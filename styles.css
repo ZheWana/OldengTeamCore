@@ -1,0 +1,26 @@
+.team-core-status { cursor: pointer; display: inline-flex; align-items: center; gap: .35em; }
+.team-core-status-text { white-space: nowrap; }
+.team-core-status-progress { width: 4.5em; height: .7em; accent-color: var(--interactive-accent); }
+.team-core-history-view { padding: 1em 1.2em; overflow: auto; }
+.team-core-toolbar { display: flex; gap: .5em; margin-bottom: 1em; }
+.team-core-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7em; margin: 1em 0; }
+.team-core-stat { border: 1px solid var(--background-modifier-border); padding: .8em; text-align: center; }
+.team-core-stat strong, .team-core-stat span { display: block; }
+.team-core-stat strong { font-size: 1.5em; }
+.team-core-section { margin-top: 1.2em; }
+.team-core-commit-list { border-left: 2px solid var(--interactive-accent); padding-left: 1em; }
+.team-core-commit { display: flex; gap: .6em; margin: .8em 0; }
+.team-core-commit-dot { width: .55em; height: .55em; border-radius: 50%; background: var(--interactive-accent); margin-top: .35em; margin-left: -.35em; flex: 0 0 auto; }
+.team-core-commit-detail strong, .team-core-commit-detail span { display: block; }
+.team-core-commit-detail span { color: var(--text-muted); font-size: .85em; }
+.team-core-history-view table { width: 100%; border-collapse: collapse; }
+.team-core-history-view th, .team-core-history-view td { border-bottom: 1px solid var(--background-modifier-border); padding: .45em; text-align: left; vertical-align: top; }
+.team-core-clear-targets { padding-left: 1.4em; overflow-wrap: anywhere; }
+.team-core-clear-note { color: var(--text-muted); }
+.team-core-clear-status { min-height: 1.5em; color: var(--text-error); }
+.team-core-clear-actions { display: flex; justify-content: flex-end; gap: .6em; margin-top: .8em; }
+.team-core-destructive-button { background-color: var(--color-red) !important; color: white !important; }
+.team-core-destructive-button:hover { filter: brightness(1.08); }
+.team-core-update-notes { margin-top: .4em; color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.team-core-update-actions { display: flex; justify-content: flex-end; gap: .5em; margin-top: .7em; }
+@media (max-width: 600px) { .team-core-summary-grid { grid-template-columns: 1fr; } .team-core-history-view { padding: .75em; } }
