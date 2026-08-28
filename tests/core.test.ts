@@ -12,7 +12,7 @@ import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateMa
 import { S3Transport } from "../src/s3";
 import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment, shouldTrackVaultEvent } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
-import { mergeSharedPluginIds, readSharedPluginIdsFromGitignore, updateSharedPluginsInGitignore } from "../src/shared-plugins";
+import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
 import git from "isomorphic-git";
@@ -311,6 +311,22 @@ describe("manifest and vault path rules", () => {
     expect(() => updateSharedPluginsInGitignore(content, ".obsidian", ["../secret"])).toThrow();
     expect(mergeSharedPluginIds(["calendar"], ["calendar", "dataview"], ["calendar", "templater-obsidian"])).toEqual(["calendar", "dataview", "templater-obsidian"]);
     expect(mergeSharedPluginIds(["calendar"], [], ["calendar"])).toEqual([]);
+    expect(parseSharedPluginState(serializeSharedPluginState(["calendar"]))).toEqual(["calendar"]);
+    expect(mergeSharedPluginState(["calendar"], ["calendar", "dataview"], ["calendar", "templater-obsidian"])).toBe(serializeSharedPluginState(["calendar", "dataview", "templater-obsidian"]));
+  });
+
+  it("applies shared plugin enablement while preserving personal plugins", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-plugin-state-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.write(".obsidian/community-plugins.json", encode("[\"team-core\", \"personal-plugin\", \"calendar\"]"));
+      await applySharedPluginState(vault, ".obsidian", ["calendar", "dataview"], ["dataview"]);
+      expect(JSON.parse(decode(await vault.read(".obsidian/community-plugins.json")))).toEqual(["team-core", "personal-plugin", "dataview"]);
+      await writeSharedPluginState(vault, ["calendar"]);
+      expect(await readSharedPluginState(vault)).toEqual(["calendar"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("tracks S3 attachments and only whitelisted configuration paths", () => {
@@ -506,6 +522,62 @@ describe("Git repository adapter", () => {
       const history = await repo.log("notes/readme.md", 10);
       expect(history).toHaveLength(2);
       expect(history[0]).toMatchObject({ message: "Update note", author: "Alice.Example", email: "alice.example@knowledgebase.local" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not leave selected plugin files as local changes after a clean remote merge", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-plugin-merge-state-"));
+    try {
+      const vault = new NodeVault(root);
+      const sharedIds = ["calendar"];
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian", sharedIds);
+      await repo.init();
+      await repo.ensureGitignore();
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("calendar\n"));
+      await repo.commit("Base plugin");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("calendar\n"));
+      await vault.write("remote.md", encode("remote\n"));
+      const remoteCommit = await repo.commit("Remote note");
+      if (!remoteCommit) throw new Error("Expected a remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+      expect(await vault.exists(".obsidian/plugins/calendar/main.js")).toBe(true);
+      expect(await vault.exists("remote.md")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("semantically merges independent public-plugin enablement changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-plugin-state-merge-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian", ["calendar", "dataview", "templater-obsidian"]);
+      await repo.init();
+      await writeSharedPluginState(vault, ["calendar"]);
+      await repo.commit("Base plugin state");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await writeSharedPluginState(vault, ["calendar", "dataview"]);
+      const remoteCommit = await repo.commit("Remote plugin state");
+      if (!remoteCommit) throw new Error("Expected a remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await writeSharedPluginState(vault, ["calendar", "templater-obsidian"]);
+      await repo.commit("Local plugin state");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      expect(await readSharedPluginState(vault)).toEqual(["calendar", "dataview", "templater-obsidian"]);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

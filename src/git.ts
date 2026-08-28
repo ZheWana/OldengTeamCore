@@ -5,7 +5,7 @@ import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./t
 import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
 import { DEFAULT_BRANCH, MANIFEST_PATH } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
-import { isPotentialPluginPath, mergeSharedPluginIds, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
+import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
 
 const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
 const LINEBREAKS = /^.*(\r?\n|$)/gm;
@@ -157,6 +157,14 @@ function teamCoreMergeDriver(params: MergeDriverParams, configDir: string): { cl
         cleanMerge: true,
         mergedText: updateSharedPluginsInGitignore(unmanaged.mergedText, configDir, mergeSharedPluginIds(ids[0], ids[1], ids[2]))
       };
+    } catch {
+      return textMerge(params);
+    }
+  }
+  if (params.path === SHARED_PLUGIN_STATE_PATH || params.path === "shared-plugins.json") {
+    try {
+      const [base, ours, theirs] = params.contents.map(parseSharedPluginState);
+      return { cleanMerge: true, mergedText: mergeSharedPluginState(base, ours, theirs) };
     } catch {
       return textMerge(params);
     }
@@ -340,6 +348,7 @@ export class GitRepository {
     if (!gitUrl) throw new Error("Git URL is not configured");
     const personalPluginFiles = await this.snapshotPersonalPluginFiles();
     await git.clone({ ...(await this.gitOptions()), url: gitUrl, ref: DEFAULT_BRANCH, singleBranch: true, noCheckout: false });
+    await this.materializeSharedPluginFiles();
     await this.restorePersonalPluginFiles(personalPluginFiles);
   }
 
@@ -486,6 +495,13 @@ export class GitRepository {
           throw new Error(`公共插件配置格式无效：${error instanceof Error ? error.message : String(error)}`);
         }
       }
+      if (resolution.path === SHARED_PLUGIN_STATE_PATH && resolution.content !== undefined) {
+        try {
+          return { path: resolution.path, content: serializeSharedPluginState(parseSharedPluginState(resolution.content)) };
+        } catch (error) {
+          throw new Error(`公共插件启用状态格式无效：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       return { ...resolution };
     });
 
@@ -571,7 +587,16 @@ export class GitRepository {
     await writeSharedPluginIds(this.vault, this.configDir, this.sharedPluginIds);
   }
 
+  private async currentSharedPluginIds(): Promise<readonly string[]> {
+    // The ignore file is the source of truth. Re-read it before staging so a
+    // remote checkout or a settings change cannot leave a stale constructor
+    // snapshot capable of untracking shared plugin files.
+    if (await this.vault.exists(".gitignore")) return readSharedPluginIds(this.vault, this.configDir);
+    return this.sharedPluginIds;
+  }
+
   async stageManagedChanges(): Promise<string[]> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
     const matrix = await git.statusMatrix({ fs: this.fs, dir: "", filepaths: undefined });
     const changed: string[] = [];
     for (const [filepath, head, workdir, stage] of matrix as Array<[string, number, number, number]>) {
@@ -580,11 +605,13 @@ export class GitRepository {
         if (stage !== 0) await git.remove({ fs: this.fs, dir: "", filepath });
         continue;
       }
-      if (isManagedPath(filepath, this.configDir, this.sharedPluginIds) && (head !== workdir || workdir !== stage)) {
+      if (isManagedPath(filepath, this.configDir, sharedPluginIds) && (head !== workdir || workdir !== stage)) {
         changed.push(filepath);
         if (workdir === 0) await git.remove({ fs: this.fs, dir: "", filepath });
         else await git.add({ fs: this.fs, dir: "", filepath });
-      } else if (isPotentialPluginPath(filepath, this.configDir) && (head !== 0 || stage !== 0)) {
+      } else if (!isManagedPath(filepath, this.configDir, sharedPluginIds)
+        && isPotentialPluginPath(filepath, this.configDir)
+        && (head !== 0 || stage !== 0)) {
         // Removing a directory from the whitelist untracks it without deleting
         // its local files, so it becomes a personal plugin immediately.
         changed.push(filepath);
@@ -639,6 +666,7 @@ export class GitRepository {
         // merge into the working tree. Checkout makes remote notes available
         // in the Vault before attachment materialization and the next commit.
         await git.checkout({ fs: this.fs, dir: "", ref: currentBranch ?? DEFAULT_BRANCH });
+        await this.materializeSharedPluginFiles();
         await this.restorePersonalPluginFiles(personalPluginFiles);
       }
       await this.clearConflictState();
@@ -681,6 +709,25 @@ export class GitRepository {
     }
   }
 
+  private async materializeSharedPluginFiles(): Promise<void> {
+    const sharedPluginIds = await readSharedPluginIds(this.vault, this.configDir);
+    const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    if (!head) return;
+    const files = await git.listFiles({ fs: this.fs, dir: "", ref: head });
+    for (const path of files) {
+      if (!isSharedPluginPath(path, this.configDir, sharedPluginIds)) continue;
+      const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid: head, filepath: path });
+      const data = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+      const current = await this.vault.read(path).catch(() => undefined);
+      if (current && current.byteLength === data.byteLength) {
+        const expected = new Uint8Array(data);
+        const actual = new Uint8Array(current);
+        if (expected.every((value, index) => value === actual[index])) continue;
+      }
+      await this.vault.write(path, data);
+    }
+  }
+
   async push(): Promise<void> {
     await this.ensureRemote();
     await git.push({ ...(await this.gitOptions()), remote: "origin", ref: DEFAULT_BRANCH, onAuth: this.auth() ? () => this.auth() : undefined });
@@ -719,9 +766,10 @@ export class GitRepository {
   }
 
   async hasUncommittedChanges(): Promise<boolean> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
     return (await git.statusMatrix({ fs: this.fs, dir: "" })).some(([filepath, head, workdir, stage]) => {
       if (isPrivatePath(filepath)) return head !== 0 || stage !== 0;
-      if (isManagedPath(filepath, this.configDir, this.sharedPluginIds)) return head !== workdir || workdir !== stage;
+      if (isManagedPath(filepath, this.configDir, sharedPluginIds)) return head !== workdir || workdir !== stage;
       return isPotentialPluginPath(filepath, this.configDir) && (head !== 0 || stage !== 0);
     });
   }

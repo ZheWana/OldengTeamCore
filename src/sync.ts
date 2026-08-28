@@ -7,7 +7,7 @@ import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestE
 import { S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
 import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
-import { readSharedPluginIds, writeSharedPluginIds } from "./shared-plugins";
+import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
 
@@ -83,6 +83,7 @@ export class SyncCoordinator {
   private pendingAssets = new Set<string>();
   private internalMarkdownWrites = new Set<string>();
   private internalAssetWrites = new Set<string>();
+  private internalCommunityPluginWriteDepth = 0;
   private debounceTimer: number | undefined;
   private periodicTimer: number | undefined;
   private running: Promise<void> | undefined;
@@ -112,6 +113,12 @@ export class SyncCoordinator {
 
   markFileChanged(file: TFile): void {
     const path = normalizeVaultPath(file.path);
+    if (isCommunityPluginStatePath(path, this.app.vault.configDir)) {
+      if (this.internalCommunityPluginWriteDepth > 0) return;
+      this.pendingFiles.add(SHARED_PLUGIN_STATE_PATH);
+      this.scheduleSync();
+      return;
+    }
     // Attachments are managed through S3 rather than Git, but their Vault
     // events still need to enter the attachment preparation queue.
     if (!shouldTrackVaultEvent(path, this.app.vault.configDir, this.sharedPluginIds)) return;
@@ -146,6 +153,7 @@ export class SyncCoordinator {
     const existing = await vault.stat(PRIVATE_FOLDER);
     if (existing && existing.type !== "folder") throw new Error(`无法创建私人笔记文件夹：${PRIVATE_FOLDER} 已被文件占用`);
     await vault.mkdir(PRIVATE_FOLDER);
+    await this.ensureSharedPluginState(vault);
   }
 
   async setSharedPluginIds(ids: readonly string[]): Promise<void> {
@@ -226,7 +234,8 @@ export class SyncCoordinator {
       const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       await git.resolveConflicts(resolutions);
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds);
+      const enabledStateChanged = await this.applySharedPluginState(vault);
+      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
       for (const { path } of resolutions) this.pendingFiles.delete(path);
       this.lastError = "";
       this.progress = undefined;
@@ -279,6 +288,7 @@ export class SyncCoordinator {
       this.advanceProgress();
       await git.ensureRemote();
       await git.ensureGitignore();
+      await this.syncSharedPluginStateBeforeCommit(vault);
       await this.prepareAttachments(new Set(), new Set(), true);
       if (!(await vault.exists(MANIFEST_PATH))) await writeManifest(vault, createEmptyManifest());
       this.startProgress("提交知识库", 1);
@@ -335,7 +345,8 @@ export class SyncCoordinator {
       const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       await git.clone();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds);
+      const enabledStateChanged = await this.applySharedPluginState(vault);
+      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
       await this.materializeRemoteAttachments(createEmptyManifest(), await readManifest(vault));
       this.lastSyncAt = Date.now();
       this.lastError = "";
@@ -444,6 +455,7 @@ export class SyncCoordinator {
       this.fullAttachmentScanPending = false;
       await git.ensureRemote();
       await git.ensureGitignore();
+      await this.syncSharedPluginStateBeforeCommit(vault);
       const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
       const hasGitChanges = await git.hasUncommittedChanges();
       if (changed || pendingNotes.size || hasGitChanges) {
@@ -491,7 +503,12 @@ export class SyncCoordinator {
       this.lastSyncAt = Date.now();
       this.lastError = "";
       this.progress = undefined;
-      this.setState(this.pendingFiles.size || this.pendingAssets.size ? "local-changes" : "synced");
+      const remainingChanges = await git.hasUncommittedChanges();
+      if (!remainingChanges) {
+        this.pendingFiles.clear();
+        this.pendingAssets.clear();
+      }
+      this.setState(remainingChanges ? "local-changes" : "synced");
     } catch (error) {
       for (const path of pendingNotes) this.pendingFiles.add(path);
       for (const path of pendingAssets) this.pendingAssets.add(path);
@@ -516,14 +533,41 @@ export class SyncCoordinator {
     this.advanceProgress();
     if (merge.conflicts.length) return { conflicts: merge.conflicts, deferred: false };
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-    this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds);
+    const enabledStateChanged = await this.applySharedPluginState(vault);
+    this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
     await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
     return { conflicts: [], deferred: false };
   }
 
-  private notifySharedPluginChange(before: readonly string[], after: readonly string[]): void {
-    if (before.length === after.length && before.every((id, index) => id === after[index])) return;
-    this.callbacks.onNotice("公共插件文件已同步。请重启 Obsidian，然后在“社区插件”中启用需要使用的插件。");
+  private async ensureSharedPluginState(vault: BinaryVault): Promise<void> {
+    const existing = await readSharedPluginState(vault);
+    if (existing !== undefined) return;
+    const enabled = (await readCommunityPluginIds(vault, this.app.vault.configDir)).filter((id) => this.sharedPluginIds.includes(id));
+    await writeSharedPluginState(vault, enabled);
+  }
+
+  private async syncSharedPluginStateBeforeCommit(vault: BinaryVault): Promise<void> {
+    const enabled = (await readCommunityPluginIds(vault, this.app.vault.configDir)).filter((id) => this.sharedPluginIds.includes(id));
+    await writeSharedPluginState(vault, enabled);
+  }
+
+  private async applySharedPluginState(vault: BinaryVault): Promise<boolean> {
+    const state = await readSharedPluginState(vault);
+    if (state === undefined) {
+      await this.ensureSharedPluginState(vault);
+      return false;
+    }
+    this.internalCommunityPluginWriteDepth += 1;
+    try {
+      return await applySharedPluginStateToVault(vault, this.app.vault.configDir, this.sharedPluginIds, state);
+    } finally {
+      this.internalCommunityPluginWriteDepth -= 1;
+    }
+  }
+
+  private notifySharedPluginChange(before: readonly string[], after: readonly string[], enabledStateChanged = false): void {
+    if (!enabledStateChanged && before.length === after.length && before.every((id, index) => id === after[index])) return;
+    this.callbacks.onNotice("公共插件文件和启用状态已同步。请重启 Obsidian 以加载变更。");
   }
 
   private deferForLocalChanges(): void {

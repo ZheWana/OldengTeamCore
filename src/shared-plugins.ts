@@ -3,6 +3,9 @@ import { normalizeVaultPath, type BinaryVault } from "./vault";
 
 export const SHARED_PLUGINS_START = "# >>> Oldeng Team Core shared plugins";
 export const SHARED_PLUGINS_END = "# <<< Oldeng Team Core shared plugins";
+export const SHARED_PLUGIN_STATE_PATH = ".team/shared-plugins.json";
+const COMMUNITY_PLUGINS_FILE = "community-plugins.json";
+const SHARED_PLUGIN_STATE_VERSION = 1;
 const PLUGIN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export interface LocalCommunityPlugin {
@@ -56,6 +59,10 @@ export function isSharedPluginPath(path: string, configDir: string, ids: readonl
   return Boolean(id && id !== "team-core" && ids.includes(id));
 }
 
+export function isCommunityPluginStatePath(path: string, configDir: string): boolean {
+  return normalizeVaultPath(path) === `${configPath(configDir)}/${COMMUNITY_PLUGINS_FILE}`;
+}
+
 export function readSharedPluginIdsFromGitignore(content: string, configDir: string): string[] {
   const lines = content.replace(/\r\n?/g, "\n").split("\n");
   const start = lines.indexOf(SHARED_PLUGINS_START);
@@ -105,6 +112,66 @@ export function mergeSharedPluginIds(base: readonly string[], ours: readonly str
     if (enabled) merged.push(id);
   }
   return normalizeSharedPluginIds(merged);
+}
+
+function parsePluginIdArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) throw new Error(`${label} 格式无效：应为插件 ID 数组`);
+  return [...new Set(value)];
+}
+
+export function parseSharedPluginState(content: string): string[] {
+  let value: unknown;
+  try { value = JSON.parse(content); } catch (error) { throw new Error(`公共插件启用状态格式无效：${error instanceof Error ? error.message : String(error)}`); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("公共插件启用状态格式无效：应为对象");
+  const state = value as { version?: unknown; enabled?: unknown };
+  if (state.version !== SHARED_PLUGIN_STATE_VERSION) throw new Error(`公共插件启用状态版本不受支持：${String(state.version)}`);
+  return normalizeSharedPluginIds(parsePluginIdArray(state.enabled, "公共插件启用状态"));
+}
+
+export function serializeSharedPluginState(ids: readonly string[]): string {
+  return `${JSON.stringify({ version: SHARED_PLUGIN_STATE_VERSION, enabled: normalizeSharedPluginIds(ids) }, null, 2)}\n`;
+}
+
+export function mergeSharedPluginState(base: readonly string[], ours: readonly string[], theirs: readonly string[]): string {
+  return serializeSharedPluginState(mergeSharedPluginIds(base, ours, theirs));
+}
+
+export async function readCommunityPluginIds(vault: BinaryVault, configDir: string): Promise<string[]> {
+  const path = `${configPath(configDir)}/${COMMUNITY_PLUGINS_FILE}`;
+  if (!(await vault.exists(path))) return [];
+  let value: unknown;
+  try { value = JSON.parse(new TextDecoder().decode(await vault.read(path))); } catch (error) { throw new Error(`Obsidian 公共插件启用列表格式无效：${error instanceof Error ? error.message : String(error)}`); }
+  return parsePluginIdArray(value, "Obsidian 公共插件启用列表");
+}
+
+export async function readSharedPluginState(vault: BinaryVault): Promise<string[] | undefined> {
+  if (!(await vault.exists(SHARED_PLUGIN_STATE_PATH))) return undefined;
+  return parseSharedPluginState(new TextDecoder().decode(await vault.read(SHARED_PLUGIN_STATE_PATH)));
+}
+
+export async function writeSharedPluginState(vault: BinaryVault, ids: readonly string[]): Promise<void> {
+  const next = serializeSharedPluginState(ids);
+  const current = await readSharedPluginState(vault);
+  if (current && serializeSharedPluginState(current) === next) return;
+  const encoded = new TextEncoder().encode(next);
+  await vault.write(SHARED_PLUGIN_STATE_PATH, encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength));
+}
+
+/**
+ * Applies the shared enablement without touching personal plugin choices.
+ * Obsidian's own community-plugins.json remains local and is never committed.
+ */
+export async function applySharedPluginState(vault: BinaryVault, configDir: string, sharedIds: readonly string[], enabledSharedIds: readonly string[]): Promise<boolean> {
+  const shared = new Set(normalizeSharedPluginIds(sharedIds));
+  const enabled = normalizeSharedPluginIds(enabledSharedIds).filter((id) => shared.has(id));
+  const current = await readCommunityPluginIds(vault, configDir);
+  const personal = current.filter((id) => !shared.has(id));
+  const next = [...new Set([...personal, ...enabled])];
+  if (JSON.stringify(current) === JSON.stringify(next)) return false;
+  const path = `${configPath(configDir)}/${COMMUNITY_PLUGINS_FILE}`;
+  const encoded = new TextEncoder().encode(`${JSON.stringify(next, null, 2)}\n`);
+  await vault.write(path, encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength));
+  return true;
 }
 
 export function updateSharedPluginsInGitignore(content: string, configDir: string, ids: readonly string[]): string {

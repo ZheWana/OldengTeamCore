@@ -22,6 +22,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Provides explicit initialization, remote import, attachment normalization, diagnostics, and an in-app conflict editor.
 - Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
 - Lets the team choose trusted community plugin folders to share through a managed `.gitignore` whitelist. Obsidian remains responsible for installing and updating plugins.
+- Synchronizes the enabled state of whitelisted community plugins while preserving each member's personal plugin choices.
 
 ## Requirements
 
@@ -54,7 +55,7 @@ Open **Settings → Oldeng Team Core** and configure:
 - S3 endpoint, region, bucket, prefix, Access Key, and Secret Key;
 - save debounce and automatic synchronization intervals.
 
-In **团队共享插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. Unselected plugins remain local and are never removed or disabled. `team-core` itself and `community-plugins.json` are never synchronized.
+In **团队公共插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. The enabled state of selected plugins is stored in `.team/shared-plugins.json` and applied to each member's local `community-plugins.json`. Unselected plugins and their enabled states remain local and are never removed, disabled, or overwritten. `team-core` itself and the local `community-plugins.json` file are never committed.
 
 The quick export string contains shared Git and S3 secrets. Treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import.
 
