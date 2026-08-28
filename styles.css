@@ -19,8 +19,9 @@
 .team-core-clear-note { color: var(--text-muted); }
 .team-core-clear-status { min-height: 1.5em; color: var(--text-error); }
 .team-core-clear-actions { display: flex; justify-content: flex-end; gap: .6em; margin-top: .8em; }
-.team-core-destructive-button { background-color: var(--color-red) !important; color: white !important; }
+button.team-core-destructive-button { background-color: var(--color-red); color: white; }
 .team-core-destructive-button:hover { filter: brightness(1.08); }
+.team-core-confirm-actions { display: flex; justify-content: flex-end; gap: .6em; margin-top: .8em; }
 .team-core-update-notes { margin-top: .4em; color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .team-core-update-actions { display: flex; justify-content: flex-end; gap: .5em; margin-top: .7em; }
 .team-core-settings .setting-item:not(.setting-item-heading) { align-items: center; gap: 1rem; }
@@ -32,9 +33,9 @@
 .team-core-settings .team-core-config-transfer > .setting-item-control { display: grid; grid-template-columns: minmax(12rem, 1fr) auto auto; gap: .5rem; flex-basis: 46rem; width: min(72%, 46rem); max-width: 46rem; }
 .team-core-config-input { grid-column: 1; }
 .team-core-config-action { white-space: nowrap; }
-.team-core-shared-plugins { margin: .4rem 0 1.25rem; }
+.team-core-shared-plugins { display: block; margin: .4rem 0 1.25rem; }
 .team-core-shared-plugins > p { margin: .35rem 0 .8rem; color: var(--text-muted); font-size: var(--font-ui-small); }
-.team-core-shared-plugins-warning { color: var(--text-warning) !important; }
+.team-core-shared-plugins > p.team-core-shared-plugins-warning { color: var(--text-warning); }
 .team-core-shared-plugins-list { border-top: 1px solid var(--background-modifier-border); }
 .team-core-shared-plugins-list .setting-item { padding-left: .2rem; padding-right: .2rem; }
 .team-core-shared-plugins-empty,

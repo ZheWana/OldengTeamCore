@@ -1,4 +1,4 @@
-import { PRIVATE_PREFIX } from "./constants";
+import { PRIVATE_PREFIX, TRASH_PREFIX } from "./constants";
 import { normalizeVaultPath, type BinaryVault } from "./vault";
 
 export const SHARED_PLUGINS_START = "# >>> Oldeng Team Core shared plugins";
@@ -12,7 +12,9 @@ export interface LocalCommunityPlugin {
 }
 
 function configPath(configDir: string): string {
-  return normalizeVaultPath(configDir) || ".obsidian";
+  const config = normalizeVaultPath(configDir);
+  if (!config) throw new Error("无法确定 Obsidian 配置目录");
+  return config;
 }
 
 function pluginPrefix(configDir: string): string {
@@ -118,7 +120,7 @@ export async function writeSharedPluginIds(vault: BinaryVault, configDir: string
   let next = updateSharedPluginsInGitignore(current, configDir, ids);
   const lines = next.replace(/\r\n?/g, "\n").split("\n");
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-  for (const entry of ["assets/", PRIVATE_PREFIX]) if (!lines.some((line) => line.trim() === entry)) lines.push(entry);
+  for (const entry of ["assets/", PRIVATE_PREFIX, TRASH_PREFIX]) if (!lines.some((line) => line.trim() === entry)) lines.push(entry);
   next = `${lines.join("\n")}\n`;
   if (next === current.replace(/\r\n?/g, "\n")) return;
   const encoded = new TextEncoder().encode(next);

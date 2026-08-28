@@ -1,5 +1,5 @@
 import type { DataAdapter, TFile, Vault } from "obsidian";
-import { ASSETS_PREFIX, PRIVATE_FOLDER, PRIVATE_PREFIX } from "./constants";
+import { ASSETS_PREFIX, PRIVATE_FOLDER, PRIVATE_PREFIX, TRASH_FOLDER, TRASH_PREFIX } from "./constants";
 import type { ReferenceInfo } from "./types";
 
 export interface BinaryVault {
@@ -27,11 +27,12 @@ export function normalizeVaultPath(path: string): string {
   return parts.join("/");
 }
 
-export function isManagedPath(path: string, configDir = "", sharedPluginIds: readonly string[] = []): boolean {
+export function isManagedPath(path: string, configDir: string, sharedPluginIds: readonly string[] = []): boolean {
   const normalized = normalizeVaultPath(path);
-  if (!normalized.length || normalized.startsWith(ASSETS_PREFIX) || isPrivatePath(normalized)) return false;
+  if (!normalized.length || normalized.startsWith(ASSETS_PREFIX) || isPrivatePath(normalized) || isTrashPath(normalized)) return false;
   if (!isConfigPath(normalized, configDir)) return true;
-  const config = normalizeVaultPath(configDir) || ".obsidian";
+  const config = normalizeVaultPath(configDir);
+  if (!config) return false;
   const prefix = `${config}/plugins/`;
   if (!normalized.startsWith(prefix)) return false;
   const pluginId = normalized.slice(prefix.length).split("/")[0];
@@ -40,8 +41,8 @@ export function isManagedPath(path: string, configDir = "", sharedPluginIds: rea
 
 export function isConfigPath(path: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(path);
-  const config = normalizeVaultPath(configDir) || ".obsidian";
-  return normalized === config || normalized.startsWith(`${config}/`);
+  const config = normalizeVaultPath(configDir);
+  return config.length > 0 && (normalized === config || normalized.startsWith(`${config}/`));
 }
 
 export function isAssetPath(path: string): boolean {
@@ -51,6 +52,11 @@ export function isAssetPath(path: string): boolean {
 export function isPrivatePath(path: string): boolean {
   const normalized = normalizeVaultPath(path);
   return normalized === PRIVATE_FOLDER || normalized.startsWith(PRIVATE_PREFIX);
+}
+
+export function isTrashPath(path: string): boolean {
+  const normalized = normalizeVaultPath(path);
+  return normalized === TRASH_FOLDER || normalized.startsWith(TRASH_PREFIX);
 }
 
 export const CONTENT_ADDRESSED_ASSET_PREFIX = "tc-sha256-";

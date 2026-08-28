@@ -5,6 +5,7 @@ import { PluginLogger } from "./logger";
 import { SyncCoordinator } from "./sync";
 import { HISTORY_VIEW_TYPE, TeamCoreHistoryView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
+import { requestConfirmation } from "./confirm";
 
 export default class TeamCorePlugin extends Plugin {
   teamCoreSettings: TeamCoreSettings = { ...DEFAULT_SETTINGS };
@@ -136,15 +137,23 @@ export default class TeamCorePlugin extends Plugin {
         const configuredRemote = this.teamCoreSettings.gitUrl.replace(/\/+$/, "");
         const localRemote = info.localRemoteUrl?.replace(/\/+$/, "");
         if (!info.localRepository || localRemote !== configuredRemote) {
-          new Notice("远端仓库已有内容。请使用“从远端知识库导入”，不要重复初始化当前 Vault。");
+          new Notice("远端仓库已有内容。请使用“从远端知识库导入”，不要重复初始化当前知识库。");
           return;
         }
-        if (!window.confirm("远端仓库已有内容，将按普通同步流程合并本地与远端更改。是否继续？")) return;
+        if (!await requestConfirmation(this.app, {
+          title: "继续同步现有仓库",
+          message: "远端仓库已有内容，将按普通同步流程合并本地与远端更改。是否继续？",
+          confirmText: "继续同步"
+        })) return;
         await this.coordinator.runManual();
         new Notice("已执行同步；请查看状态栏确认结果");
         return;
       }
-      if (!window.confirm("检测到你要初始化当前知识库并推送到远端，是否继续？")) return;
+      if (!await requestConfirmation(this.app, {
+        title: "初始化知识库",
+        message: "检测到你要初始化当前知识库并推送到远端，是否继续？",
+        confirmText: "初始化并同步"
+      })) return;
       await this.coordinator.initializeEmptyRemote();
       new Notice("知识库已初始化并同步");
     }
@@ -167,7 +176,11 @@ export default class TeamCorePlugin extends Plugin {
         return;
       }
       if (!info.localHasManagedFiles) {
-        if (!window.confirm("本地知识库为空，将从远端导入，是否继续？")) return;
+        if (!await requestConfirmation(this.app, {
+          title: "导入远端知识库",
+          message: "本地知识库为空，将从远端导入，是否继续？",
+          confirmText: "开始导入"
+        })) return;
         await this.coordinator.cloneRemote();
       } else {
         const path = this.coordinator.getVaultBasePath();
@@ -177,7 +190,12 @@ export default class TeamCorePlugin extends Plugin {
           const copy = backupNotice.messageEl.createEl("button", { text: "复制路径" });
           copy.addEventListener("click", () => void navigator.clipboard.writeText(path));
         }
-        if (!window.confirm(`本地已有内容。请先备份后确认远端覆盖本地。${location}\n\n确定后将删除本地非 .obsidian 文件。`)) return;
+        if (!await requestConfirmation(this.app, {
+          title: "确认覆盖本地知识库",
+          message: `本地已有内容。请先备份后确认远端覆盖本地。${location}\n\n确定后将删除本地非配置目录文件。`,
+          confirmText: "覆盖并导入",
+          destructive: true
+        })) return;
         await this.coordinator.cloneRemote(true);
       }
       new Notice("远端知识库已导入");
@@ -208,11 +226,11 @@ class ClearRemoteConfirmationModal extends Modal {
   onOpen(): void {
     this.titleEl.setText("确认清空远端测试数据");
     this.contentEl.empty();
-    this.contentEl.createEl("p", { text: "此操作不可撤销。将删除远端 Git main，并删除当前 S3 Prefix 下由 Oldeng Team Core 管理的全部附件对象。" });
+    this.contentEl.createEl("p", { text: "此操作不可撤销。将删除远端 Git main，并删除当前 S3 前缀下由本插件管理的全部附件对象。" });
     const targets = this.contentEl.createEl("ul", { cls: "team-core-clear-targets" });
     targets.createEl("li", { text: `Git：${safeRemoteLabel(this.settings.gitUrl)}` });
     targets.createEl("li", { text: `S3：${this.settings.s3Bucket || "未配置"}/${[this.settings.s3Prefix.replace(/^\/+|\/+$/g, ""), "sha256/"].filter(Boolean).join("/")}` });
-    this.contentEl.createEl("p", { text: "“私人笔记”文件夹、Vault 中的本地笔记和本地附件不会删除；本地 Git 元数据会重置，避免自动同步把测试内容立即推回远端。", cls: "team-core-clear-note" });
+    this.contentEl.createEl("p", { text: "“私人笔记”文件夹、知识库中的本地笔记和本地附件不会删除；本地 Git 元数据会重置，避免自动同步把测试内容立即推回远端。", cls: "team-core-clear-note" });
     const status = this.contentEl.createEl("p", { cls: "team-core-clear-status" });
     const actions = this.contentEl.createDiv("team-core-clear-actions");
     const cancel = new ButtonComponent(actions).setButtonText("取消").onClick(() => this.close());

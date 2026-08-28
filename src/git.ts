@@ -549,7 +549,9 @@ export class GitRepository {
 
   private async snapshotPersonalPluginFiles(): Promise<Map<string, ArrayBuffer>> {
     const snapshot = new Map<string, ArrayBuffer>();
-    const configPrefix = `${normalizeVaultPath(this.configDir) || ".obsidian"}/plugins/`;
+    const config = normalizeVaultPath(this.configDir);
+    if (!config) return snapshot;
+    const configPrefix = `${config}/plugins/`;
     const walk = async (path: string): Promise<void> => {
       const entries = await this.vault.list(path);
       for (const file of entries.files) {

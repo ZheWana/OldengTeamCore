@@ -11,7 +11,7 @@ import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPus
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
 import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment, shouldTrackVaultEvent } from "../src/sync";
-import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
+import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
 import { readSharedPluginIdsFromGitignore, updateSharedPluginsInGitignore } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
@@ -279,14 +279,14 @@ describe("manifest and vault path rules", () => {
     expect(collectMarkdownReferences(markdown, "notes/readme.md")).toEqual(["assets/diagram.png", "assets/guide.pdf", "assets/notes.txt"]);
     expect(normalizeVaultPath("/notes\\../assets//a.png")).toBe("assets/a.png");
     expect(isAssetPath("assets/a.png")).toBe(true);
-    expect(isManagedPath("notes/readme.md")).toBe(true);
-    expect(isManagedPath("assets/a.png")).toBe(false);
+    expect(isManagedPath("notes/readme.md", ".obsidian")).toBe(true);
+    expect(isManagedPath("assets/a.png", ".obsidian")).toBe(false);
     expect(isPrivatePath("私人笔记/秘密.md")).toBe(true);
-    expect(isManagedPath("私人笔记/秘密.md")).toBe(false);
+    expect(isManagedPath("私人笔记/秘密.md", ".obsidian")).toBe(false);
     expect(isPrivatePath("私人笔记")).toBe(true);
     expect(isPrivatePath("私人笔记备份/公开.md")).toBe(false);
     expect(isPrivatePath("Private/legacy.md")).toBe(false);
-    expect(isManagedPath("Private/legacy.md")).toBe(true);
+    expect(isManagedPath("Private/legacy.md", ".obsidian")).toBe(true);
     expect(isPrivatePath("PrivateNotes/visible.md")).toBe(false);
     expect(isConfigPath(".settings/plugins/team-core/data.json", ".settings")).toBe(true);
     expect(isManagedPath(".settings/plugins/team-core/data.json", ".settings")).toBe(false);
@@ -294,6 +294,8 @@ describe("manifest and vault path rules", () => {
     expect(isManagedPath(".settings/plugins/dataview/main.js", ".settings", ["calendar"])).toBe(false);
     expect(isManagedPath(".settings/community-plugins.json", ".settings", ["calendar"])).toBe(false);
     expect(isConfigPath(".settings-backup/visible.md", ".settings")).toBe(false);
+    expect(isTrashPath(".trash/deleted.md")).toBe(true);
+    expect(isManagedPath(".trash/deleted.md", ".obsidian")).toBe(false);
   });
 
   it("uses the managed gitignore block as the shared plugin whitelist", () => {
@@ -484,6 +486,7 @@ describe("Git repository adapter", () => {
       await repo.ensureGitignore();
       const gitignore = new TextDecoder().decode(await vault.read(".gitignore"));
       expect(gitignore).toContain("私人笔记/\n");
+      expect(gitignore).toContain(".trash/\n");
       expect(gitignore).not.toContain("Private/\n");
       await vault.write("notes/readme.md", new TextEncoder().encode("first\n").buffer);
       await vault.write("私人笔记/秘密.md", new TextEncoder().encode("never sync\n").buffer);

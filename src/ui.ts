@@ -1,4 +1,4 @@
-import { ItemView, Notice, PluginSettingTab, Setting, WorkspaceLeaf, type App, type Plugin } from "obsidian";
+import { ItemView, Notice, PluginSettingTab, Setting, TFile, WorkspaceLeaf, type App, type Plugin, type SettingDefinition, type SettingDefinitionItem } from "obsidian";
 import { exportSettings, importSettings } from "./config";
 import { readManifest } from "./manifest";
 import { GitRepository } from "./git";
@@ -6,6 +6,7 @@ import type { CommitSummary, ReferenceInfo, TeamCoreSettings } from "./types";
 import { buildReferenceAudit, createVaultAdapter } from "./vault";
 import type { SyncCoordinator } from "./sync";
 import { listLocalCommunityPlugins, readSharedPluginIds } from "./shared-plugins";
+import { requestConfirmation } from "./confirm";
 
 export const HISTORY_VIEW_TYPE = "team-core-history";
 
@@ -15,7 +16,7 @@ export class TeamCoreHistoryView extends ItemView {
   }
 
   getViewType(): string { return HISTORY_VIEW_TYPE; }
-  getDisplayText(): string { return "Oldeng Team Core 历史"; }
+  getDisplayText(): string { return "团队知识库历史"; }
   getIcon(): string { return "git-commit-horizontal"; }
 
   async onOpen(): Promise<void> { await this.render(); }
@@ -32,7 +33,7 @@ export class TeamCoreHistoryView extends ItemView {
     auditButton.addEventListener("click", () => void this.renderAudit(container));
     const settings = this.getSettings();
     if (!settings.gitUrl) {
-      container.createEl("p", { text: "请先在 Oldeng Team Core 设置中配置 Git 和 S3。" });
+      container.createEl("p", { text: "请先在插件设置中配置 Git 和 S3。" });
       return;
     }
     const repo = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, consoleLogger(), this.app.vault.configDir);
@@ -98,8 +99,16 @@ export class TeamCoreHistoryView extends ItemView {
   }
 
   private async cleanupOrphans(orphan: ReferenceInfo[]): Promise<void> {
-    if (!window.confirm(`确定删除 ${orphan.length} 个本地孤立附件吗？S3 对象不会删除。`)) return;
-    for (const item of orphan) await this.app.vault.adapter.remove(item.path);
+    if (!await requestConfirmation(this.app, {
+      title: "清理孤立附件",
+      message: `确定删除 ${orphan.length} 个本地孤立附件吗？S3 对象不会删除。`,
+      confirmText: "删除附件",
+      destructive: true
+    })) return;
+    for (const item of orphan) {
+      const file = this.app.vault.getAbstractFileByPath(item.path);
+      if (file instanceof TFile) await this.app.fileManager.trashFile(file);
+    }
     const manifest = await readManifest(createVaultAdapter(this.app.vault.adapter));
     for (const item of orphan) delete manifest.files[item.path];
     const adapter = createVaultAdapter(this.app.vault.adapter);
@@ -126,29 +135,96 @@ export class TeamCoreSettingTab extends PluginSettingTab {
 
   private get teamPlugin(): TeamCorePluginHost { return this.teamCorePlugin; }
 
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      this.group("Git", [
+        this.textDefinition("Git 远端 URL", "gitUrl", false),
+        this.textDefinition("个人 username", "gitUsername", false),
+        this.textDefinition("团队密码", "gitPassword", true)
+      ]),
+      this.group("七牛 S3", [
+        this.textDefinition("Endpoint", "s3Endpoint", false),
+        this.textDefinition("Region", "s3Region", false),
+        this.textDefinition("Bucket / Space", "s3Bucket", false),
+        this.textDefinition("Prefix", "s3Prefix", false),
+        this.textDefinition("Access Key", "s3AccessKey", true),
+        this.textDefinition("Secret Key", "s3SecretKey", true)
+      ]),
+      this.group("同步", [
+        this.numberDefinition("保存消抖（分钟）", "debounceMs", 60_000),
+        this.numberDefinition("自动同步（分钟）", "syncIntervalMs", 300_000)
+      ]),
+      this.group("团队共享插件", [this.sharedPluginsDefinition()]),
+      this.group("快速导入 / 导出", [this.transferDefinition()])
+    ];
+  }
+
   display(): void {
+    this.renderLegacySettings();
+  }
+
+  private renderLegacySettings(): void {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("team-core-settings");
     new Setting(containerEl).setName("Git").setHeading();
-    this.text("Git 远端 URL", "gitUrl", false);
-    this.text("个人 username", "gitUsername", false);
-    this.text("团队密码", "gitPassword", true);
+    this.addTextControl(new Setting(containerEl).setName("Git 远端 URL"), "gitUrl", false);
+    this.addTextControl(new Setting(containerEl).setName("个人 username"), "gitUsername", false);
+    this.addTextControl(new Setting(containerEl).setName("团队密码"), "gitPassword", true);
     new Setting(containerEl).setName("七牛 S3").setHeading();
-    for (const [name, key, secret] of [["Endpoint", "s3Endpoint", false], ["Region", "s3Region", false], ["Bucket / Space", "s3Bucket", false], ["Prefix", "s3Prefix", false], ["Access Key", "s3AccessKey", true], ["Secret Key", "s3SecretKey", true]] as const) this.text(name, key, secret);
+    for (const [name, key, secret] of [["Endpoint", "s3Endpoint", false], ["Region", "s3Region", false], ["Bucket / Space", "s3Bucket", false], ["Prefix", "s3Prefix", false], ["Access Key", "s3AccessKey", true], ["Secret Key", "s3SecretKey", true]] as const) {
+      this.addTextControl(new Setting(containerEl).setName(name), key, secret);
+    }
     new Setting(containerEl).setName("同步").setHeading();
-    this.number("保存消抖（分钟）", "debounceMs", 60_000);
-    this.number("自动同步（分钟）", "syncIntervalMs", 300_000);
+    this.addNumberControl(new Setting(containerEl).setName("保存消抖（分钟）"), "debounceMs", 60_000);
+    this.addNumberControl(new Setting(containerEl).setName("自动同步（分钟）"), "syncIntervalMs", 300_000);
     new Setting(containerEl).setName("团队共享插件").setHeading();
-    const pluginsContainer = containerEl.createDiv("team-core-shared-plugins");
-    pluginsContainer.createEl("p", { text: "选择后会同步该插件目录中的全部文件，包括 main.js、配置和样式。未选择的插件只保留在本地，不会被卸载或覆盖。" });
-    const warning = pluginsContainer.createEl("p", { text: "请只选择团队信任的插件：共享插件包含可执行 JavaScript，远端内容会替换本地版本。", cls: "team-core-shared-plugins-warning" });
+    this.addSharedPluginsControl(new Setting(containerEl));
+    new Setting(containerEl).setName("快速导入 / 导出").setHeading();
+    this.addTransferControl(new Setting(containerEl).setName("配置字符串"));
+  }
+
+  private group(heading: string, items: SettingDefinition[]): SettingDefinitionItem {
+    return { type: "group", heading, cls: "team-core-settings", items };
+  }
+
+  private textDefinition(name: string, key: keyof TeamCoreSettings, secret: boolean): SettingDefinition {
+    return { name, aliases: [String(key)], render: (setting) => this.addTextControl(setting, key, secret) };
+  }
+
+  private numberDefinition(name: string, key: "debounceMs" | "syncIntervalMs", defaultMs: number): SettingDefinition {
+    return { name, aliases: [String(key)], render: (setting) => this.addNumberControl(setting, key, defaultMs) };
+  }
+
+  private sharedPluginsDefinition(): SettingDefinition {
+    return {
+      name: "共享插件白名单",
+      aliases: ["团队插件", "插件同步", "gitignore"],
+      render: (setting) => this.addSharedPluginsControl(setting)
+    };
+  }
+
+  private transferDefinition(): SettingDefinition {
+    return {
+      name: "配置字符串",
+      aliases: ["导入配置", "导出配置"],
+      render: (setting) => this.addTransferControl(setting)
+    };
+  }
+
+  private addSharedPluginsControl(setting: Setting): void {
+    setting.settingEl.empty();
+    setting.settingEl.addClass("team-core-shared-plugins");
+    setting.settingEl.createEl("p", { text: "选择后会同步该插件目录中的全部文件，包括 main.js、配置和样式。未选择的插件只保留在本地，不会被卸载或覆盖。" });
+    const warning = setting.settingEl.createEl("p", { text: "请只选择团队信任的插件：共享插件包含可执行 JavaScript，远端内容会替换本地版本。", cls: "team-core-shared-plugins-warning" });
     warning.setAttr("role", "note");
-    const list = pluginsContainer.createDiv("team-core-shared-plugins-list");
+    const list = setting.settingEl.createDiv("team-core-shared-plugins-list");
     list.createEl("p", { text: "正在读取本地插件……", cls: "team-core-shared-plugins-loading" });
     void this.renderSharedPlugins(list);
-    new Setting(containerEl).setName("快速导入 / 导出").setHeading();
-    const transfer = new Setting(containerEl).setName("配置字符串").setClass("team-core-config-transfer");
+  }
+
+  private addTransferControl(transfer: Setting): void {
+    transfer.setClass("team-core-config-transfer");
     const configInput = transfer.controlEl.createEl("input", { type: "text", placeholder: "粘贴配置字符串", cls: "team-core-config-input" });
     configInput.setAttr("aria-label", "配置字符串");
     const importButton = transfer.controlEl.createEl("button", { text: "导入配置", cls: "team-core-config-action" });
@@ -156,12 +232,18 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     importButton.addEventListener("click", () => {
       try {
         this.teamPlugin.teamCoreSettings = importSettings(configInput.value, this.teamPlugin.teamCoreSettings);
-        void this.teamPlugin.saveSettings().then(() => { new Notice("配置已导入"); this.display(); });
+        void this.teamPlugin.saveSettings().then(() => { new Notice("配置已导入"); this.refreshSettings(); });
       } catch (error) { new Notice(error instanceof Error ? error.message : "配置导入失败"); }
     });
     const exportButton = transfer.controlEl.createEl("button", { text: "复制导出字符串", cls: "team-core-config-action" });
     exportButton.type = "button";
     exportButton.addEventListener("click", () => void navigator.clipboard.writeText(exportSettings(this.teamPlugin.teamCoreSettings)).then(() => new Notice("配置字符串已复制")));
+  }
+
+  private refreshSettings(): void {
+    const update = (this as { update?: () => void }).update;
+    if (typeof update === "function") update.call(this);
+    else this.renderLegacySettings();
   }
 
   private async renderSharedPlugins(container: HTMLElement): Promise<void> {
@@ -207,8 +289,8 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     }
   }
 
-  private text(name: string, key: keyof TeamCoreSettings, secret: boolean): void {
-    new Setting(this.containerEl).setName(name).addText((component) => {
+  private addTextControl(setting: Setting, key: keyof TeamCoreSettings, secret: boolean): void {
+    setting.addText((component) => {
       component.setValue(String(this.teamPlugin.teamCoreSettings[key] ?? ""));
       component.inputEl.type = secret ? "password" : "text";
       component.onChange(async (value) => {
@@ -218,8 +300,8 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     });
   }
 
-  private number(name: string, key: "debounceMs" | "syncIntervalMs", defaultMs: number): void {
-    new Setting(this.containerEl).setName(name).addText((component) => {
+  private addNumberControl(setting: Setting, key: "debounceMs" | "syncIntervalMs", defaultMs: number): void {
+    setting.addText((component) => {
       component.setValue(String(Math.round(this.teamPlugin.teamCoreSettings[key] / 60_000) || defaultMs / 60_000));
       component.inputEl.type = "number";
       component.onChange(async (value) => {

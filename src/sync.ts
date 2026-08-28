@@ -6,7 +6,7 @@ import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
+import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
 import { readSharedPluginIds, writeSharedPluginIds } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
@@ -352,10 +352,10 @@ export class SyncCoordinator {
     const files = this.app.vault.getFiles()
       .filter((file) => {
         const path = normalizeVaultPath(file.path);
-        return !isConfigPath(path, this.app.vault.configDir) && !isPrivatePath(path);
+        return !isConfigPath(path, this.app.vault.configDir) && !isPrivatePath(path) && !isTrashPath(path);
       })
       .sort((a, b) => b.path.length - a.path.length);
-    for (const file of files) await this.app.vault.delete(file);
+    for (const file of files) await this.app.fileManager.trashFile(file);
     const adapter = createVaultAdapter(this.app.vault.adapter);
     if (await adapter.exists(".git")) await adapter.rmdir(".git", true);
   }
@@ -613,7 +613,7 @@ export class SyncCoordinator {
           if (destination instanceof TFile) {
             const destinationHash = await sha256Hex(await vault.read(plan.targetPath));
             if (destinationHash !== plan.hash) throw new Error(`哈希附件路径已被不同内容占用：${plan.targetPath}`);
-            await this.app.vault.delete(source);
+            await this.app.fileManager.trashFile(source);
           } else if (destination) {
             throw new Error(`哈希附件路径无法使用：${plan.targetPath}`);
           } else {
