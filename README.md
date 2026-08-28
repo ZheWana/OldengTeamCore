@@ -13,6 +13,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Shows phase and numeric progress during synchronization.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
 - Provides explicit initialization, remote import, attachment normalization, diagnostics, and conflict states.
+- Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
 - Checks the Oldeng Team Core release index and reminds users when a newer version is available. Obsidian remains responsible for installing updates.
 
 ## Requirements
@@ -55,6 +56,12 @@ Oldeng Team Core automatically creates `私人笔记/`. That exact folder and al
 ## Attachment model
 
 Files under `assets/` are not committed to Git. Oldeng Team Core hashes changed or explicitly normalized attachments, uploads immutable objects to the configured S3 prefix, and commits `.team/assets-manifest.json` only after each required object is available. Ordinary synchronization is incremental; use **规范化全部附件** only for initial migration or recovery after external file changes.
+
+Concurrent changes to different attachment paths are merged semantically in the manifest rather than treated as a JSON text conflict. Competing content for the same logical path remains a real conflict.
+
+## Conflict behavior
+
+Oldeng Team Core automatically merges independent changes and retries a push race at most twice through fetch and merge. It never force-pushes. A true content conflict stops before push, keeps the pre-merge note content unchanged, records the conflicting paths under local `.git` metadata, and remains visible after plugin reload. Repeated automatic or manual synchronization stays blocked until the Git conflict is resolved with a commit that includes both recorded histories.
 
 ## Network and privacy disclosure
 

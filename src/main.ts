@@ -47,6 +47,7 @@ export default class TeamCorePlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => { if (file instanceof TFile) this.coordinator.markFileChanged(file); }));
     this.app.workspace.onLayoutReady(() => {
       void this.coordinator.prepareLocalVault()
+        .then(() => this.coordinator.refreshState())
         .catch((error) => new Notice(`无法创建“私人笔记”文件夹：${error instanceof Error ? error.message : String(error)}`))
         .finally(() => this.coordinator.start());
       void this.checkForPluginUpdate(false);
@@ -137,8 +138,24 @@ export default class TeamCorePlugin extends Plugin {
 
   private async confirmInitialize(): Promise<void> {
     if (!this.teamCoreSettings.gitUrl) { new Notice("请先配置 Git 远端 URL"); return; }
-    if (!window.confirm("检测到你要初始化当前知识库并推送到远端，是否继续？")) return;
-    try { await this.coordinator.initializeEmptyRemote(); new Notice("知识库已初始化并同步"); }
+    try {
+      const info = await this.coordinator.inspectConnection();
+      if (info.remoteHasCommits) {
+        const configuredRemote = this.teamCoreSettings.gitUrl.replace(/\/+$/, "");
+        const localRemote = info.localRemoteUrl?.replace(/\/+$/, "");
+        if (!info.localRepository || localRemote !== configuredRemote) {
+          new Notice("远端仓库已有内容。请使用“从远端知识库导入”，不要重复初始化当前 Vault。");
+          return;
+        }
+        if (!window.confirm("远端仓库已有内容，将按普通同步流程合并本地与远端更改。是否继续？")) return;
+        await this.coordinator.runManual();
+        new Notice("已执行同步；请查看状态栏确认结果");
+        return;
+      }
+      if (!window.confirm("检测到你要初始化当前知识库并推送到远端，是否继续？")) return;
+      await this.coordinator.initializeEmptyRemote();
+      new Notice("知识库已初始化并同步");
+    }
     catch (error) { new Notice(`初始化失败：${error instanceof Error ? error.message : String(error)}`); }
   }
 

@@ -1,12 +1,14 @@
 import { FileSystemAdapter, TFile, type App } from "obsidian";
 import { MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
 import { sha256Hex } from "./crypto";
-import { GitRepository } from "./git";
+import { GitRepository, isPushReconciliationError } from "./git";
 import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "./vault";
+import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
+
+const MAX_PUSH_RECONCILIATION_RETRIES = 2;
 
 export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
@@ -33,6 +35,30 @@ interface AttachmentPlan {
   mime: string;
   data?: ArrayBuffer;
   requiresUpload: boolean;
+}
+
+export interface RemoteReconciliationResult {
+  conflicts: string[];
+  deferred: boolean;
+}
+
+export async function pushWithNonFastForwardRetry(
+  push: () => Promise<void>,
+  reconcile: (attempt: number, maximum: number) => Promise<RemoteReconciliationResult>,
+  maximumRetries = MAX_PUSH_RECONCILIATION_RETRIES
+): Promise<RemoteReconciliationResult> {
+  let retries = 0;
+  while (true) {
+    try {
+      await push();
+      return { conflicts: [], deferred: false };
+    } catch (error) {
+      if (!isPushReconciliationError(error) || retries >= maximumRetries) throw error;
+      retries += 1;
+      const result = await reconcile(retries, maximumRetries);
+      if (result.conflicts.length || result.deferred) return result;
+    }
+  }
 }
 
 export function shouldMaterializeRemoteAttachment(previous: AssetManifestEntry | undefined, current: AssetManifestEntry, localFileExists: boolean): boolean {
@@ -111,7 +137,7 @@ export class SyncCoordinator {
   }
 
   private scheduleSync(): void {
-    this.setState("local-changes");
+    if (this.state !== "conflict") this.setState("local-changes");
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
   }
@@ -136,6 +162,27 @@ export class SyncCoordinator {
     this.debounceTimer = undefined;
     await this.runCycle(true);
     if (this.fullAttachmentScanPending) await this.runCycle(true);
+  }
+
+  async refreshState(): Promise<void> {
+    const vault = createVaultAdapter(this.app.vault.adapter);
+    const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+    try {
+      if (!(await git.exists()) || !(await git.remoteUrl())) {
+        this.setState("uninitialized");
+        return;
+      }
+      const conflicts = await git.conflictedFiles();
+      if (conflicts.length) {
+        this.lastError = `待解决的 Git 冲突：${conflicts.join(", ")}`;
+        this.setState("conflict");
+        return;
+      }
+      this.setState(await git.hasUncommittedChanges() ? "local-changes" : "synced");
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+      this.setState(this.isOffline(error) ? "offline" : "error");
+    }
   }
 
   async clearRemoteData(): Promise<RemoteClearResult> {
@@ -164,10 +211,16 @@ export class SyncCoordinator {
   }
 
   async initializeEmptyRemote(): Promise<void> {
+    return this.runExclusive(() => this.executeInitializeEmptyRemote());
+  }
+
+  private async executeInitializeEmptyRemote(): Promise<void> {
     this.setState("syncing");
     try {
       const settings = this.settings();
       const git = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, this.logger, this.app.vault.configDir);
+      const remote = await git.remoteInfo();
+      if (Object.keys(remote.heads).length > 0) throw new Error("远端仓库已有提交，请使用“从远端知识库导入”或“立即同步”，不能重复初始化");
       this.startProgress("准备本地仓库", 1);
       await git.init();
       this.advanceProgress();
@@ -189,6 +242,16 @@ export class SyncCoordinator {
       this.setState(this.isOffline(error) ? "offline" : "error");
       throw error;
     }
+  }
+
+  private async runExclusive(operation: () => Promise<void>): Promise<void> {
+    while (this.running) await this.running;
+    const task = operation();
+    const running = task.finally(() => {
+      if (this.running === running) this.running = undefined;
+    });
+    this.running = running;
+    return running;
   }
 
   async inspectConnection(): Promise<ConnectionInfo> {
@@ -298,18 +361,26 @@ export class SyncCoordinator {
     const pendingNotes = new Set(this.pendingFiles);
     const pendingAssets = new Set(this.pendingAssets);
     const forceFullAttachmentScan = this.fullAttachmentScanPending;
-    this.pendingFiles.clear();
-    this.pendingAssets.clear();
-    this.fullAttachmentScanPending = false;
     try {
       const settings = this.settings();
       const vault = createVaultAdapter(this.app.vault.adapter);
       const git = new GitRepository(vault, settings, this.logger, this.app.vault.configDir);
       if (!(await git.exists())) {
+        this.pendingFiles.clear();
+        this.pendingAssets.clear();
+        this.fullAttachmentScanPending = false;
         this.progress = undefined;
         this.setState("uninitialized");
         return;
       }
+      const existingConflicts = await git.conflictedFiles();
+      if (existingConflicts.length) {
+        this.enterConflict(existingConflicts, false);
+        return;
+      }
+      this.pendingFiles.clear();
+      this.pendingAssets.clear();
+      this.fullAttachmentScanPending = false;
       await git.ensureRemote();
       await git.ensureGitignore();
       const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
@@ -323,19 +394,37 @@ export class SyncCoordinator {
       this.startProgress("拉取远端更改", 1);
       await git.fetch();
       this.advanceProgress();
-      this.startProgress("合并远端更改", 1);
-      const merge = await git.mergeRemote();
-      this.advanceProgress();
-      if (merge.conflicts.length) {
-        this.progress = undefined;
-        this.callbacks.onNotice(`检测到 Git 冲突：${merge.conflicts.join(", ")}`);
-        this.setState("conflict");
+      const initialReconciliation = await this.mergeFetchedRemote(git, vault, manifestBeforeRemote);
+      if (initialReconciliation.deferred) {
+        this.deferForLocalChanges();
         return;
       }
-      await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
-      this.startProgress("推送到远端", 1);
-      await git.push();
-      this.advanceProgress();
+      if (initialReconciliation.conflicts.length) {
+        this.enterConflict(initialReconciliation.conflicts);
+        return;
+      }
+      const pushResult = await pushWithNonFastForwardRetry(
+        async () => {
+          this.startProgress("推送到远端", 1);
+          await git.push();
+          this.advanceProgress();
+        },
+        async (attempt, maximum) => {
+          const manifestBeforeRetry = await readManifest(vault);
+          this.startProgress(`远端已更新，重新拉取 ${attempt}/${maximum}`, 1);
+          await git.fetch();
+          this.advanceProgress();
+          return this.mergeFetchedRemote(git, vault, manifestBeforeRetry);
+        }
+      );
+      if (pushResult.deferred) {
+        this.deferForLocalChanges();
+        return;
+      }
+      if (pushResult.conflicts.length) {
+        this.enterConflict(pushResult.conflicts);
+        return;
+      }
       const active = this.app.workspace.getActiveFile();
       if (active) this.currentAuthor = (await git.log(active.path, 1))[0]?.author;
       this.lastSyncAt = Date.now();
@@ -354,6 +443,31 @@ export class SyncCoordinator {
       }
       this.logger.error("Synchronization failed", { error: this.lastError });
     }
+  }
+
+  private async mergeFetchedRemote(git: GitRepository, vault: BinaryVault, manifestBeforeRemote: AssetManifest): Promise<RemoteReconciliationResult> {
+    // A note may be edited while fetch is in flight. Defer the merge so the
+    // next cycle commits that edit before checkout can materialize remote data.
+    if (await git.hasUncommittedChanges()) return { conflicts: [], deferred: true };
+    this.startProgress("合并远端更改", 1);
+    const merge = await git.mergeRemote();
+    this.advanceProgress();
+    if (merge.conflicts.length) return { conflicts: merge.conflicts, deferred: false };
+    await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
+    return { conflicts: [], deferred: false };
+  }
+
+  private deferForLocalChanges(): void {
+    this.progress = undefined;
+    this.lastError = "";
+    this.setState("local-changes");
+  }
+
+  private enterConflict(conflicts: string[], notify = true): void {
+    this.progress = undefined;
+    this.lastError = `待解决的 Git 冲突：${conflicts.join(", ")}`;
+    if (notify) this.callbacks.onNotice(`检测到 Git 冲突：${conflicts.join(", ")}。已停止推送，请先解决冲突。`);
+    this.setState("conflict");
   }
 
   private async prepareAttachments(pendingNotes: ReadonlySet<string>, pendingAssets: ReadonlySet<string>, forceFullScan = false): Promise<boolean> {

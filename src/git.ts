@@ -1,8 +1,21 @@
-import git from "isomorphic-git";
+import git, { type MergeDriverParams } from "isomorphic-git";
+import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
-import type { Logger, CommitSummary, TeamCoreSettings } from "./types";
+import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./types";
 import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
 import { DEFAULT_BRANCH, PRIVATE_PREFIX } from "./constants";
+import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
+
+const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
+const LINEBREAKS = /^.*(\r?\n|$)/gm;
+
+interface GitConflictState {
+  version: 1;
+  localOid: string;
+  remoteOid: string;
+  files: string[];
+  detectedAt: string;
+}
 
 interface GitHttpRequest {
   url: string;
@@ -43,6 +56,69 @@ export function normalizeRemoteInfo(value: unknown): GitRemoteInfo {
 
 export function normalizeGitUrl(value: string): string {
   return value.trim().replace(/\/+$/, "");
+}
+
+export function conflictFilesFromError(error: unknown): string[] {
+  if (!error || typeof error !== "object") return [];
+  const input = error as { conflictedFiles?: unknown; data?: { filepaths?: unknown } };
+  const value = input.data?.filepaths ?? input.conflictedFiles;
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((path): path is string => typeof path === "string" && path.length > 0))].sort();
+}
+
+export function isNonFastForwardPushError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const input = error as { code?: unknown; message?: unknown; data?: { reason?: unknown } };
+  return (input.code === "PushRejectedError" && input.data?.reason === "not-fast-forward")
+    || (typeof input.message === "string" && /push rejected.*not a simple fast-forward/i.test(input.message));
+}
+
+export function isPushReconciliationError(error: unknown): boolean {
+  if (isNonFastForwardPushError(error)) return true;
+  if (!error || typeof error !== "object") return false;
+  const input = error as { code?: unknown; caller?: unknown; data?: { what?: unknown } };
+  // A server can advance after fetch to an OID the client has not downloaded.
+  // isomorphic-git reports that race as NotFoundError before it can classify
+  // the update as non-fast-forward.
+  return input.code === "NotFoundError"
+    && input.caller === "git.push"
+    && typeof input.data?.what === "string"
+    && /^[0-9a-f]{40}$/i.test(input.data.what);
+}
+
+function textMerge({ branches, contents }: MergeDriverParams): { cleanMerge: boolean; mergedText: string } {
+  const [baseContent, ourContent, theirContent] = contents;
+  const ours = ourContent.match(LINEBREAKS) ?? [];
+  const base = baseContent.match(LINEBREAKS) ?? [];
+  const theirs = theirContent.match(LINEBREAKS) ?? [];
+  const result = diff3Merge(ours, base, theirs);
+  let cleanMerge = true;
+  let mergedText = "";
+  for (const item of result) {
+    if ("ok" in item) mergedText += item.ok.join("");
+    else {
+      cleanMerge = false;
+      mergedText += `<<<<<<< ${branches[1]}\n${item.conflict.a.join("")}=======\n${item.conflict.b.join("")}>>>>>>> ${branches[2]}\n`;
+    }
+  }
+  return { cleanMerge, mergedText };
+}
+
+function parseManifestContent(value: string): AssetManifest | undefined {
+  try {
+    return validateManifest(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function teamCoreMergeDriver(params: MergeDriverParams): { cleanMerge: boolean; mergedText: string } {
+  const [base, ours, theirs] = params.contents.map(parseManifestContent);
+  if (base && ours && theirs) {
+    const merged = mergeAssetManifests(base, ours, theirs);
+    if (merged) return { cleanMerge: true, mergedText: serializeManifest(merged) };
+  }
+  return textMerge(params);
 }
 
 async function collectGitBody(body: GitHttpRequest["body"]): Promise<ArrayBuffer | undefined> {
@@ -229,6 +305,45 @@ export class GitRepository {
     return typeof value === "string" ? value : undefined;
   }
 
+  private async readConflictState(): Promise<GitConflictState | undefined> {
+    if (!(await this.vault.exists(CONFLICT_STATE_PATH))) return undefined;
+    try {
+      const value = JSON.parse(new TextDecoder().decode(await this.vault.read(CONFLICT_STATE_PATH))) as Partial<GitConflictState>;
+      if (value.version !== 1
+        || typeof value.localOid !== "string" || !/^[0-9a-f]{40}$/i.test(value.localOid)
+        || typeof value.remoteOid !== "string" || !/^[0-9a-f]{40}$/i.test(value.remoteOid)
+        || !Array.isArray(value.files) || !value.files.every((path) => typeof path === "string" && path.length > 0)
+        || typeof value.detectedAt !== "string") throw new Error("invalid shape");
+      return value as GitConflictState;
+    } catch (error) {
+      throw new Error(`本地 Git 冲突状态记录损坏，已停止同步：${String(error)}`);
+    }
+  }
+
+  private async writeConflictState(state: GitConflictState): Promise<void> {
+    const encoded = new TextEncoder().encode(`${JSON.stringify(state, null, 2)}\n`);
+    await this.vault.write(CONFLICT_STATE_PATH, encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength));
+  }
+
+  private async clearConflictState(): Promise<void> {
+    if (await this.vault.exists(CONFLICT_STATE_PATH)) await this.vault.remove(CONFLICT_STATE_PATH);
+  }
+
+  async conflictedFiles(): Promise<string[]> {
+    const state = await this.readConflictState();
+    if (!state) return [];
+    const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    if (head && head !== state.localOid) {
+      const includesLocal = await git.isDescendent({ fs: this.fs, dir: "", oid: head, ancestor: state.localOid }).catch(() => false);
+      const includesRemote = await git.isDescendent({ fs: this.fs, dir: "", oid: head, ancestor: state.remoteOid }).catch(() => false);
+      if (includesLocal && includesRemote) {
+        await this.clearConflictState();
+        return [];
+      }
+    }
+    return [...state.files];
+  }
+
   async ensureGitignore(): Promise<void> {
     const path = ".gitignore";
     let current = "";
@@ -273,27 +388,44 @@ export class GitRepository {
   }
 
   async mergeRemote(): Promise<{ merged: boolean; conflicts: string[] }> {
+    const pendingConflicts = await this.conflictedFiles();
+    if (pendingConflicts.length) return { merged: false, conflicts: pendingConflicts };
     const remote = await git.resolveRef({ fs: this.fs, dir: "", ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }).catch(() => undefined);
     const local = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
     if (!remote || !local || remote === local) return { merged: false, conflicts: [] };
+    const currentBranch = await git.currentBranch({ fs: this.fs, dir: "", fullname: false }).catch(() => undefined);
     try {
       const username = this.settings.gitUsername.trim() || "unknown";
       const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
       const result = await git.merge({
         fs: this.fs,
         dir: "",
-        ours: local,
-        theirs: remote,
-        fastForward: false,
+        // Pass the branch ref, not its current OID, so isomorphic-git updates
+        // the branch pointer after creating a merge commit.
+        ours: currentBranch ? `refs/heads/${currentBranch}` : undefined,
+        theirs: `refs/remotes/origin/${DEFAULT_BRANCH}`,
+        fastForward: true,
         message: "Merge remote changes",
         author: { name: username, email },
-        committer: { name: username, email }
+        committer: { name: username, email },
+        mergeDriver: teamCoreMergeDriver
       });
       const conflicts = (result as { conflictedFiles?: string[] }).conflictedFiles ?? [];
+      if (!conflicts.length && !result.alreadyMerged) {
+        // merge() updates the index/tree but does not materialize a clean
+        // merge into the working tree. Checkout makes remote notes available
+        // in the Vault before attachment materialization and the next commit.
+        await git.checkout({ fs: this.fs, dir: "", ref: currentBranch ?? DEFAULT_BRANCH });
+      }
+      await this.clearConflictState();
       return { merged: true, conflicts };
     } catch (error) {
-      const conflicts = (error as { conflictedFiles?: string[] }).conflictedFiles ?? [];
-      if (conflicts.length) return { merged: false, conflicts };
+      const conflicts = conflictFilesFromError(error);
+      if (conflicts.length) {
+        await this.writeConflictState({ version: 1, localOid: local, remoteOid: remote, files: conflicts, detectedAt: new Date().toISOString() });
+        this.logger.warn("Git merge blocked by conflicts", { files: conflicts });
+        return { merged: false, conflicts };
+      }
       throw error;
     }
   }

@@ -1,6 +1,6 @@
 {
   "name": "team-core",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "description": "Cross-platform Oldeng Team Core collaboration plugin for Obsidian",
   "main": "main.js",
   "type": "module",
@@ -37,6 +37,7 @@
     "url": "https://github.com/ZheWana/OldengTeamCore/issues"
   },
   "dependencies": {
+    "diff3": "0.0.3",
     "isomorphic-git": "^1.27.2"
   }
 }

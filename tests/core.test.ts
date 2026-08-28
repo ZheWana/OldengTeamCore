@@ -1,17 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, rename, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { exportSettings, importSettings } from "../src/config";
 import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
-import { GitRepository, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
-import { createEmptyManifest, serializeManifest, validateManifest } from "../src/manifest";
+import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
+import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
-import { shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment } from "../src/sync";
+import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
 import { compareVersions, validatePluginReleaseIndex } from "../src/updater";
+import git from "isomorphic-git";
+
+const execFileAsync = promisify(execFile);
 
 const settings = (overrides: Partial<TeamCoreSettings> = {}): TeamCoreSettings => ({
   ...DEFAULT_SETTINGS,
@@ -63,6 +69,109 @@ class NodeVault implements BinaryVault {
   rename(path: string, newPath: string): Promise<void> {
     return rename(this.resolve(path), this.resolve(newPath));
   }
+}
+
+const encode = (value: string): ArrayBuffer => new TextEncoder().encode(value).buffer;
+const decode = (value: ArrayBuffer): string => new TextDecoder().decode(value);
+
+async function applyFiles(vault: NodeVault, changes: Record<string, string | null>): Promise<void> {
+  for (const [path, content] of Object.entries(changes)) {
+    if (content === null) await vault.remove(path);
+    else await vault.write(path, encode(content));
+  }
+}
+
+async function createDivergence(root: string, base: Record<string, string>, local: Record<string, string | null>, remote: Record<string, string | null>) {
+  const vault = new NodeVault(root);
+  const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+  await repo.init();
+  await applyFiles(vault, base);
+  await repo.commit("Base");
+  await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+  await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+  await applyFiles(vault, remote);
+  const remoteCommit = await repo.commit("Remote change");
+  if (!remoteCommit) throw new Error("Expected a remote commit");
+
+  await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+  await applyFiles(vault, local);
+  const localCommit = await repo.commit("Local change");
+  if (!localCommit) throw new Error("Expected a local commit");
+  await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+  return { vault, repo, localCommit, remoteCommit };
+}
+
+async function runGit(args: string[], cwd?: string): Promise<string> {
+  const result = await execFileAsync("git", args, { cwd });
+  return result.stdout.trim();
+}
+
+async function startGitHttpServer(projectRoot: string, beforeFirstPush: () => Promise<void>) {
+  let pushHookPending = true;
+  const server = createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (pushHookPending && url.searchParams.get("service") === "git-receive-pack") {
+        pushHookPending = false;
+        await beforeFirstPush();
+      }
+      const backend = spawn("git", ["http-backend"], {
+        env: {
+          ...process.env,
+          GIT_PROJECT_ROOT: projectRoot,
+          GIT_HTTP_EXPORT_ALL: "1",
+          PATH_INFO: decodeURIComponent(url.pathname),
+          QUERY_STRING: url.searchParams.toString(),
+          REQUEST_METHOD: request.method ?? "GET",
+          CONTENT_TYPE: request.headers["content-type"] ?? "",
+          CONTENT_LENGTH: request.headers["content-length"] ?? "0",
+          REMOTE_ADDR: request.socket.remoteAddress ?? "127.0.0.1",
+          REMOTE_USER: "vitest"
+        },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      request.pipe(backend.stdin);
+      let pending = Buffer.alloc(0);
+      let headersSent = false;
+      backend.stdout.on("data", (chunk: Buffer) => {
+        if (headersSent) { response.write(chunk); return; }
+        pending = Buffer.concat([pending, chunk]);
+        const split = pending.indexOf("\r\n\r\n");
+        if (split < 0) return;
+        let status = 200;
+        const headers: Record<string, string> = {};
+        for (const line of pending.subarray(0, split).toString("utf8").split("\r\n")) {
+          const colon = line.indexOf(":");
+          if (colon < 0) continue;
+          const name = line.slice(0, colon).trim();
+          const value = line.slice(colon + 1).trim();
+          if (name.toLowerCase() === "status") status = Number.parseInt(value, 10);
+          else headers[name] = value;
+        }
+        response.writeHead(status, headers);
+        headersSent = true;
+        response.write(pending.subarray(split + 4));
+      });
+      backend.on("close", (code) => {
+        if (!headersSent) response.writeHead(code === 0 ? 200 : 500);
+        response.end();
+      });
+    } catch (error) {
+      response.writeHead(500, { "content-type": "text/plain" });
+      response.end(String(error));
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Unable to resolve Git test server port");
+  return {
+    url: `http://127.0.0.1:${address.port}/repo.git`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  };
 }
 
 describe("configuration bundles", () => {
@@ -168,6 +277,29 @@ describe("manifest and vault path rules", () => {
     expect(() => validateManifest({ version: 1, files: { "assets/a.bin": { sha256: "x", size: 1, mime: "x", uploadedAt: "2026-01-01", uploadedBy: "a" } } })).toThrow("SHA-256");
   });
 
+  it("semantically merges independent attachment paths and rejects competing changes to one path", () => {
+    const entry = (hash: string, uploadedBy: string) => ({
+      sha256: hash.repeat(64),
+      size: 10,
+      mime: "image/png",
+      uploadedAt: "2026-08-28T00:00:00.000Z",
+      uploadedBy
+    });
+    const base = createEmptyManifest();
+    const ours = validateManifest({ version: 1, files: { "assets/local.png": entry("a", "alice") } });
+    const theirs = validateManifest({ version: 1, files: { "assets/remote.png": entry("b", "bob") } });
+    expect(mergeAssetManifests(base, ours, theirs)).toEqual(validateManifest({
+      version: 1,
+      files: { "assets/local.png": entry("a", "alice"), "assets/remote.png": entry("b", "bob") }
+    }));
+
+    const remoteSamePath = validateManifest({ version: 1, files: { "assets/local.png": entry("c", "bob") } });
+    expect(mergeAssetManifests(base, ours, remoteSamePath)).toBeUndefined();
+
+    const sameContentMetadata = validateManifest({ version: 1, files: { "assets/local.png": { ...entry("a", "bob"), uploadedAt: "2026-08-28T01:00:00.000Z" } } });
+    expect(mergeAssetManifests(base, ours, sameContentMetadata)?.files["assets/local.png"]).toEqual(ours.files["assets/local.png"]);
+  });
+
   it("extracts wiki and Markdown attachment references", () => {
     const markdown = [
       "![[assets/diagram.png|width=300]]",
@@ -259,6 +391,51 @@ describe("remote attachment materialization", () => {
   });
 });
 
+describe("sync push reconciliation", () => {
+  const rejected = () => Object.assign(new Error("Push rejected because it was not a simple fast-forward. Use force true to override."), {
+    code: "PushRejectedError",
+    data: { reason: "not-fast-forward" }
+  });
+
+  it("recognizes structured and legacy non-fast-forward errors", () => {
+    expect(isNonFastForwardPushError(rejected())).toBe(true);
+    expect(isNonFastForwardPushError(new Error("Push rejected because it was not a simple fast-forward."))).toBe(true);
+    expect(isNonFastForwardPushError(new Error("authentication failed"))).toBe(false);
+    expect(isPushReconciliationError({ code: "NotFoundError", caller: "git.push", data: { what: "a".repeat(40) } })).toBe(true);
+    expect(isPushReconciliationError({ code: "NotFoundError", caller: "git.fetch", data: { what: "a".repeat(40) } })).toBe(false);
+    expect(conflictFilesFromError({ data: { filepaths: ["b.md", "a.md", "a.md"] } })).toEqual(["a.md", "b.md"]);
+  });
+
+  it("fetches, merges, and retries a racing push at most twice", async () => {
+    let pushes = 0;
+    const attempts: number[] = [];
+    const result = await pushWithNonFastForwardRetry(
+      async () => { pushes += 1; if (pushes < 3) throw rejected(); },
+      async (attempt) => { attempts.push(attempt); return { conflicts: [], deferred: false }; }
+    );
+    expect(result).toEqual({ conflicts: [], deferred: false });
+    expect(pushes).toBe(3);
+    expect(attempts).toEqual([1, 2]);
+
+    pushes = 0;
+    await expect(pushWithNonFastForwardRetry(
+      async () => { pushes += 1; throw rejected(); },
+      async () => ({ conflicts: [], deferred: false })
+    )).rejects.toMatchObject({ code: "PushRejectedError" });
+    expect(pushes).toBe(3);
+  });
+
+  it("stops before another push when reconciliation finds a conflict", async () => {
+    let pushes = 0;
+    const result = await pushWithNonFastForwardRetry(
+      async () => { pushes += 1; throw rejected(); },
+      async () => ({ conflicts: ["shared.md"], deferred: false })
+    );
+    expect(result).toEqual({ conflicts: ["shared.md"], deferred: false });
+    expect(pushes).toBe(1);
+  });
+});
+
 describe("Git repository adapter", () => {
   it("initializes, commits, reports history, and detects working-tree changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-git-"));
@@ -291,4 +468,200 @@ describe("Git repository adapter", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("reconciles a diverged local branch and materializes the merged tree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-merge-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+
+      await vault.write("base.md", new TextEncoder().encode("base\n").buffer);
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write("remote.md", new TextEncoder().encode("remote\n").buffer);
+      const remoteCommit = await repo.commit("Remote change");
+      expect(remoteCommit).toMatch(/^[0-9a-f]{40}$/);
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write("local.md", new TextEncoder().encode("local\n").buffer);
+      const localCommit = await repo.commit("Local change");
+      expect(localCommit).toMatch(/^[0-9a-f]{40}$/);
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+
+      const result = await repo.mergeRemote();
+      expect(result).toEqual({ merged: true, conflicts: [] });
+      expect(await git.resolveRef({ fs: repo.fs, dir: "", ref: "HEAD" })).not.toBe(localCommit);
+      expect(new TextDecoder().decode(await vault.read("remote.md"))).toBe("remote\n");
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "same line changed differently",
+      base: { "shared.md": "title\nbase\nend\n" },
+      local: { "shared.md": "title\nlocal\nend\n" },
+      remote: { "shared.md": "title\nremote\nend\n" },
+      conflict: true
+    },
+    {
+      name: "local modification and remote deletion",
+      base: { "shared.md": "base\n", "anchor.md": "anchor\n" },
+      local: { "shared.md": "local\n" },
+      remote: { "shared.md": null },
+      conflict: true
+    },
+    {
+      name: "local deletion and remote modification",
+      base: { "shared.md": "base\n", "anchor.md": "anchor\n" },
+      local: { "shared.md": null },
+      remote: { "shared.md": "remote\n" },
+      conflict: true
+    },
+    {
+      name: "same path added with different content",
+      base: { "anchor.md": "anchor\n" },
+      local: { "shared.md": "local\n" },
+      remote: { "shared.md": "remote\n" },
+      conflict: true
+    },
+    {
+      name: "same path added with identical content",
+      base: { "anchor.md": "anchor\n" },
+      local: { "shared.md": "same\n" },
+      remote: { "shared.md": "same\n" },
+      conflict: false
+    },
+    {
+      name: "different regions of one file",
+      base: { "shared.md": "start\nbase one\nmiddle a\nmiddle b\nbase two\nend\n" },
+      local: { "shared.md": "start\nlocal one\nmiddle a\nmiddle b\nbase two\nend\n" },
+      remote: { "shared.md": "start\nbase one\nmiddle a\nmiddle b\nremote two\nend\n" },
+      conflict: false
+    }
+  ])("handles $name conservatively", async ({ base, local, remote, conflict }) => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-"));
+    try {
+      const { vault, repo, localCommit, remoteCommit } = await createDivergence(root, base, local, remote);
+      const result = await repo.mergeRemote();
+      if (!conflict) {
+        expect(result.conflicts).toEqual([]);
+        expect(await repo.conflictedFiles()).toEqual([]);
+        expect(await repo.hasUncommittedChanges()).toBe(false);
+        return;
+      }
+
+      expect(result).toEqual({ merged: false, conflicts: ["shared.md"] });
+      expect(await git.resolveRef({ fs: repo.fs, dir: "", ref: "HEAD" })).toBe(localCommit);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+      if (local["shared.md"] === null) expect(await vault.exists("shared.md")).toBe(false);
+      else expect(decode(await vault.read("shared.md"))).toBe(local["shared.md"]);
+
+      const reloaded = new GitRepository(vault, settings(), logger, ".obsidian");
+      expect(await reloaded.conflictedFiles()).toEqual(["shared.md"]);
+      expect(await reloaded.mergeRemote()).toEqual({ merged: false, conflicts: ["shared.md"] });
+      expect(await reloaded.commit("Must not commit a blocked conflict")).toBeUndefined();
+      expect(await git.resolveRef({ fs: reloaded.fs, dir: "", ref: "HEAD" })).toBe(localCommit);
+
+      await git.commit({
+        fs: reloaded.fs,
+        dir: "",
+        message: "Resolve conflict externally",
+        parent: [localCommit, remoteCommit],
+        author: { name: "Resolver", email: "resolver@example.test" },
+        committer: { name: "Resolver", email: "resolver@example.test" }
+      });
+      expect(await reloaded.conflictedFiles()).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("merges independent attachment manifest entries without a text conflict", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-manifest-merge-"));
+    const entry = (hash: string, uploadedBy: string) => ({ sha256: hash.repeat(64), size: 10, mime: "image/png", uploadedAt: "2026-08-28T00:00:00.000Z", uploadedBy });
+    try {
+      const base = serializeManifest(createEmptyManifest());
+      const local = serializeManifest(validateManifest({ version: 1, files: { "assets/local.png": entry("a", "alice") } }));
+      const remote = serializeManifest(validateManifest({ version: 1, files: { "assets/remote.png": entry("b", "bob") } }));
+      const { vault, repo } = await createDivergence(root, { ".team/assets-manifest.json": base }, { ".team/assets-manifest.json": local }, { ".team/assets-manifest.json": remote });
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const merged = validateManifest(JSON.parse(decode(await vault.read(".team/assets-manifest.json"))));
+      expect(Object.keys(merged.files).sort()).toEqual(["assets/local.png", "assets/remote.png"]);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers from a real Smart HTTP push race without force-pushing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-push-race-"));
+    const bare = join(root, "repo.git");
+    const seed = join(root, "seed");
+    const racer = join(root, "racer");
+    const local = join(root, "local");
+    let server: Awaited<ReturnType<typeof startGitHttpServer>> | undefined;
+    try {
+      await runGit(["init", "--bare", bare]);
+      await runGit(["symbolic-ref", "HEAD", "refs/heads/main"], bare);
+      await runGit(["config", "http.receivepack", "true"], bare);
+
+      await mkdir(seed);
+      await runGit(["init"], seed);
+      await runGit(["checkout", "-b", "main"], seed);
+      await runGit(["config", "user.name", "Seed"], seed);
+      await runGit(["config", "user.email", "seed@example.test"], seed);
+      await writeFile(join(seed, "base.md"), "base\n");
+      await runGit(["add", "base.md"], seed);
+      await runGit(["commit", "-m", "Base"], seed);
+      await runGit(["remote", "add", "origin", bare], seed);
+      await runGit(["push", "origin", "main"], seed);
+
+      await runGit(["clone", bare, racer]);
+      await runGit(["config", "user.name", "Remote"], racer);
+      await runGit(["config", "user.email", "remote@example.test"], racer);
+      await writeFile(join(racer, "remote.md"), "remote race\n");
+      await runGit(["add", "remote.md"], racer);
+      await runGit(["commit", "-m", "Remote race"], racer);
+      await runGit(["push", "origin", "HEAD:refs/heads/race-candidate"], racer);
+      const candidateOid = await runGit(["rev-parse", "refs/heads/race-candidate"], bare);
+
+      server = await startGitHttpServer(root, async () => {
+        await runGit(["update-ref", "refs/heads/main", candidateOid], bare);
+      });
+      const vault = new NodeVault(local);
+      await vault.mkdir("");
+      const repo = new GitRepository(vault, settings({ gitUrl: server.url }), logger, ".obsidian");
+      await repo.clone();
+      await vault.write("local.md", encode("local race\n"));
+      await repo.commit("Local race");
+
+      let reconciliations = 0;
+      const result = await pushWithNonFastForwardRetry(
+        () => repo.push(),
+        async () => {
+          reconciliations += 1;
+          await repo.fetch();
+          return { ...(await repo.mergeRemote()), deferred: false };
+        }
+      );
+      expect(result).toEqual({ conflicts: [], deferred: false });
+      expect(reconciliations).toBe(1);
+      const localHead = await git.resolveRef({ fs: repo.fs, dir: "", ref: "HEAD" });
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(localHead);
+      const mergedCommit = await git.readCommit({ fs: repo.fs, dir: "", oid: localHead });
+      expect(mergedCommit.commit.parent).toHaveLength(2);
+      expect(decode(await vault.read("local.md"))).toBe("local race\n");
+      expect(decode(await vault.read("remote.md"))).toBe("remote race\n");
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      if (server) await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
