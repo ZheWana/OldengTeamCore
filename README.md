@@ -4,6 +4,13 @@ Oldeng Team Core is a cross-platform Obsidian plugin for synchronizing a small t
 
 Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown 笔记使用 Git 保留历史，附件使用兼容 S3 的对象存储，并在桌面端和移动端使用同一套插件代码。
 
+> [!IMPORTANT]
+> **AI development disclosure / AI 开发声明**
+>
+> This plugin was developed entirely by AI, including its source code, tests, documentation, and automation workflows. Human participation is limited to requirements, product decisions, deployment authorization, and acceptance testing.
+>
+> 本插件完全由 AI 开发，包括源代码、测试、文档和自动化工作流。人类仅负责提出需求、产品决策、部署授权和验收测试。
+
 ## Features
 
 - Automatically batches local changes, fetches remote commits, merges, and pushes through Git Smart HTTP.
@@ -14,7 +21,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
 - Provides explicit initialization, remote import, attachment normalization, diagnostics, and an in-app conflict editor.
 - Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
-- Checks the Oldeng Team Core release index and reminds users when a newer version is available. Obsidian remains responsible for installing updates.
+- Lets the team choose trusted community plugin folders to share through a managed `.gitignore` whitelist. Obsidian remains responsible for installing and updating plugins.
 
 ## Requirements
 
@@ -47,6 +54,8 @@ Open **Settings → Oldeng Team Core** and configure:
 - S3 endpoint, region, bucket, prefix, Access Key, and Secret Key;
 - save debounce and automatic synchronization intervals.
 
+In **团队共享插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. Unselected plugins remain local and are never removed or disabled. `team-core` itself and `community-plugins.json` are never synchronized.
+
 The quick export string contains shared Git and S3 secrets. Treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import.
 
 ## Private notes
@@ -67,12 +76,11 @@ Select the conflict status or run **解决同步冲突** to open the built-in ed
 
 ## Network and privacy disclosure
 
-Oldeng Team Core makes network requests only for its stated synchronization and update-check features:
+Oldeng Team Core makes network requests only for its stated synchronization features:
 
 - the user-configured Git Smart HTTP server receives Git authentication and Markdown repository traffic;
 - the user-configured S3-compatible service receives attachment requests signed with the configured S3 credentials;
-- `https://zhewana.cn/team-core-plugin/index.json` is requested at startup and every six hours to check the latest plugin version;
-- the GitHub Releases page opens only when the user selects **查看发布页**.
+- GitHub Releases are used by Obsidian's own community-plugin update flow, outside the plugin runtime.
 
 Oldeng Team Core does not include client-side telemetry or advertising. Credentials are stored in Obsidian's local plugin data under `.obsidian/plugins/team-core/data.json` and are never committed by Oldeng Team Core. Server operators remain responsible for their Git and S3 privacy, retention, access-control, and logging policies.
 
@@ -88,7 +96,7 @@ npm run dev
 npm run check
 ```
 
-Production output is written to `dist/`. Unit tests cover configuration, hashing, path boundaries, manifest behavior, Git adapter behavior, attachment names, links, and release-index validation.
+Production output is written to `dist/`. Unit tests cover configuration, hashing, path boundaries, shared-plugin ignore rules, manifest behavior, Git adapter behavior, attachment names, links, and conflict handling.
 
 ## Releasing
 

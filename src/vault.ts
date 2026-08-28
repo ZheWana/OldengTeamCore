@@ -27,18 +27,21 @@ export function normalizeVaultPath(path: string): string {
   return parts.join("/");
 }
 
-export function isManagedPath(path: string, configDir = ""): boolean {
+export function isManagedPath(path: string, configDir = "", sharedPluginIds: readonly string[] = []): boolean {
   const normalized = normalizeVaultPath(path);
-  return normalized.length > 0
-    && !isConfigPath(normalized, configDir)
-    && !normalized.startsWith(ASSETS_PREFIX)
-    && !isPrivatePath(normalized);
+  if (!normalized.length || normalized.startsWith(ASSETS_PREFIX) || isPrivatePath(normalized)) return false;
+  if (!isConfigPath(normalized, configDir)) return true;
+  const config = normalizeVaultPath(configDir) || ".obsidian";
+  const prefix = `${config}/plugins/`;
+  if (!normalized.startsWith(prefix)) return false;
+  const pluginId = normalized.slice(prefix.length).split("/")[0];
+  return pluginId !== "team-core" && sharedPluginIds.includes(pluginId);
 }
 
 export function isConfigPath(path: string, configDir: string): boolean {
   const normalized = normalizeVaultPath(path);
-  const config = normalizeVaultPath(configDir);
-  return config.length > 0 && (normalized === config || normalized.startsWith(`${config}/`));
+  const config = normalizeVaultPath(configDir) || ".obsidian";
+  return normalized === config || normalized.startsWith(`${config}/`);
 }
 
 export function isAssetPath(path: string): boolean {

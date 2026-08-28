@@ -5,6 +5,7 @@ import { GitRepository } from "./git";
 import type { CommitSummary, ReferenceInfo, TeamCoreSettings } from "./types";
 import { buildReferenceAudit, createVaultAdapter } from "./vault";
 import type { SyncCoordinator } from "./sync";
+import { listLocalCommunityPlugins, readSharedPluginIds } from "./shared-plugins";
 
 export const HISTORY_VIEW_TYPE = "team-core-history";
 
@@ -113,7 +114,6 @@ type TeamCorePluginHost = Plugin & {
   teamCoreSettings: TeamCoreSettings;
   coordinator: SyncCoordinator;
   saveSettings(): Promise<void>;
-  checkForPluginUpdate(manual?: boolean): Promise<void>;
 };
 
 export class TeamCoreSettingTab extends PluginSettingTab {
@@ -139,11 +139,14 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("同步").setHeading();
     this.number("保存消抖（分钟）", "debounceMs", 60_000);
     this.number("自动同步（分钟）", "syncIntervalMs", 300_000);
-    new Setting(containerEl).setName("插件更新").setHeading();
-    new Setting(containerEl)
-      .setName(`当前版本 ${this.teamPlugin.manifest.version}`)
-      .setDesc("发现新版本后请通过 Obsidian 社区插件功能更新")
-      .addButton((button) => button.setButtonText("检查更新").onClick(() => void this.teamPlugin.checkForPluginUpdate(true)));
+    new Setting(containerEl).setName("团队共享插件").setHeading();
+    const pluginsContainer = containerEl.createDiv("team-core-shared-plugins");
+    pluginsContainer.createEl("p", { text: "选择后会同步该插件目录中的全部文件，包括 main.js、配置和样式。未选择的插件只保留在本地，不会被卸载或覆盖。" });
+    const warning = pluginsContainer.createEl("p", { text: "请只选择团队信任的插件：共享插件包含可执行 JavaScript，远端内容会替换本地版本。", cls: "team-core-shared-plugins-warning" });
+    warning.setAttr("role", "note");
+    const list = pluginsContainer.createDiv("team-core-shared-plugins-list");
+    list.createEl("p", { text: "正在读取本地插件……", cls: "team-core-shared-plugins-loading" });
+    void this.renderSharedPlugins(list);
     new Setting(containerEl).setName("快速导入 / 导出").setHeading();
     const transfer = new Setting(containerEl).setName("配置字符串").setClass("team-core-config-transfer");
     const configInput = transfer.controlEl.createEl("input", { type: "text", placeholder: "粘贴配置字符串", cls: "team-core-config-input" });
@@ -159,6 +162,49 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     const exportButton = transfer.controlEl.createEl("button", { text: "复制导出字符串", cls: "team-core-config-action" });
     exportButton.type = "button";
     exportButton.addEventListener("click", () => void navigator.clipboard.writeText(exportSettings(this.teamPlugin.teamCoreSettings)).then(() => new Notice("配置字符串已复制")));
+  }
+
+  private async renderSharedPlugins(container: HTMLElement): Promise<void> {
+    try {
+      const vault = createVaultAdapter(this.app.vault.adapter);
+      const [plugins, selected] = await Promise.all([
+        listLocalCommunityPlugins(vault, this.app.vault.configDir),
+        readSharedPluginIds(vault, this.app.vault.configDir)
+      ]);
+      container.empty();
+      if (!plugins.length) {
+        container.createEl("p", { text: "尚未发现其他已安装插件。安装插件后重新打开此设置页即可选择。", cls: "team-core-shared-plugins-empty" });
+        return;
+      }
+      const selectedSet = new Set(selected);
+      for (const plugin of plugins) {
+        const detail = plugin.version ? `${plugin.id} · v${plugin.version}` : plugin.id;
+        new Setting(container)
+          .setName(plugin.name)
+          .setDesc(detail)
+          .addToggle((toggle) => {
+            toggle.setValue(selectedSet.has(plugin.id));
+            toggle.setTooltip(`共享 ${plugin.name}`);
+            toggle.onChange(async (enabled) => {
+              toggle.setDisabled(true);
+              try {
+                if (enabled) selectedSet.add(plugin.id);
+                else selectedSet.delete(plugin.id);
+                await this.teamPlugin.coordinator.setSharedPluginIds([...selectedSet]);
+                new Notice(enabled ? `已将 ${plugin.name} 加入团队共享` : `已将 ${plugin.name} 保留为本地插件`);
+              } catch (error) {
+                toggle.setValue(!enabled);
+                new Notice(`共享插件设置失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
+              } finally {
+                toggle.setDisabled(false);
+              }
+            });
+          });
+      }
+    } catch (error) {
+      container.empty();
+      container.createEl("p", { text: `无法读取共享插件白名单：${error instanceof Error ? error.message : String(error)}`, cls: "team-core-shared-plugins-error" });
+    }
   }
 
   private text(name: string, key: keyof TeamCoreSettings, secret: boolean): void {

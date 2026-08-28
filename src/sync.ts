@@ -6,7 +6,8 @@ import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
+import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
+import { readSharedPluginIds, writeSharedPluginIds } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
 
@@ -69,6 +70,13 @@ export function shouldProtectMismatchedLocalAttachment(localFileExists: boolean,
   return localFileExists && uploadedBy === username;
 }
 
+export function shouldTrackVaultEvent(path: string, configDir: string, sharedPluginIds: readonly string[]): boolean {
+  const normalized = normalizeVaultPath(path);
+  return normalized !== MANIFEST_PATH
+    && !isPrivatePath(normalized)
+    && (isAssetPath(normalized) || isManagedPath(normalized, configDir, sharedPluginIds));
+}
+
 export class SyncCoordinator {
   private state: SyncState = "uninitialized";
   private pendingFiles = new Set<string>();
@@ -83,6 +91,7 @@ export class SyncCoordinator {
   private currentAuthor: string | undefined;
   private progress: SyncProgress | undefined;
   private fullAttachmentScanPending = false;
+  private sharedPluginIds: string[] = [];
   readonly logger: Logger;
 
   constructor(private readonly app: App, private readonly settings: () => TeamCoreSettings, private readonly callbacks: SyncCallbacks, logger?: Logger) {
@@ -103,7 +112,9 @@ export class SyncCoordinator {
 
   markFileChanged(file: TFile): void {
     const path = normalizeVaultPath(file.path);
-    if (isConfigPath(path, this.app.vault.configDir) || path === MANIFEST_PATH || isPrivatePath(path)) return;
+    // Attachments are managed through S3 rather than Git, but their Vault
+    // events still need to enter the attachment preparation queue.
+    if (!shouldTrackVaultEvent(path, this.app.vault.configDir, this.sharedPluginIds)) return;
     if (isAssetPath(path)) {
       if (this.internalAssetWrites.delete(path)) return;
       this.pendingAssets.add(path);
@@ -124,16 +135,28 @@ export class SyncCoordinator {
       return;
     }
     if (isAssetPath(previous)) this.pendingAssets.add(previous);
-    else if (!isPrivatePath(previous) && !isConfigPath(previous, this.app.vault.configDir) && previous !== MANIFEST_PATH) this.pendingFiles.add(previous);
+    else if (isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds) && !isPrivatePath(previous) && previous !== MANIFEST_PATH) this.pendingFiles.add(previous);
     this.markFileChanged(file);
     if (this.pendingFiles.has(previous) || this.pendingAssets.has(previous)) this.scheduleSync();
   }
 
   async prepareLocalVault(): Promise<void> {
     const vault = createVaultAdapter(this.app.vault.adapter);
+    this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     const existing = await vault.stat(PRIVATE_FOLDER);
     if (existing && existing.type !== "folder") throw new Error(`无法创建私人笔记文件夹：${PRIVATE_FOLDER} 已被文件占用`);
     await vault.mkdir(PRIVATE_FOLDER);
+  }
+
+  async setSharedPluginIds(ids: readonly string[]): Promise<void> {
+    const vault = createVaultAdapter(this.app.vault.adapter);
+    await writeSharedPluginIds(vault, this.app.vault.configDir, ids);
+    this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+    await this.refreshState();
+    if (this.state !== "uninitialized") {
+      this.pendingFiles.add(".gitignore");
+      this.scheduleSync();
+    }
   }
 
   private scheduleSync(): void {
@@ -166,8 +189,9 @@ export class SyncCoordinator {
 
   async refreshState(): Promise<void> {
     const vault = createVaultAdapter(this.app.vault.adapter);
-    const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
     try {
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       if (!(await git.exists()) || !(await git.remoteUrl())) {
         this.setState("uninitialized");
         return;
@@ -188,7 +212,8 @@ export class SyncCoordinator {
   async getConflictEditorSession(): Promise<ConflictEditorSession> {
     return this.runExclusive(async () => {
       const vault = createVaultAdapter(this.app.vault.adapter);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       return git.getConflictEditorSession();
     });
   }
@@ -196,7 +221,8 @@ export class SyncCoordinator {
   async resolveConflicts(resolutions: readonly ConflictResolution[]): Promise<SyncSnapshot> {
     await this.runExclusive(async () => {
       const vault = createVaultAdapter(this.app.vault.adapter);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       await git.resolveConflicts(resolutions);
       for (const { path } of resolutions) this.pendingFiles.delete(path);
       this.lastError = "";
@@ -240,7 +266,9 @@ export class SyncCoordinator {
     this.setState("syncing");
     try {
       const settings = this.settings();
-      const git = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, this.logger, this.app.vault.configDir);
+      const vault = createVaultAdapter(this.app.vault.adapter);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, settings, this.logger, this.app.vault.configDir, this.sharedPluginIds);
       const remote = await git.remoteInfo();
       if (Object.keys(remote.heads).length > 0) throw new Error("远端仓库已有提交，请使用“从远端知识库导入”或“立即同步”，不能重复初始化");
       this.startProgress("准备本地仓库", 1);
@@ -249,7 +277,6 @@ export class SyncCoordinator {
       await git.ensureRemote();
       await git.ensureGitignore();
       await this.prepareAttachments(new Set(), new Set(), true);
-      const vault = createVaultAdapter(this.app.vault.adapter);
       if (!(await vault.exists(MANIFEST_PATH))) await writeManifest(vault, createEmptyManifest());
       this.startProgress("提交知识库", 1);
       await git.commit("Initialize vault");
@@ -280,10 +307,11 @@ export class SyncCoordinator {
 
   async inspectConnection(): Promise<ConnectionInfo> {
     const vault = createVaultAdapter(this.app.vault.adapter);
-    const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+    this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+    const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
     const files = this.app.vault.getFiles().filter((file) => {
       const path = normalizeVaultPath(file.path);
-      return !isConfigPath(path, this.app.vault.configDir) && !isPrivatePath(path);
+      return (isAssetPath(path) || isManagedPath(path, this.app.vault.configDir, this.sharedPluginIds)) && !isPrivatePath(path);
     });
     const info = await git.remoteInfo();
     return {
@@ -299,8 +327,10 @@ export class SyncCoordinator {
     try {
       if (force) await this.clearForRemoteClone();
       const vault = createVaultAdapter(this.app.vault.adapter);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       await git.clone();
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       await this.materializeRemoteAttachments(createEmptyManifest(), await readManifest(vault));
       this.lastSyncAt = Date.now();
       this.lastError = "";
@@ -335,7 +365,8 @@ export class SyncCoordinator {
     this.setState("syncing");
     try {
       const vault = createVaultAdapter(this.app.vault.adapter);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       const s3 = new S3Transport(this.settings(), this.logger);
       if (!s3.enabled()) throw new Error("S3 配置不完整，未执行任何删除");
 
@@ -388,7 +419,8 @@ export class SyncCoordinator {
     try {
       const settings = this.settings();
       const vault = createVaultAdapter(this.app.vault.adapter);
-      const git = new GitRepository(vault, settings, this.logger, this.app.vault.configDir);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = new GitRepository(vault, settings, this.logger, this.app.vault.configDir, this.sharedPluginIds);
       if (!(await git.exists())) {
         this.pendingFiles.clear();
         this.pendingAssets.clear();

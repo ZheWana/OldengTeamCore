@@ -4,7 +4,6 @@ import { mergeSettings } from "./config";
 import { PluginLogger } from "./logger";
 import { SyncCoordinator } from "./sync";
 import { HISTORY_VIEW_TYPE, TeamCoreHistoryView, TeamCoreSettingTab } from "./ui";
-import { compareVersions, PluginUpdater, UPDATE_CHECK_INTERVAL_MS, type PluginRelease } from "./updater";
 import { ConflictEditorModal } from "./conflict-ui";
 
 export default class TeamCorePlugin extends Plugin {
@@ -15,16 +14,12 @@ export default class TeamCorePlugin extends Plugin {
   private statusProgress!: HTMLProgressElement;
   private latestSnapshot: SyncSnapshot = { state: "uninitialized", pendingFiles: [] };
   private logger!: PluginLogger;
-  private updater!: PluginUpdater;
-  private updateCheckTask: Promise<void> | undefined;
-  private notifiedVersion: string | undefined;
   private conflictEditor: ConflictEditorModal | undefined;
   private openingConflictEditor = false;
 
   async onload(): Promise<void> {
     this.teamCoreSettings = mergeSettings(await this.loadData());
     this.logger = new PluginLogger(() => false);
-    this.updater = new PluginUpdater(this.manifest.id);
     this.statusBar = this.addStatusBarItem();
     this.statusBar.addClass("team-core-status");
     this.statusBar.addEventListener("click", () => void this.handleSyncAction());
@@ -45,7 +40,6 @@ export default class TeamCorePlugin extends Plugin {
     this.addCommand({ id: "clone-remote", name: "从远端知识库导入", callback: () => void this.confirmClone() });
     this.addCommand({ id: "clear-remote-test-data", name: "测试：清空远端 Git 与 S3", callback: () => this.confirmClearRemote() });
     this.addCommand({ id: "copy-diagnostics", name: "复制诊断信息", callback: () => void this.copyDiagnostics() });
-    this.addCommand({ id: "check-for-updates", name: "检查插件更新", callback: () => void this.checkForPluginUpdate(true) });
     this.registerEvent(this.app.vault.on("modify", (file) => { if (file instanceof TFile) this.coordinator.markFileChanged(file); }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => { if (file instanceof TFile) this.coordinator.markFileRenamed(file, oldPath); }));
     this.registerEvent(this.app.vault.on("delete", (file) => { if (file instanceof TFile) this.coordinator.markFileChanged(file); }));
@@ -54,9 +48,7 @@ export default class TeamCorePlugin extends Plugin {
         .then(() => this.coordinator.refreshState())
         .catch((error) => new Notice(`无法创建“私人笔记”文件夹：${error instanceof Error ? error.message : String(error)}`))
         .finally(() => this.coordinator.start());
-      void this.checkForPluginUpdate(false);
     });
-    this.registerInterval(window.setInterval(() => void this.checkForPluginUpdate(false), UPDATE_CHECK_INTERVAL_MS));
     this.updateSnapshot(this.latestSnapshot);
   }
 
@@ -71,48 +63,6 @@ export default class TeamCorePlugin extends Plugin {
     this.coordinator?.start();
   }
 
-  async checkForPluginUpdate(manual = true): Promise<void> {
-    if (this.updateCheckTask) return this.updateCheckTask;
-    const task = this.performUpdateCheck(manual);
-    this.updateCheckTask = task;
-    try { await task; }
-    finally { if (this.updateCheckTask === task) this.updateCheckTask = undefined; }
-  }
-
-  private async performUpdateCheck(manual: boolean): Promise<void> {
-    try {
-      const index = await this.updater.fetchIndex();
-      const current = this.manifest.version;
-      if (compareVersions(index.latest.version, current) > 0) {
-        this.showUpdateNotice(index.latest, current, manual);
-      } else if (manual) {
-        new Notice(`Oldeng Team Core 已是最新版本（${current}）`);
-      }
-    } catch (error) {
-      this.logger.warn("Plugin update check failed", error);
-      if (manual) new Notice(`检查更新失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
-    }
-  }
-
-  private showUpdateNotice(release: PluginRelease, current: string, manual: boolean): void {
-    if (!manual && this.notifiedVersion === release.version) return;
-    this.notifiedVersion = release.version;
-    const fragment = createFragment();
-    const message = fragment.createDiv();
-    message.setText(`Oldeng Team Core 有新版本：${current} → ${release.version}`);
-    if (release.notes.trim()) {
-      const notes = fragment.createDiv();
-      notes.addClass("team-core-update-notes");
-      notes.setText(release.notes.trim());
-    }
-    const notice = new Notice(fragment, 0);
-    const actions = notice.messageEl.createDiv("team-core-update-actions");
-    new ButtonComponent(actions).setButtonText("稍后").onClick(() => notice.hide());
-    new ButtonComponent(actions).setButtonText("查看发布页").setCta().onClick(() => {
-      notice.hide();
-      window.open("https://github.com/ZheWana/OldengTeamCore/releases/latest", "_blank", "noopener");
-    });
-  }
 
   private updateSnapshot(snapshot: SyncSnapshot): void {
     this.latestSnapshot = snapshot;

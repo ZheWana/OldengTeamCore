@@ -10,11 +10,11 @@ import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
-import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment } from "../src/sync";
+import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment, shouldTrackVaultEvent } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
+import { readSharedPluginIdsFromGitignore, updateSharedPluginsInGitignore } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
-import { compareVersions, validatePluginReleaseIndex } from "../src/updater";
 import git from "isomorphic-git";
 
 const execFileAsync = promisify(execFile);
@@ -214,37 +214,6 @@ describe("crypto helpers", () => {
   });
 });
 
-describe("plugin release updates", () => {
-  const release = (version: string) => ({
-    version,
-    minAppVersion: "1.5.0",
-    publishedAt: "2026-08-27T00:00:00.000Z",
-    notes: "test release",
-    files: Object.fromEntries(["main.js", "manifest.json", "styles.css"].map((name) => [name, {
-      path: `releases/${version}/${name}`,
-      sha256: "a".repeat(64),
-      size: 10
-    }]))
-  });
-
-  it("compares stable and prerelease semantic versions", () => {
-    expect(compareVersions("0.1.1", "0.1.0")).toBe(1);
-    expect(compareVersions("1.0.0", "1.0.0-beta.2")).toBe(1);
-    expect(compareVersions("1.0.0-beta.2", "1.0.0-beta.10")).toBe(-1);
-    expect(compareVersions("1.0.0+build.2", "1.0.0+build.1")).toBe(0);
-  });
-
-  it("accepts exactly two ordered releases and rejects redirected file paths", () => {
-    const index = validatePluginReleaseIndex({ schemaVersion: 1, pluginId: "team-core", latest: release("0.1.1"), previous: release("0.1.0") }, "team-core");
-    expect(index.latest.version).toBe("0.1.1");
-    expect(index.previous?.version).toBe("0.1.0");
-
-    const invalid = release("0.1.2");
-    invalid.files["main.js"].path = "https://example.test/main.js";
-    expect(() => validatePluginReleaseIndex({ schemaVersion: 1, pluginId: "team-core", latest: invalid, previous: release("0.1.1") }, "team-core")).toThrow("路径");
-  });
-});
-
 describe("manifest and vault path rules", () => {
   it("normalizes and serializes asset entries deterministically", () => {
     const manifest = validateManifest({
@@ -321,7 +290,33 @@ describe("manifest and vault path rules", () => {
     expect(isPrivatePath("PrivateNotes/visible.md")).toBe(false);
     expect(isConfigPath(".settings/plugins/team-core/data.json", ".settings")).toBe(true);
     expect(isManagedPath(".settings/plugins/team-core/data.json", ".settings")).toBe(false);
+    expect(isManagedPath(".settings/plugins/calendar/main.js", ".settings", ["calendar"])).toBe(true);
+    expect(isManagedPath(".settings/plugins/dataview/main.js", ".settings", ["calendar"])).toBe(false);
+    expect(isManagedPath(".settings/community-plugins.json", ".settings", ["calendar"])).toBe(false);
     expect(isConfigPath(".settings-backup/visible.md", ".settings")).toBe(false);
+  });
+
+  it("uses the managed gitignore block as the shared plugin whitelist", () => {
+    const content = ["notes/*.tmp", "assets/", "私人笔记/"].join("\n") + "\n";
+    const updated = updateSharedPluginsInGitignore(content, ".obsidian", ["dataview", "calendar", "dataview"]);
+    expect(readSharedPluginIdsFromGitignore(updated, ".obsidian")).toEqual(["calendar", "dataview"]);
+    expect(updated).toContain("!.obsidian/plugins/calendar/**");
+    expect(updated).toContain("!.obsidian/plugins/dataview/**");
+    expect(updated).toContain("notes/*.tmp\n");
+    expect(updated).not.toContain("!.obsidian/plugins/team-core/");
+    const migrated = updateSharedPluginsInGitignore(".obsidian/\nassets/\n", ".obsidian", ["calendar"]);
+    expect(migrated.split("\n")).not.toContain(".obsidian/");
+    expect(() => updateSharedPluginsInGitignore(content, ".obsidian", ["../secret"])).toThrow();
+  });
+
+  it("tracks S3 attachments and only whitelisted configuration paths", () => {
+    expect(shouldTrackVaultEvent("assets/new-image.png", ".obsidian", [])).toBe(true);
+    expect(shouldTrackVaultEvent("notes/readme.md", ".obsidian", [])).toBe(true);
+    expect(shouldTrackVaultEvent(".obsidian/plugins/calendar/main.js", ".obsidian", ["calendar"])).toBe(true);
+    expect(shouldTrackVaultEvent(".obsidian/plugins/dataview/main.js", ".obsidian", ["calendar"])).toBe(false);
+    expect(shouldTrackVaultEvent(".obsidian/plugins/team-core/data.json", ".obsidian", ["team-core"])).toBe(false);
+    expect(shouldTrackVaultEvent("私人笔记/private.md", ".obsidian", [])).toBe(false);
+    expect(shouldTrackVaultEvent(".team/assets-manifest.json", ".obsidian", [])).toBe(false);
   });
 
   it("uses a distinct SHA-256 attachment prefix and preserves link decorations when renaming", () => {
@@ -437,6 +432,48 @@ describe("sync push reconciliation", () => {
 });
 
 describe("Git repository adapter", () => {
+  it("stages every file in selected plugin folders and keeps unselected folders local", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-plugins-"));
+    try {
+      const vault = new NodeVault(root);
+      const shared = new GitRepository(vault, settings(), logger, ".obsidian", ["calendar"]);
+      await shared.init();
+      await shared.ensureRemote();
+      await shared.ensureGitignore();
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("calendar"));
+      await vault.write(".obsidian/plugins/calendar/manifest.json", encode("{}"));
+      await vault.write(".obsidian/plugins/calendar/styles.css", encode(".x{}"));
+      await vault.write(".obsidian/plugins/calendar/data.json", encode("{}"));
+      await vault.write(".obsidian/plugins/calendar/extra.bin", encode("extra"));
+      await vault.write(".obsidian/plugins/dataview/main.js", encode("personal"));
+      await vault.write(".obsidian/plugins/team-core/data.json", encode("secret"));
+      const generatedIgnore = decode(await vault.read(".gitignore"));
+      expect(generatedIgnore).toContain(".obsidian/plugins/*\n");
+      expect(generatedIgnore).toContain("!.obsidian/plugins/calendar/**\n");
+      await shared.commit("Shared plugin");
+      const files = await git.listFiles({ fs: shared.fs, dir: "", ref: "HEAD" });
+      expect(files).toEqual(expect.arrayContaining([
+        ".obsidian/plugins/calendar/main.js",
+        ".obsidian/plugins/calendar/manifest.json",
+        ".obsidian/plugins/calendar/styles.css",
+        ".obsidian/plugins/calendar/data.json",
+        ".obsidian/plugins/calendar/extra.bin"
+      ]));
+      expect(files).not.toContain(".obsidian/plugins/dataview/main.js");
+      expect(files).not.toContain(".obsidian/plugins/team-core/data.json");
+
+      const personal = new GitRepository(vault, settings(), logger, ".obsidian", []);
+      await personal.ensureGitignore();
+      expect(await personal.hasUncommittedChanges()).toBe(true);
+      await personal.commit("Make plugin personal");
+      const after = await git.listFiles({ fs: personal.fs, dir: "", ref: "HEAD" });
+      expect(after.some((path) => path.startsWith(".obsidian/plugins/calendar/"))).toBe(false);
+      expect(await vault.exists(".obsidian/plugins/calendar/main.js")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("initializes, commits, reports history, and detects working-tree changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-git-"));
     try {
