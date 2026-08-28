@@ -5,6 +5,7 @@ import { PluginLogger } from "./logger";
 import { SyncCoordinator } from "./sync";
 import { HISTORY_VIEW_TYPE, TeamCoreHistoryView, TeamCoreSettingTab } from "./ui";
 import { compareVersions, PluginUpdater, UPDATE_CHECK_INTERVAL_MS, type PluginRelease } from "./updater";
+import { ConflictEditorModal } from "./conflict-ui";
 
 export default class TeamCorePlugin extends Plugin {
   teamCoreSettings: TeamCoreSettings = { ...DEFAULT_SETTINGS };
@@ -17,6 +18,8 @@ export default class TeamCorePlugin extends Plugin {
   private updater!: PluginUpdater;
   private updateCheckTask: Promise<void> | undefined;
   private notifiedVersion: string | undefined;
+  private conflictEditor: ConflictEditorModal | undefined;
+  private openingConflictEditor = false;
 
   async onload(): Promise<void> {
     this.teamCoreSettings = mergeSettings(await this.loadData());
@@ -24,7 +27,7 @@ export default class TeamCorePlugin extends Plugin {
     this.updater = new PluginUpdater(this.manifest.id);
     this.statusBar = this.addStatusBarItem();
     this.statusBar.addClass("team-core-status");
-    this.statusBar.addEventListener("click", () => void this.coordinator.runManual());
+    this.statusBar.addEventListener("click", () => void this.handleSyncAction());
     this.statusText = this.statusBar.createSpan("team-core-status-text");
     this.statusProgress = this.statusBar.createEl("progress", { cls: "team-core-status-progress" });
     this.statusProgress.hidden = true;
@@ -34,7 +37,8 @@ export default class TeamCorePlugin extends Plugin {
     }, this.logger);
     this.addSettingTab(new TeamCoreSettingTab(this.app, this));
     this.registerView(HISTORY_VIEW_TYPE, (leaf) => new TeamCoreHistoryView(leaf, () => this.teamCoreSettings, () => this.coordinator));
-    this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.coordinator.runManual() });
+    this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.handleSyncAction() });
+    this.addCommand({ id: "resolve-conflicts", name: "解决同步冲突", callback: () => void this.openConflictEditor() });
     this.addCommand({ id: "normalize-attachments", name: "规范化全部附件", callback: () => void this.coordinator.normalizeAllAttachments() });
     this.addCommand({ id: "open-history", name: "打开历史窗口", callback: () => void this.openHistory() });
     this.addCommand({ id: "initialize-remote", name: "初始化并同步当前知识库", callback: () => void this.confirmInitialize() });
@@ -57,6 +61,8 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   onunload(): void {
+    this.conflictEditor?.close();
+    this.conflictEditor = undefined;
     this.coordinator?.stop();
   }
 
@@ -126,8 +132,44 @@ export default class TeamCorePlugin extends Plugin {
       this.statusProgress.hidden = true;
       this.statusProgress.removeAttribute("aria-label");
     }
-    this.statusBar.setAttr("aria-label", progressLabel ? `点击立即同步，${progressLabel}` : "点击立即同步");
-    this.statusBar.setAttr("title", progress?.item ? `${progressLabel ?? progress.phase}：${progress.item}` : "点击立即同步");
+    const actionLabel = snapshot.state === "conflict" ? "点击解决同步冲突" : "点击立即同步";
+    this.statusBar.setAttr("aria-label", progressLabel ? `${actionLabel}，${progressLabel}` : actionLabel);
+    this.statusBar.setAttr("title", progress?.item ? `${progressLabel ?? progress.phase}：${progress.item}` : actionLabel);
+  }
+
+  private async handleSyncAction(): Promise<void> {
+    if (this.latestSnapshot.state === "conflict") {
+      await this.openConflictEditor();
+      return;
+    }
+    await this.coordinator.runManual();
+  }
+
+  private async openConflictEditor(): Promise<void> {
+    if (this.conflictEditor || this.openingConflictEditor) return;
+    this.openingConflictEditor = true;
+    try {
+      const session = await this.coordinator.getConflictEditorSession();
+      if (!session.files.length) {
+        new Notice("当前没有待解决的同步冲突");
+        return;
+      }
+      const modal = new ConflictEditorModal(this.app, session, async (resolutions) => {
+        const snapshot = await this.coordinator.resolveConflicts(resolutions);
+        if (snapshot.state === "synced") new Notice("冲突已解决并完成同步");
+        else if (snapshot.state === "conflict") new Notice("合并提交已保存，但远端又产生了新冲突，请重新打开冲突编辑器", 10_000);
+        else if (snapshot.state === "error" || snapshot.state === "offline") new Notice(`合并提交已保存，后续同步未完成：${snapshot.lastError ?? "请稍后重试"}`, 10_000);
+        else new Notice("冲突已解决，合并提交将在下次同步时推送");
+      }, () => {
+        if (this.conflictEditor === modal) this.conflictEditor = undefined;
+      });
+      this.conflictEditor = modal;
+      modal.open();
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error), 10_000);
+    } finally {
+      this.openingConflictEditor = false;
+    }
   }
 
   private async openHistory(): Promise<void> {

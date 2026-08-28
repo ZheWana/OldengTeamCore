@@ -582,6 +582,136 @@ describe("Git repository adapter", () => {
     }
   });
 
+  it("loads all three conflict versions and creates a two-parent custom resolution", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-editor-"));
+    try {
+      const { vault, repo, localCommit, remoteCommit } = await createDivergence(
+        root,
+        { "shared.md": "title\nbase\n" },
+        { "shared.md": "title\nlocal\n" },
+        { "shared.md": "title\nremote\n" }
+      );
+      expect(await repo.mergeRemote()).toEqual({ merged: false, conflicts: ["shared.md"] });
+
+      const session = await repo.getConflictEditorSession();
+      expect(session).toMatchObject({
+        localOid: localCommit,
+        remoteOid: remoteCommit,
+        files: [{ path: "shared.md", base: "title\nbase\n", local: "title\nlocal\n", remote: "title\nremote\n" }]
+      });
+      expect(session.baseOid).toMatch(/^[0-9a-f]{40}$/);
+      await expect(repo.resolveConflicts([])).rejects.toThrow("每个冲突文件");
+
+      const oid = await repo.resolveConflicts([{ path: "shared.md", content: "title\ncombined\n" }]);
+      const commit = await git.readCommit({ fs: repo.fs, dir: "", oid });
+      expect(commit.commit.parent).toEqual([localCommit, remoteCommit]);
+      expect(commit.commit.message.trim()).toBe("Resolve synchronization conflicts");
+      expect(decode(await vault.read("shared.md"))).toBe("title\ncombined\n");
+      expect(await repo.conflictedFiles()).toEqual([]);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("represents deleted conflict sides and can resolve by deleting the file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-delete-"));
+    try {
+      const { vault, repo, localCommit, remoteCommit } = await createDivergence(
+        root,
+        { "shared.md": "base\n", "anchor.md": "anchor\n" },
+        { "shared.md": "local\n" },
+        { "shared.md": null }
+      );
+      expect(await repo.mergeRemote()).toEqual({ merged: false, conflicts: ["shared.md"] });
+      expect((await repo.getConflictEditorSession()).files[0]).toEqual({
+        path: "shared.md",
+        base: "base\n",
+        local: "local\n",
+        remote: undefined
+      });
+
+      const oid = await repo.resolveConflicts([{ path: "shared.md", content: undefined }]);
+      expect(await vault.exists("shared.md")).toBe(false);
+      expect((await git.readCommit({ fs: repo.fs, dir: "", oid })).commit.parent).toEqual([localCommit, remoteCommit]);
+      await expect(git.readBlob({ fs: repo.fs, dir: "", oid, filepath: "shared.md" })).rejects.toMatchObject({ code: "NotFoundError" });
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("can keep a local deletion when the remote side modified the file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-keep-delete-"));
+    try {
+      const { vault, repo } = await createDivergence(
+        root,
+        { "shared.md": "base\n", "anchor.md": "anchor\n" },
+        { "shared.md": null },
+        { "shared.md": "remote\n" }
+      );
+      expect(await repo.mergeRemote()).toEqual({ merged: false, conflicts: ["shared.md"] });
+      expect((await repo.getConflictEditorSession()).files[0]).toMatchObject({ local: undefined, remote: "remote\n" });
+      await repo.resolveConflicts([{ path: "shared.md", content: undefined }]);
+      expect(await vault.exists("shared.md")).toBe(false);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects stale conflict sessions after HEAD changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-stale-"));
+    try {
+      const { repo, localCommit } = await createDivergence(
+        root,
+        { "shared.md": "base\n" },
+        { "shared.md": "local\n" },
+        { "shared.md": "remote\n" }
+      );
+      await repo.mergeRemote();
+      await git.commit({
+        fs: repo.fs,
+        dir: "",
+        message: "Unexpected local commit",
+        parent: [localCommit],
+        author: { name: "Test", email: "test@example.test" },
+        committer: { name: "Test", email: "test@example.test" }
+      });
+      await expect(repo.getConflictEditorSession()).rejects.toThrow("本地提交已变化");
+      await expect(repo.resolveConflicts([{ path: "shared.md", content: "combined\n" }])).rejects.toThrow("本地提交已变化");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("validates attachment manifest resolutions before changing the worktree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-manifest-editor-"));
+    const entry = (hash: string, uploadedBy: string) => ({ sha256: hash.repeat(64), size: 10, mime: "image/png", uploadedAt: "2026-08-28T00:00:00.000Z", uploadedBy });
+    try {
+      const base = serializeManifest(createEmptyManifest());
+      const local = serializeManifest(validateManifest({ version: 1, files: { "assets/shared.png": entry("a", "alice") } }));
+      const remote = serializeManifest(validateManifest({ version: 1, files: { "assets/shared.png": entry("b", "bob") } }));
+      const { vault, repo } = await createDivergence(
+        root,
+        { ".team/assets-manifest.json": base },
+        { ".team/assets-manifest.json": local },
+        { ".team/assets-manifest.json": remote }
+      );
+      expect(await repo.mergeRemote()).toEqual({ merged: false, conflicts: [".team/assets-manifest.json"] });
+      await expect(repo.resolveConflicts([{ path: ".team/assets-manifest.json", content: "not json" }])).rejects.toThrow("附件清单格式无效");
+      await expect(repo.resolveConflicts([{ path: ".team/assets-manifest.json", content: undefined }])).rejects.toThrow("附件清单不能删除");
+      expect(decode(await vault.read(".team/assets-manifest.json"))).toBe(local);
+      expect(await repo.conflictedFiles()).toEqual([".team/assets-manifest.json"]);
+
+      await repo.resolveConflicts([{ path: ".team/assets-manifest.json", content: remote }]);
+      expect(validateManifest(JSON.parse(decode(await vault.read(".team/assets-manifest.json"))))).toEqual(JSON.parse(remote));
+      expect(await repo.conflictedFiles()).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("merges independent attachment manifest entries without a text conflict", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-manifest-merge-"));
     const entry = (hash: string, uploadedBy: string) => ({ sha256: hash.repeat(64), size: 10, mime: "image/png", uploadedAt: "2026-08-28T00:00:00.000Z", uploadedBy });

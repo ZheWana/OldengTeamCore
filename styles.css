@@ -46,3 +46,69 @@
   .team-core-summary-grid { grid-template-columns: 1fr; }
   .team-core-history-view { padding: .75em; }
 }
+
+.team-core-conflict-modal { width: min(96vw, 90rem); height: min(88vh, 58rem); }
+.team-core-conflict-modal .modal-content { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.team-core-conflict-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 2rem; margin-bottom: .65rem; }
+.team-core-conflict-revision { color: var(--text-muted); font-family: var(--font-monospace); font-size: var(--font-ui-smaller); }
+.team-core-conflict-completion { color: var(--text-muted); font-size: var(--font-ui-small); white-space: nowrap; }
+.team-core-conflict-mobile-file { display: none; margin-bottom: .65rem; }
+.team-core-conflict-mobile-file select { width: 100%; }
+.team-core-conflict-shell { display: grid; grid-template-columns: minmax(11rem, 15rem) minmax(0, 1fr); flex: 1; min-height: 0; border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
+.team-core-conflict-files { min-width: 0; padding: .7rem .5rem; overflow: auto; background: var(--background-secondary); border-right: 1px solid var(--background-modifier-border); }
+.team-core-conflict-section-label { padding: 0 .45rem .55rem; color: var(--text-muted); font-size: var(--font-ui-smaller); font-weight: var(--font-semibold); }
+.team-core-conflict-file { display: grid; grid-template-columns: 1rem minmax(0, 1fr); align-items: center; gap: .5rem; width: 100%; min-height: 2.25rem; padding: .4rem .5rem; border: 0; border-radius: 4px; color: var(--text-muted); background: transparent; box-shadow: none; text-align: left; }
+.team-core-conflict-file:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.team-core-conflict-file.is-active { color: var(--text-normal); background: var(--background-modifier-active-hover); }
+.team-core-conflict-file.is-resolved .team-core-conflict-file-icon { color: var(--color-green); }
+.team-core-conflict-file-icon { display: flex; width: 1rem; height: 1rem; color: var(--text-warning); }
+.team-core-conflict-file-icon svg { width: 1rem; height: 1rem; }
+.team-core-conflict-file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-core-conflict-workbench { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: .75rem; }
+.team-core-conflict-file-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 2.25rem; margin-bottom: .55rem; }
+.team-core-conflict-file-header strong { min-width: 0; overflow-wrap: anywhere; font-size: var(--font-ui-medium); }
+.team-core-conflict-navigation { display: flex; flex: 0 0 auto; gap: .35rem; }
+.team-core-conflict-navigation button { width: 2rem; height: 2rem; padding: 0; }
+.team-core-conflict-modal button .team-core-button-icon { display: inline-flex; width: 1rem; height: 1rem; margin-right: .35rem; vertical-align: text-bottom; }
+.team-core-conflict-modal button .team-core-button-icon svg { width: 1rem; height: 1rem; }
+.team-core-conflict-tabs { display: none; }
+.team-core-conflict-panes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); flex: 1; min-height: 20rem; border: 1px solid var(--background-modifier-border); border-radius: 5px; overflow: hidden; }
+.team-core-conflict-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--background-primary); }
+.team-core-conflict-pane + .team-core-conflict-pane { border-left: 1px solid var(--background-modifier-border); }
+.team-core-conflict-result { background: var(--background-primary-alt); box-shadow: inset 0 2px 0 var(--interactive-accent); }
+.team-core-conflict-pane-heading { display: flex; align-items: center; justify-content: space-between; gap: .5rem; min-height: 2.4rem; padding: .45rem .65rem; border-bottom: 1px solid var(--background-modifier-border); }
+.team-core-conflict-pane-heading strong { font-size: var(--font-ui-small); }
+.team-core-conflict-pane-heading span { color: var(--text-muted); font-family: var(--font-monospace); font-size: var(--font-ui-smaller); }
+.team-core-conflict-editor { flex: 1; width: 100%; min-width: 0; min-height: 0; padding: .7rem; border: 0; border-radius: 0; color: var(--text-normal); background: transparent; box-shadow: none; font-family: var(--font-monospace); font-size: var(--font-ui-small); line-height: 1.55; resize: none; white-space: pre; overflow: auto; }
+.team-core-conflict-editor[readonly] { color: var(--text-muted); cursor: text; }
+.team-core-conflict-editor:focus { box-shadow: inset 0 0 0 2px var(--interactive-accent); }
+.team-core-conflict-decisions { display: flex; align-items: center; gap: .45rem; margin-top: .65rem; }
+.team-core-conflict-decisions button:last-child { margin-left: auto; }
+.team-core-conflict-delete { color: var(--text-error); }
+.team-core-conflict-error { min-height: 1.5rem; padding-top: .35rem; color: var(--text-error); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
+.team-core-conflict-footer { display: flex; justify-content: flex-end; gap: .5rem; }
+
+@media (max-width: 860px) {
+  .team-core-conflict-modal { width: min(96vw, 48rem); height: min(92vh, 58rem); }
+  .team-core-conflict-mobile-file { display: block; }
+  .team-core-conflict-shell { grid-template-columns: minmax(0, 1fr); }
+  .team-core-conflict-files { display: none; }
+  .team-core-conflict-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: .55rem; border-bottom: 1px solid var(--background-modifier-border); }
+  .team-core-conflict-tabs button { min-height: 2.25rem; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+  .team-core-conflict-tabs button.is-active { color: var(--text-accent); box-shadow: inset 0 -2px 0 var(--interactive-accent); }
+  .team-core-conflict-panes { grid-template-columns: minmax(0, 1fr); min-height: 18rem; }
+  .team-core-conflict-pane { display: none; }
+  .team-core-conflict-pane.is-mobile-active { display: flex; }
+  .team-core-conflict-pane + .team-core-conflict-pane { border-left: 0; }
+  .team-core-conflict-decisions { flex-wrap: wrap; }
+  .team-core-conflict-decisions button:last-child { margin-left: 0; }
+}
+
+@media (max-width: 520px) {
+  .team-core-conflict-modal { width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
+  .team-core-conflict-workbench { padding: .55rem; }
+  .team-core-conflict-header { align-items: flex-start; }
+  .team-core-conflict-decisions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .team-core-conflict-decisions button { width: 100%; }
+  .team-core-conflict-footer button { flex: 1; }
+}

@@ -1,7 +1,7 @@
 import { FileSystemAdapter, TFile, type App } from "obsidian";
 import { MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
 import { sha256Hex } from "./crypto";
-import { GitRepository, isPushReconciliationError } from "./git";
+import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
 import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3NotFoundError, S3Transport } from "./s3";
@@ -185,6 +185,28 @@ export class SyncCoordinator {
     }
   }
 
+  async getConflictEditorSession(): Promise<ConflictEditorSession> {
+    return this.runExclusive(async () => {
+      const vault = createVaultAdapter(this.app.vault.adapter);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+      return git.getConflictEditorSession();
+    });
+  }
+
+  async resolveConflicts(resolutions: readonly ConflictResolution[]): Promise<SyncSnapshot> {
+    await this.runExclusive(async () => {
+      const vault = createVaultAdapter(this.app.vault.adapter);
+      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir);
+      await git.resolveConflicts(resolutions);
+      for (const { path } of resolutions) this.pendingFiles.delete(path);
+      this.lastError = "";
+      this.progress = undefined;
+      this.setState("local-changes");
+    });
+    await this.runCycle(true);
+    return this.snapshot();
+  }
+
   async clearRemoteData(): Promise<RemoteClearResult> {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = undefined;
@@ -244,14 +266,16 @@ export class SyncCoordinator {
     }
   }
 
-  private async runExclusive(operation: () => Promise<void>): Promise<void> {
+  private async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
     while (this.running) await this.running;
-    const task = operation();
+    let result!: T;
+    const task = operation().then((value) => { result = value; });
     const running = task.finally(() => {
       if (this.running === running) this.running = undefined;
     });
     this.running = running;
-    return running;
+    await running;
+    return result;
   }
 
   async inspectConnection(): Promise<ConnectionInfo> {

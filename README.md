@@ -12,7 +12,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Renames managed attachments to `assets/tc-sha256-<sha256>.<extension>` and updates Markdown and Wiki links.
 - Shows phase and numeric progress during synchronization.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
-- Provides explicit initialization, remote import, attachment normalization, diagnostics, and conflict states.
+- Provides explicit initialization, remote import, attachment normalization, diagnostics, and an in-app conflict editor.
 - Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
 - Checks the Oldeng Team Core release index and reminds users when a newer version is available. Obsidian remains responsible for installing updates.
 
@@ -61,7 +61,9 @@ Concurrent changes to different attachment paths are merged semantically in the 
 
 ## Conflict behavior
 
-Oldeng Team Core automatically merges independent changes and retries a push race at most twice through fetch and merge. It never force-pushes. A true content conflict stops before push, keeps the pre-merge note content unchanged, records the conflicting paths under local `.git` metadata, and remains visible after plugin reload. Repeated automatic or manual synchronization stays blocked until the Git conflict is resolved with a commit that includes both recorded histories.
+Oldeng Team Core automatically merges independent changes and retries a push race at most twice through fetch and merge. It never force-pushes. A true content conflict stops before push, keeps the pre-merge note content unchanged, records the conflicting paths under local `.git` metadata, and remains visible after plugin reload.
+
+Select the conflict status or run **解决同步冲突** to open the built-in editor. Desktop layouts show the local version, editable result, and remote version side by side; narrow layouts provide the same views as tabs. Every file must be explicitly resolved by choosing a side, editing a custom result, or deleting the file. Saving creates a standard two-parent merge commit and resumes the normal synchronization flow.
 
 ## Network and privacy disclosure
 

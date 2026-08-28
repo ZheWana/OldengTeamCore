@@ -3,7 +3,7 @@ import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
 import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./types";
 import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
-import { DEFAULT_BRANCH, PRIVATE_PREFIX } from "./constants";
+import { DEFAULT_BRANCH, MANIFEST_PATH, PRIVATE_PREFIX } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
 
 const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
@@ -37,6 +37,25 @@ export interface GitRemoteInfo {
   heads: Record<string, string>;
   tags: Record<string, string>;
   defaultBranch?: string;
+}
+
+export interface ConflictFileVersion {
+  path: string;
+  base?: string;
+  local?: string;
+  remote?: string;
+}
+
+export interface ConflictEditorSession {
+  baseOid: string;
+  localOid: string;
+  remoteOid: string;
+  files: ConflictFileVersion[];
+}
+
+export interface ConflictResolution {
+  path: string;
+  content?: string;
 }
 
 function stringMap(value: unknown): Record<string, string> {
@@ -327,6 +346,94 @@ export class GitRepository {
 
   private async clearConflictState(): Promise<void> {
     if (await this.vault.exists(CONFLICT_STATE_PATH)) await this.vault.remove(CONFLICT_STATE_PATH);
+  }
+
+  private async requireConflictState(): Promise<GitConflictState> {
+    const state = await this.readConflictState();
+    if (!state) throw new Error("当前没有待解决的同步冲突");
+    const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    if (head !== state.localOid) throw new Error("冲突发生后本地提交已变化，请重新同步并重新打开冲突编辑器");
+    return state;
+  }
+
+  private async readConflictText(oid: string, filepath: string): Promise<string | undefined> {
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid, filepath });
+      if (blob.includes(0)) throw new Error(`冲突文件不是文本，无法在内置编辑器中处理：${filepath}`);
+      try {
+        return new TextDecoder("utf-8", { fatal: true }).decode(blob);
+      } catch {
+        throw new Error(`冲突文件不是有效的 UTF-8 文本，无法在内置编辑器中处理：${filepath}`);
+      }
+    } catch (error) {
+      if (error && typeof error === "object" && (error as { code?: unknown }).code === "NotFoundError") return undefined;
+      throw error;
+    }
+  }
+
+  async getConflictEditorSession(): Promise<ConflictEditorSession> {
+    const state = await this.requireConflictState();
+    const mergeBases: unknown = await git.findMergeBase({ fs: this.fs, dir: "", oids: [state.localOid, state.remoteOid] });
+    const baseOid = Array.isArray(mergeBases) ? mergeBases.find((oid): oid is string => typeof oid === "string" && /^[0-9a-f]{40}$/i.test(oid)) : undefined;
+    if (!baseOid) throw new Error("无法确定冲突的共同版本，请使用外部 Git 工具处理");
+    const files = await Promise.all(state.files.map(async (path) => ({
+      path,
+      base: await this.readConflictText(baseOid, path),
+      local: await this.readConflictText(state.localOid, path),
+      remote: await this.readConflictText(state.remoteOid, path)
+    })));
+    return { baseOid, localOid: state.localOid, remoteOid: state.remoteOid, files };
+  }
+
+  async resolveConflicts(resolutions: readonly ConflictResolution[]): Promise<string> {
+    const state = await this.requireConflictState();
+    const expected = [...state.files].sort();
+    const provided = resolutions.map(({ path }) => path).sort();
+    if (new Set(provided).size !== provided.length || provided.length !== expected.length || provided.some((path, index) => path !== expected[index])) {
+      throw new Error("必须为每个冲突文件提交且仅提交一个解决结果");
+    }
+
+    const normalized = resolutions.map((resolution) => {
+      if (resolution.path !== normalizeVaultPath(resolution.path) || !isManagedPath(resolution.path, this.configDir)) {
+        throw new Error(`冲突文件路径无效：${resolution.path}`);
+      }
+      if (resolution.path !== MANIFEST_PATH) return { ...resolution };
+      if (resolution.content === undefined) throw new Error("附件清单不能删除，请选择或编辑一个有效版本");
+      try {
+        return { path: resolution.path, content: serializeManifest(validateManifest(JSON.parse(resolution.content))) };
+      } catch (error) {
+        throw new Error(`附件清单格式无效：${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+
+    for (const resolution of normalized) {
+      if (resolution.content === undefined) {
+        if (await this.vault.exists(resolution.path)) await this.vault.remove(resolution.path);
+        await git.remove({ fs: this.fs, dir: "", filepath: resolution.path });
+      } else {
+        const encoded = new TextEncoder().encode(resolution.content);
+        await this.vault.write(resolution.path, encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength));
+        await git.add({ fs: this.fs, dir: "", filepath: resolution.path });
+      }
+    }
+
+    const username = this.settings.gitUsername.trim() || "unknown";
+    const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
+    const oid = await git.commit({
+      fs: this.fs,
+      dir: "",
+      message: "Resolve synchronization conflicts",
+      parent: [state.localOid, state.remoteOid],
+      author: { name: username, email },
+      committer: { name: username, email }
+    });
+    const commit = await git.readCommit({ fs: this.fs, dir: "", oid });
+    if (commit.commit.parent[0] !== state.localOid || commit.commit.parent[1] !== state.remoteOid) {
+      throw new Error("冲突解决提交未包含完整的本地和远端历史，已停止同步");
+    }
+    await this.clearConflictState();
+    this.logger.debug("Created conflict resolution commit", { oid, files: expected });
+    return oid;
   }
 
   async conflictedFiles(): Promise<string[]> {
