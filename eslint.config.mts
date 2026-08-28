@@ -20,10 +20,16 @@ export default defineConfig(
         projectService: {
           allowDefaultProject: ["eslint.config.mts", "stylelint.config.mjs", "manifest.json"]
         },
-        tsconfigRootDir: import.meta.dirname as string,
+        tsconfigRootDir: import.meta.dirname,
         extraFileExtensions: [".json"]
       }
     }
   },
-  ...obsidianmd.configs.recommended
+  ...obsidianmd.configs.recommended,
+  {
+    files: ["eslint.config.mts"],
+    rules: {
+      "@typescript-eslint/no-unsafe-assignment": "off"
+    }
+  }
 );
