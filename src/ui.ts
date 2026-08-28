@@ -1,4 +1,4 @@
-import { ItemView, Notice, PluginSettingTab, Setting, TFile, WorkspaceLeaf, type App, type Plugin, type SettingDefinition, type SettingDefinitionItem } from "obsidian";
+import { ButtonComponent, ItemView, Modal, Notice, PluginSettingTab, Setting, TFile, WorkspaceLeaf, type App, type Plugin, type SettingDefinition, type SettingDefinitionItem } from "obsidian";
 import { exportSettings, importSettings } from "./config";
 import { readManifest } from "./manifest";
 import { GitRepository } from "./git";
@@ -154,7 +154,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
         this.numberDefinition("保存消抖（分钟）", "debounceMs", 60_000),
         this.numberDefinition("自动同步（分钟）", "syncIntervalMs", 300_000)
       ]),
-      this.group("团队共享插件", [this.sharedPluginsDefinition()]),
+      this.group("团队公共插件", [this.sharedPluginsDefinition()]),
       this.group("快速导入 / 导出", [this.transferDefinition()])
     ];
   }
@@ -178,8 +178,8 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("同步").setHeading();
     this.addNumberControl(new Setting(containerEl).setName("保存消抖（分钟）"), "debounceMs", 60_000);
     this.addNumberControl(new Setting(containerEl).setName("自动同步（分钟）"), "syncIntervalMs", 300_000);
-    new Setting(containerEl).setName("团队共享插件").setHeading();
-    this.addSharedPluginsControl(new Setting(containerEl));
+    new Setting(containerEl).setName("团队公共插件").setHeading();
+    this.addSharedPluginsEntry(new Setting(containerEl).setName("公共插件管理"));
     new Setting(containerEl).setName("快速导入 / 导出").setHeading();
     this.addTransferControl(new Setting(containerEl).setName("配置字符串"));
   }
@@ -198,9 +198,10 @@ export class TeamCoreSettingTab extends PluginSettingTab {
 
   private sharedPluginsDefinition(): SettingDefinition {
     return {
-      name: "共享插件白名单",
-      aliases: ["团队插件", "插件同步", "gitignore"],
-      render: (setting) => this.addSharedPluginsControl(setting)
+      name: "公共插件管理",
+      desc: "仅供负责维护团队插件配置的核心成员使用。",
+      aliases: ["团队插件", "共享插件", "插件同步", "gitignore"],
+      render: (setting) => this.addSharedPluginsEntry(setting)
     };
   }
 
@@ -212,15 +213,26 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     };
   }
 
-  private addSharedPluginsControl(setting: Setting): void {
-    setting.settingEl.empty();
-    setting.settingEl.addClass("team-core-shared-plugins");
-    setting.settingEl.createEl("p", { text: "选择后会同步该插件目录中的全部文件，包括 main.js、配置和样式。未选择的插件只保留在本地，不会被卸载或覆盖。" });
-    const warning = setting.settingEl.createEl("p", { text: "请只选择团队信任的插件：共享插件包含可执行 JavaScript，远端内容会替换本地版本。", cls: "team-core-shared-plugins-warning" });
-    warning.setAttr("role", "note");
-    const list = setting.settingEl.createDiv("team-core-shared-plugins-list");
-    list.createEl("p", { text: "正在读取本地插件……", cls: "team-core-shared-plugins-loading" });
-    void this.renderSharedPlugins(list);
+  private addSharedPluginsEntry(setting: Setting): void {
+    setting.setDesc("仅供负责维护团队插件配置的核心成员使用。");
+    setting.addButton((button) => {
+      button
+        .setIcon("settings-2")
+        .setTooltip("进入公共插件管理")
+        .onClick(() => void this.openSharedPluginManager());
+      button.buttonEl.appendText("管理公共插件");
+    });
+  }
+
+  private async openSharedPluginManager(): Promise<void> {
+    const confirmed = await requestConfirmation(this.app, {
+      title: "进入公共插件管理",
+      message: "这里的更改会修改团队公共插件配置，并在同步后影响所有成员。只有确认自己正在维护团队配置时才应继续。",
+      confirmText: "进入管理",
+      destructive: true
+    });
+    if (!confirmed) return;
+    new SharedPluginsModal(this.app, (container) => this.renderSharedPlugins(container)).open();
   }
 
   private addTransferControl(transfer: Setting): void {
@@ -249,10 +261,13 @@ export class TeamCoreSettingTab extends PluginSettingTab {
   private async renderSharedPlugins(container: HTMLElement): Promise<void> {
     try {
       const vault = createVaultAdapter(this.app.vault.adapter);
-      const [plugins, selected] = await Promise.all([
+      const [localPlugins, selected] = await Promise.all([
         listLocalCommunityPlugins(vault, this.app.vault.configDir),
         readSharedPluginIds(vault, this.app.vault.configDir)
       ]);
+      const pluginsById = new Map(localPlugins.map((plugin) => [plugin.id, plugin]));
+      for (const id of selected) if (!pluginsById.has(id)) pluginsById.set(id, { id, name: id });
+      const plugins = [...pluginsById.values()].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
       container.empty();
       if (!plugins.length) {
         container.createEl("p", { text: "尚未发现其他已安装插件。安装插件后重新打开此设置页即可选择。", cls: "team-core-shared-plugins-empty" });
@@ -260,7 +275,8 @@ export class TeamCoreSettingTab extends PluginSettingTab {
       }
       const selectedSet = new Set(selected);
       for (const plugin of plugins) {
-        const detail = plugin.version ? `${plugin.id} · v${plugin.version}` : plugin.id;
+        const local = localPlugins.some(({ id }) => id === plugin.id);
+        const detail = plugin.version ? `${plugin.id} · v${plugin.version}` : local ? plugin.id : `${plugin.id} · 文件尚未同步到本机`;
         new Setting(container)
           .setName(plugin.name)
           .setDesc(detail)
@@ -312,6 +328,36 @@ export class TeamCoreSettingTab extends PluginSettingTab {
         }
       });
     });
+  }
+}
+
+class SharedPluginsModal extends Modal {
+  constructor(app: App, private readonly renderPlugins: (container: HTMLElement) => Promise<void>) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass("team-core-shared-plugins-modal");
+    this.titleEl.setText("公共插件管理");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: "启用后会同步该插件目录中的全部文件，包括 main.js、配置和样式。关闭后插件仍保留在本机。",
+      cls: "team-core-shared-plugins-intro"
+    });
+    const warning = this.contentEl.createEl("p", {
+      text: "公共插件包含可执行 JavaScript，远端版本会替换其他成员的本地版本。",
+      cls: "team-core-shared-plugins-warning"
+    });
+    warning.setAttr("role", "note");
+    const list = this.contentEl.createDiv("team-core-shared-plugins-list");
+    list.createEl("p", { text: "正在读取本地插件……", cls: "team-core-shared-plugins-loading" });
+    void this.renderPlugins(list);
+    const footer = this.contentEl.createDiv("team-core-shared-plugins-footer");
+    new ButtonComponent(footer).setButtonText("完成").setCta().onClick(() => this.close());
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 

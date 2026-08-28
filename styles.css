@@ -31,13 +31,15 @@ button.team-core-destructive-button { background-color: var(--color-red); color:
 .team-core-settings .setting-item-control input[type="password"],
 .team-core-settings .setting-item-control input[type="number"] { width: 100%; min-width: 0; max-width: none; }
 .team-core-settings .team-core-config-transfer > .setting-item-control { display: grid; grid-template-columns: minmax(12rem, 1fr) auto auto; gap: .5rem; flex-basis: 46rem; width: min(72%, 46rem); max-width: 46rem; }
+.team-core-settings .setting-item-control button[aria-label="进入公共插件管理"] .svg-icon { margin-right: .35rem; vertical-align: text-bottom; }
 .team-core-config-input { grid-column: 1; }
 .team-core-config-action { white-space: nowrap; }
-.team-core-shared-plugins { display: block; margin: .4rem 0 1.25rem; }
-.team-core-shared-plugins > p { margin: .35rem 0 .8rem; color: var(--text-muted); font-size: var(--font-ui-small); }
-.team-core-shared-plugins > p.team-core-shared-plugins-warning { color: var(--text-warning); }
+.team-core-shared-plugins-modal { width: min(92vw, 42rem); }
+.team-core-shared-plugins-intro { margin: .2rem 0 .75rem; color: var(--text-muted); font-size: var(--font-ui-small); }
+.team-core-shared-plugins-warning { margin: 0 0 1rem; padding-left: .75rem; border-left: 3px solid var(--text-warning); color: var(--text-warning); font-size: var(--font-ui-small); }
 .team-core-shared-plugins-list { border-top: 1px solid var(--background-modifier-border); }
 .team-core-shared-plugins-list .setting-item { padding-left: .2rem; padding-right: .2rem; }
+.team-core-shared-plugins-footer { display: flex; justify-content: flex-end; margin-top: 1rem; }
 .team-core-shared-plugins-empty,
 .team-core-shared-plugins-loading,
 .team-core-shared-plugins-error { padding: .75rem .2rem; color: var(--text-muted); }

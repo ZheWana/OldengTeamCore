@@ -12,7 +12,7 @@ import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateMa
 import { S3Transport } from "../src/s3";
 import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment, shouldTrackVaultEvent } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
-import { readSharedPluginIdsFromGitignore, updateSharedPluginsInGitignore } from "../src/shared-plugins";
+import { mergeSharedPluginIds, readSharedPluginIdsFromGitignore, updateSharedPluginsInGitignore } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
 import git from "isomorphic-git";
@@ -309,6 +309,8 @@ describe("manifest and vault path rules", () => {
     const migrated = updateSharedPluginsInGitignore(".obsidian/\nassets/\n", ".obsidian", ["calendar"]);
     expect(migrated.split("\n")).not.toContain(".obsidian/");
     expect(() => updateSharedPluginsInGitignore(content, ".obsidian", ["../secret"])).toThrow();
+    expect(mergeSharedPluginIds(["calendar"], ["calendar", "dataview"], ["calendar", "templater-obsidian"])).toEqual(["calendar", "dataview", "templater-obsidian"]);
+    expect(mergeSharedPluginIds(["calendar"], [], ["calendar"])).toEqual([]);
   });
 
   it("tracks S3 attachments and only whitelisted configuration paths", () => {
@@ -648,6 +650,50 @@ describe("Git repository adapter", () => {
       expect(commit.commit.message.trim()).toBe("Resolve synchronization conflicts");
       expect(decode(await vault.read("shared.md"))).toBe("title\ncombined\n");
       expect(await repo.conflictedFiles()).toEqual([]);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps non-conflicting remote files when resolving one conflict", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-remote-files-"));
+    try {
+      const { vault, repo, localCommit, remoteCommit } = await createDivergence(
+        root,
+        { "shared.md": "title\nbase\n" },
+        { "shared.md": "title\nlocal\n" },
+        { "shared.md": "title\nremote\n", "remote-only.md": "must survive\n" }
+      );
+      expect(await repo.mergeRemote()).toEqual({ merged: false, conflicts: ["shared.md"] });
+      const oid = await repo.resolveConflicts([{ path: "shared.md", content: "title\ncombined\n" }]);
+      expect(decode(await vault.read("remote-only.md"))).toBe("must survive\n");
+      expect((await git.readCommit({ fs: repo.fs, dir: "", oid })).commit.parent).toEqual([localCommit, remoteCommit]);
+      expect((await git.listFiles({ fs: repo.fs, dir: "", ref: "HEAD" }))).toContain("remote-only.md");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("semantically merges independent public-plugin whitelist changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-gitignore-merge-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      const base = updateSharedPluginsInGitignore("assets/\n私人笔记/\n", ".obsidian", []);
+      await vault.write(".gitignore", encode(base));
+      await repo.commit("Base ignore");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write(".gitignore", encode(updateSharedPluginsInGitignore(base, ".obsidian", ["calendar"])));
+      const remoteCommit = await repo.commit("Remote public plugin");
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write(".gitignore", encode(updateSharedPluginsInGitignore(base, ".obsidian", ["dataview"])));
+      await repo.commit("Local public plugin");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit!, force: true });
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      expect(readSharedPluginIdsFromGitignore(decode(await vault.read(".gitignore")), ".obsidian")).toEqual(["calendar", "dataview"]);
       expect(await repo.hasUncommittedChanges()).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });

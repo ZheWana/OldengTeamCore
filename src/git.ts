@@ -5,7 +5,7 @@ import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./t
 import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
 import { DEFAULT_BRANCH, MANIFEST_PATH } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
-import { isPotentialPluginPath, pluginIdFromPath, readSharedPluginIds, writeSharedPluginIds } from "./shared-plugins";
+import { isPotentialPluginPath, mergeSharedPluginIds, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
 
 const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
 const LINEBREAKS = /^.*(\r?\n|$)/gm;
@@ -16,6 +16,11 @@ interface GitConflictState {
   remoteOid: string;
   files: string[];
   detectedAt: string;
+}
+
+interface GitFileVersion {
+  oid: string;
+  data: Uint8Array;
 }
 
 interface GitHttpRequest {
@@ -132,11 +137,29 @@ function parseManifestContent(value: string): AssetManifest | undefined {
   }
 }
 
-function teamCoreMergeDriver(params: MergeDriverParams): { cleanMerge: boolean; mergedText: string } {
-  const [base, ours, theirs] = params.contents.map(parseManifestContent);
-  if (base && ours && theirs) {
-    const merged = mergeAssetManifests(base, ours, theirs);
-    if (merged) return { cleanMerge: true, mergedText: serializeManifest(merged) };
+function teamCoreMergeDriver(params: MergeDriverParams, configDir: string): { cleanMerge: boolean; mergedText: string } {
+  if (params.path === MANIFEST_PATH || params.path === "assets-manifest.json") {
+    const [base, ours, theirs] = params.contents.map(parseManifestContent);
+    if (base && ours && theirs) {
+      const merged = mergeAssetManifests(base, ours, theirs);
+      if (merged) return { cleanMerge: true, mergedText: serializeManifest(merged) };
+    }
+  }
+  if (params.path === ".gitignore") {
+    try {
+      const ids = params.contents.map((content) => readSharedPluginIdsFromGitignore(content, configDir));
+      const unmanaged = textMerge({
+        ...params,
+        contents: params.contents.map((content) => stripSharedPluginsFromGitignore(content, configDir))
+      });
+      if (!unmanaged.cleanMerge) return unmanaged;
+      return {
+        cleanMerge: true,
+        mergedText: updateSharedPluginsInGitignore(unmanaged.mergedText, configDir, mergeSharedPluginIds(ids[0], ids[1], ids[2]))
+      };
+    } catch {
+      return textMerge(params);
+    }
   }
   return textMerge(params);
 }
@@ -380,6 +403,46 @@ export class GitRepository {
     }
   }
 
+  private async readFileVersion(oid: string, filepath: string): Promise<GitFileVersion | undefined> {
+    try {
+      const result = await git.readBlob({ fs: this.fs, dir: "", oid, filepath });
+      return { oid: result.oid, data: result.blob };
+    } catch (error) {
+      if (error && typeof error === "object" && (error as { code?: unknown }).code === "NotFoundError") return undefined;
+      throw error;
+    }
+  }
+
+  private mergeFileVersions(
+    path: string,
+    branches: [string, string, string],
+    base: GitFileVersion | undefined,
+    local: GitFileVersion | undefined,
+    remote: GitFileVersion | undefined,
+    resolutions: ReadonlyMap<string, string | undefined>
+  ): Uint8Array | undefined {
+    if (local?.oid === remote?.oid) return local?.data;
+    if (local?.oid === base?.oid) return remote?.data;
+    if (remote?.oid === base?.oid) return local?.data;
+    if (resolutions.has(path)) {
+      const content = resolutions.get(path);
+      return content === undefined ? undefined : new TextEncoder().encode(content);
+    }
+    if (!local || !remote) throw new Error(`文件仍存在未解决的删除冲突：${path}`);
+    try {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const merged = teamCoreMergeDriver({
+        path,
+        branches,
+        contents: [base ? decoder.decode(base.data) : "", decoder.decode(local.data), decoder.decode(remote.data)]
+      }, this.configDir);
+      if (merged.cleanMerge) return new TextEncoder().encode(merged.mergedText);
+    } catch {
+      // Binary or invalid UTF-8 content requires an explicit external resolution.
+    }
+    throw new Error(`文件仍存在未解决的内容冲突：${path}`);
+  }
+
   async getConflictEditorSession(): Promise<ConflictEditorSession> {
     const state = await this.requireConflictState();
     const mergeBases: unknown = await git.findMergeBase({ fs: this.fs, dir: "", oids: [state.localOid, state.remoteOid] });
@@ -403,27 +466,70 @@ export class GitRepository {
     }
 
     const normalized = resolutions.map((resolution) => {
-      if (resolution.path !== normalizeVaultPath(resolution.path) || !isManagedPath(resolution.path, this.configDir, this.sharedPluginIds)) {
+      if (resolution.path !== normalizeVaultPath(resolution.path)
+        || (!isManagedPath(resolution.path, this.configDir, this.sharedPluginIds) && !isPotentialPluginPath(resolution.path, this.configDir))) {
         throw new Error(`冲突文件路径无效：${resolution.path}`);
       }
-      if (resolution.path !== MANIFEST_PATH) return { ...resolution };
-      if (resolution.content === undefined) throw new Error("附件清单不能删除，请选择或编辑一个有效版本");
-      try {
-        return { path: resolution.path, content: serializeManifest(validateManifest(JSON.parse(resolution.content))) };
-      } catch (error) {
-        throw new Error(`附件清单格式无效：${error instanceof Error ? error.message : String(error)}`);
+      if (resolution.path === MANIFEST_PATH) {
+        if (resolution.content === undefined) throw new Error("附件清单不能删除，请选择或编辑一个有效版本");
+        try {
+          return { path: resolution.path, content: serializeManifest(validateManifest(JSON.parse(resolution.content))) };
+        } catch (error) {
+          throw new Error(`附件清单格式无效：${error instanceof Error ? error.message : String(error)}`);
+        }
       }
+      if (resolution.path === ".gitignore" && resolution.content !== undefined) {
+        try {
+          const ids = readSharedPluginIdsFromGitignore(resolution.content, this.configDir);
+          return { path: resolution.path, content: updateSharedPluginsInGitignore(resolution.content, this.configDir, ids) };
+        } catch (error) {
+          throw new Error(`公共插件配置格式无效：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { ...resolution };
     });
 
-    for (const resolution of normalized) {
-      if (resolution.content === undefined) {
-        if (await this.vault.exists(resolution.path)) await this.vault.remove(resolution.path);
-        await git.remove({ fs: this.fs, dir: "", filepath: resolution.path });
-      } else {
-        const encoded = new TextEncoder().encode(resolution.content);
-        await this.vault.write(resolution.path, encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength));
-        await git.add({ fs: this.fs, dir: "", filepath: resolution.path });
+    const mergeBases: unknown = await git.findMergeBase({ fs: this.fs, dir: "", oids: [state.localOid, state.remoteOid] });
+    const baseOid = Array.isArray(mergeBases) ? mergeBases.find((oid): oid is string => typeof oid === "string" && /^[0-9a-f]{40}$/i.test(oid)) : undefined;
+    if (!baseOid) throw new Error("无法确定冲突的共同版本，请使用外部 Git 工具处理");
+    const tracked = await Promise.all([baseOid, state.localOid, state.remoteOid].map((ref) => git.listFiles({ fs: this.fs, dir: "", ref })));
+    const paths = [...new Set(tracked.flat())].sort();
+    const resolutionMap = new Map(normalized.map(({ path, content }) => [path, content]));
+    const mergedFiles = new Map<string, Uint8Array | undefined>();
+    const branches: [string, string, string] = [baseOid, state.localOid, state.remoteOid];
+    for (const path of paths) {
+      const [base, local, remote] = await Promise.all(branches.map((oid) => this.readFileVersion(oid, path)));
+      mergedFiles.set(path, this.mergeFileVersions(path, branches, base, local, remote, resolutionMap));
+    }
+
+    const gitignore = mergedFiles.get(".gitignore");
+    const mergedSharedPluginIds = gitignore
+      ? readSharedPluginIdsFromGitignore(new TextDecoder().decode(gitignore), this.configDir)
+      : [];
+    const personalPluginFiles = await this.snapshotPersonalPluginFiles();
+    const currentBranch = await git.currentBranch({ fs: this.fs, dir: "", fullname: false }).catch(() => undefined);
+    const checkoutRef = currentBranch ?? DEFAULT_BRANCH;
+    try {
+      await git.checkout({ fs: this.fs, dir: "", ref: checkoutRef, force: true });
+      for (const path of paths) {
+        const content = mergedFiles.get(path);
+        if (!isManagedPath(path, this.configDir, mergedSharedPluginIds)) {
+          await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+          continue;
+        }
+        if (content === undefined) {
+          if (await this.vault.exists(path)) await this.vault.remove(path);
+          await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+          continue;
+        }
+        const data = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength) as ArrayBuffer;
+        await this.vault.write(path, data);
+        await git.add({ fs: this.fs, dir: "", filepath: path });
       }
+    } catch (error) {
+      await git.checkout({ fs: this.fs, dir: "", ref: checkoutRef, force: true }).catch(() => undefined);
+      await this.restorePersonalPluginFiles(personalPluginFiles).catch(() => undefined);
+      throw error;
     }
 
     const username = this.settings.gitUsername.trim() || "unknown";
@@ -440,6 +546,7 @@ export class GitRepository {
     if (commit.commit.parent[0] !== state.localOid || commit.commit.parent[1] !== state.remoteOid) {
       throw new Error("冲突解决提交未包含完整的本地和远端历史，已停止同步");
     }
+    await this.restorePersonalPluginFiles(personalPluginFiles);
     await this.clearConflictState();
     this.logger.debug("Created conflict resolution commit", { oid, files: expected });
     return oid;
@@ -524,7 +631,7 @@ export class GitRepository {
         message: "Merge remote changes",
         author: { name: username, email },
         committer: { name: username, email },
-        mergeDriver: teamCoreMergeDriver
+        mergeDriver: (params) => teamCoreMergeDriver(params, this.configDir)
       });
       const conflicts = (result as { conflictedFiles?: string[] }).conflictedFiles ?? [];
       if (!conflicts.length && !result.alreadyMerged) {

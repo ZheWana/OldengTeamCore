@@ -221,9 +221,12 @@ export class SyncCoordinator {
   async resolveConflicts(resolutions: readonly ConflictResolution[]): Promise<SyncSnapshot> {
     await this.runExclusive(async () => {
       const vault = createVaultAdapter(this.app.vault.adapter);
+      const previousSharedPluginIds = [...this.sharedPluginIds];
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       await git.resolveConflicts(resolutions);
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds);
       for (const { path } of resolutions) this.pendingFiles.delete(path);
       this.lastError = "";
       this.progress = undefined;
@@ -327,10 +330,12 @@ export class SyncCoordinator {
     try {
       if (force) await this.clearForRemoteClone();
       const vault = createVaultAdapter(this.app.vault.adapter);
+      const previousSharedPluginIds = [...this.sharedPluginIds];
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
       await git.clone();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds);
       await this.materializeRemoteAttachments(createEmptyManifest(), await readManifest(vault));
       this.lastSyncAt = Date.now();
       this.lastError = "";
@@ -506,11 +511,19 @@ export class SyncCoordinator {
     // next cycle commits that edit before checkout can materialize remote data.
     if (await git.hasUncommittedChanges()) return { conflicts: [], deferred: true };
     this.startProgress("合并远端更改", 1);
+    const previousSharedPluginIds = [...this.sharedPluginIds];
     const merge = await git.mergeRemote();
     this.advanceProgress();
     if (merge.conflicts.length) return { conflicts: merge.conflicts, deferred: false };
+    this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+    this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds);
     await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
     return { conflicts: [], deferred: false };
+  }
+
+  private notifySharedPluginChange(before: readonly string[], after: readonly string[]): void {
+    if (before.length === after.length && before.every((id, index) => id === after[index])) return;
+    this.callbacks.onNotice("公共插件文件已同步。请重启 Obsidian，然后在“社区插件”中启用需要使用的插件。");
   }
 
   private deferForLocalChanges(): void {

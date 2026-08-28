@@ -76,23 +76,42 @@ export function readSharedPluginIdsFromGitignore(content: string, configDir: str
   return normalizeSharedPluginIds(ids);
 }
 
-export function updateSharedPluginsInGitignore(content: string, configDir: string, ids: readonly string[]): string {
-  const normalizedIds = normalizeSharedPluginIds(ids);
+export function stripSharedPluginsFromGitignore(content: string, configDir: string): string {
   const normalizedContent = content.replace(/\r\n?/g, "\n");
   let lines = normalizedContent.split("\n");
   const start = lines.indexOf(SHARED_PLUGINS_START);
   if (start >= 0) {
     const end = lines.indexOf(SHARED_PLUGINS_END, start + 1);
-    if (end < 0) throw new Error(".gitignore 中的共享插件区块不完整，请补齐结束标记后再保存");
+    if (end < 0) throw new Error(".gitignore 中的共享插件区块不完整");
     lines = [...lines.slice(0, start), ...lines.slice(end + 1)];
   }
-
-  // This exact rule was written by older Team Core releases. Remove it so
-  // the negative rules below can traverse the config directory again.
   const config = configPath(configDir);
   lines = lines.filter((line) => line.trim() !== `${config}/`);
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.length ? `${lines.join("\n")}\n` : "";
+}
 
+export function mergeSharedPluginIds(base: readonly string[], ours: readonly string[], theirs: readonly string[]): string[] {
+  const baseIds = new Set(normalizeSharedPluginIds(base));
+  const ourIds = new Set(normalizeSharedPluginIds(ours));
+  const theirIds = new Set(normalizeSharedPluginIds(theirs));
+  const allIds = new Set([...baseIds, ...ourIds, ...theirIds]);
+  const merged: string[] = [];
+  for (const id of allIds) {
+    const before = baseIds.has(id);
+    const local = ourIds.has(id);
+    const remote = theirIds.has(id);
+    const enabled = local === remote ? local : local === before ? remote : local;
+    if (enabled) merged.push(id);
+  }
+  return normalizeSharedPluginIds(merged);
+}
+
+export function updateSharedPluginsInGitignore(content: string, configDir: string, ids: readonly string[]): string {
+  const normalizedIds = normalizeSharedPluginIds(ids);
+  const lines = stripSharedPluginsFromGitignore(content, configDir).split("\n");
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const config = configPath(configDir);
   const prefix = pluginPrefix(configDir);
   const block = [
     SHARED_PLUGINS_START,
