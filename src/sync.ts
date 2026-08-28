@@ -6,7 +6,7 @@ import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
+import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
@@ -149,6 +149,11 @@ export class SyncCoordinator {
 
   async prepareLocalVault(): Promise<void> {
     const vault = createVaultAdapter(this.app.vault.adapter);
+    try {
+      if (ensureAssetsExcluded(this.app.vault)) this.logger.debug("已将 assets 加入 Obsidian 排除文件规则");
+    } catch (error) {
+      this.logger.warn("无法将 assets 加入 Obsidian 排除文件规则", error);
+    }
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     const existing = await vault.stat(PRIVATE_FOLDER);
     if (existing && existing.type !== "folder") throw new Error(`无法创建私人笔记文件夹：${PRIVATE_FOLDER} 已被文件占用`);

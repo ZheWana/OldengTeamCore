@@ -16,6 +16,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Automatically batches local changes, fetches remote commits, merges, and pushes through Git Smart HTTP.
 - Records each member's Git author identity and provides file-level history inside Obsidian.
 - Stores `assets/` outside Git with immutable SHA-256 object IDs and a Git-tracked attachment manifest.
+- Hides the `assets/` folder from Obsidian's file explorer and search while keeping attachment synchronization unchanged.
 - Renames managed attachments to `assets/tc-sha256-<sha256>.<extension>` and updates Markdown and Wiki links.
 - Shows phase and numeric progress during synchronization.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.

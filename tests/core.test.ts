@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { Vault } from "obsidian";
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, rename, writeFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -11,7 +12,7 @@ import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPus
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
 import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment, shouldTrackVaultEvent } from "../src/sync";
-import { assetPathForHash, collectMarkdownReferences, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
+import { assetPathForHash, collectMarkdownReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
@@ -215,6 +216,18 @@ describe("crypto helpers", () => {
 });
 
 describe("manifest and vault path rules", () => {
+  it("adds assets to Obsidian excluded-file filters without replacing existing filters", () => {
+    let filters: unknown = ["*.tmp"];
+    const vault = {
+      getConfig: (key: string) => key === "userIgnoreFilters" ? filters : undefined,
+      setConfig: (key: string, value: unknown) => { if (key === "userIgnoreFilters") filters = value; }
+    } as unknown as Vault;
+    expect(ensureAssetsExcluded(vault)).toBe(true);
+    expect(filters).toEqual(["*.tmp", "assets"]);
+    expect(ensureAssetsExcluded(vault)).toBe(false);
+    expect(filters).toEqual(["*.tmp", "assets"]);
+  });
+
   it("normalizes and serializes asset entries deterministically", () => {
     const manifest = validateManifest({
       version: 1,

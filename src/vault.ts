@@ -49,6 +49,27 @@ export function isAssetPath(path: string): boolean {
   return normalizeVaultPath(path).startsWith(ASSETS_PREFIX);
 }
 
+/**
+ * Keep the attachment area out of Obsidian's file explorer and search results.
+ * This is a presentation-only setting; synchronization still handles assets
+ * through the attachment manifest and S3 transport.
+ */
+export function ensureAssetsExcluded(vault: Vault): boolean {
+  const configurable = vault as Vault & {
+    getConfig?: (key: string) => unknown;
+    setConfig?: (key: string, value: unknown) => void;
+  };
+  if (typeof configurable.getConfig !== "function" || typeof configurable.setConfig !== "function") return false;
+  const configured = configurable.getConfig("userIgnoreFilters");
+  const filters = Array.isArray(configured)
+    ? (configured as unknown[]).filter((filter): filter is string => typeof filter === "string")
+    : [];
+  if (filters.some((filter) => filter === "assets")) return false;
+  filters.push("assets");
+  configurable.setConfig("userIgnoreFilters", filters);
+  return true;
+}
+
 export function isPrivatePath(path: string): boolean {
   const normalized = normalizeVaultPath(path);
   return normalized === PRIVATE_FOLDER || normalized.startsWith(PRIVATE_PREFIX);

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Hide the `assets/` folder from Obsidian's file explorer and search while preserving attachment synchronization.
+- Align shared-plugin management rows so the first plugin no longer sits higher than the others.
+
 All notable changes to Oldeng Team Core are documented in this file.
 
 ## 0.1.6 - 2026-08-28
