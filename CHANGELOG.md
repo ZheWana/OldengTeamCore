@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.11
+
+- Preserve balanced top and bottom spacing for the first and last shared-plugin rows in the management modal.
+
 ## 0.1.10
 
 - Hide the `assets/` folder from Obsidian's file explorer and search while preserving attachment synchronization.
