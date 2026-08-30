@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Show a completion modal after any successful synchronization when shared plugin files or enablement changed, reminding users to restart Obsidian. Desktop users can restart Obsidian directly from the modal.
 - Raise the minimum Obsidian version to 1.12.3 and download attachments larger than 8 MiB in 8 MiB ranged chunks with incremental SHA-256 verification and atomic temporary-file replacement, removing the temporary mobile 32 MB download restriction.
 
 ## 0.1.18 - 2026-08-30

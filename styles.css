@@ -10,6 +10,8 @@
 .team-core-mobile-sync-summary span { flex: 0 0 auto; color: var(--text-muted); font-family: var(--font-monospace); }
 .team-core-mobile-sync-progress { display: block; width: 100%; height: .7rem; margin: .35rem 0 1rem; accent-color: var(--interactive-accent); }
 .team-core-mobile-sync-item { min-height: 2.7em; margin: 0; color: var(--text-muted); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
+.team-core-restart-modal { width: min(92vw, 34rem); }
+.team-core-restart-actions { display: flex; justify-content: flex-end; margin-top: 1rem; }
 .team-core-inline-title-decorated::after { content: attr(data-team-core-authors); color: var(--text-accent); font-size: .48em; font-weight: var(--font-medium); opacity: .72; vertical-align: .16em; white-space: normal; }
 .tree-item.nav-folder.team-core-assets-hidden { display: none; }
 .team-core-history-view { box-sizing: border-box; width: 100%; height: 100%; margin: 0; padding: 0; overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; }

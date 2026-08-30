@@ -13,6 +13,7 @@ const MAX_PUSH_RECONCILIATION_RETRIES = 2;
 export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
   onNotice(message: string): void;
+  onRestartRequired(): void;
 }
 
 export interface ConnectionInfo {
@@ -243,6 +244,7 @@ export class SyncCoordinator {
   private progress: SyncProgress | undefined;
   private fullAttachmentScanPending = false;
   private sharedPluginIds: string[] = [];
+  private restartRequiredAfterSync = false;
   readonly logger: Logger;
 
   constructor(private readonly app: App, private readonly settings: () => TeamCoreSettings, private readonly callbacks: SyncCallbacks, logger?: Logger) {
@@ -502,7 +504,7 @@ export class SyncCoordinator {
       await git.resolveConflicts(resolutions);
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const enabledStateChanged = await this.applySharedPluginState(vault);
-      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
+      this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
       for (const { path } of resolutions) this.pendingFiles.delete(path);
       this.lastError = "";
       this.progress = undefined;
@@ -600,7 +602,7 @@ export class SyncCoordinator {
     };
   }
 
-  async cloneRemote(force = false): Promise<void> {
+  async cloneRemote(force = false): Promise<boolean> {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = undefined;
     this.setState("syncing");
@@ -608,7 +610,7 @@ export class SyncCoordinator {
     return this.runExclusive(() => this.executeCloneRemote(force));
   }
 
-  private async executeCloneRemote(force: boolean): Promise<void> {
+  private async executeCloneRemote(force: boolean): Promise<boolean> {
     this.setState("syncing");
     try {
       this.pendingFiles.clear();
@@ -627,7 +629,9 @@ export class SyncCoordinator {
       this.advanceProgress("公共插件白名单");
       const enabledStateChanged = await this.applySharedPluginState(vault);
       this.advanceProgress("公共插件启用状态");
-      this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
+      const sharedPluginChanged = this.sharedPluginIds.length > 0
+        || this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
+      if (sharedPluginChanged) this.restartRequiredAfterSync = true;
       this.startProgress("检查远端附件", 1);
       const remoteManifest = await readManifest(vault);
       this.advanceProgress(MANIFEST_PATH);
@@ -641,6 +645,8 @@ export class SyncCoordinator {
       this.pendingFiles.clear();
       this.pendingAssets.clear();
       this.setState("synced");
+      if (sharedPluginChanged) this.notifyRestartRequired();
+      return sharedPluginChanged;
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
       this.setState(this.isOffline(error) ? "offline" : "error");
@@ -812,6 +818,7 @@ export class SyncCoordinator {
       const remainingChanges = await git.hasUncommittedChanges();
       const queuedChanges = this.pendingFiles.size > 0 || this.pendingAssets.size > 0 || this.fullAttachmentScanPending;
       this.setState(remainingChanges || queuedChanges ? "local-changes" : "synced");
+      if (!remainingChanges && !queuedChanges) this.notifyRestartRequired();
     } catch (error) {
       for (const path of pendingNotes) this.pendingFiles.add(path);
       for (const path of pendingAssets) this.pendingAssets.add(path);
@@ -837,7 +844,7 @@ export class SyncCoordinator {
     if (merge.conflicts.length) return { conflicts: merge.conflicts, deferred: false };
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     const enabledStateChanged = await this.applySharedPluginState(vault);
-    this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
+    this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
     await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
     await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
     return { conflicts: [], deferred: false };
@@ -869,9 +876,16 @@ export class SyncCoordinator {
     }
   }
 
-  private notifySharedPluginChange(before: readonly string[], after: readonly string[], enabledStateChanged = false): void {
-    if (!enabledStateChanged && before.length === after.length && before.every((id, index) => id === after[index])) return;
-    this.callbacks.onNotice("公共插件文件和启用状态已同步。请重启 Obsidian 以加载变更。");
+  private recordSharedPluginChange(before: readonly string[], after: readonly string[], enabledStateChanged = false): boolean {
+    const changed = enabledStateChanged || before.length !== after.length || !before.every((id, index) => id === after[index]);
+    if (changed) this.restartRequiredAfterSync = true;
+    return changed;
+  }
+
+  private notifyRestartRequired(): void {
+    if (!this.restartRequiredAfterSync) return;
+    this.restartRequiredAfterSync = false;
+    this.callbacks.onRestartRequired();
   }
 
   private deferForLocalChanges(): void {

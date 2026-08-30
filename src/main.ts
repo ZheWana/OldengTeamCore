@@ -26,6 +26,7 @@ export default class TeamCorePlugin extends Plugin {
   private authorService!: FileAuthorService;
   private lastAuthorRefreshAt: number | undefined;
   private diagnosticWrite: Promise<void> = Promise.resolve();
+  private restartRequiredModalOpen = false;
 
   async onload(): Promise<void> {
     const storedData: unknown = await this.loadData() as unknown;
@@ -48,7 +49,8 @@ export default class TeamCorePlugin extends Plugin {
     this.statusProgress.hidden = true;
     this.coordinator = new SyncCoordinator(this.app, () => this.teamCoreSettings, {
       onSnapshot: (snapshot) => this.updateSnapshot(snapshot),
-      onNotice: (message) => new Notice(message)
+      onNotice: (message) => new Notice(message),
+      onRestartRequired: () => this.openRestartRequiredModal()
     }, this.logger);
     this.authorService = this.createFileAuthorService();
     this.addSettingTab(new TeamCoreSettingTab(this.app, this));
@@ -417,6 +419,12 @@ export default class TeamCorePlugin extends Plugin {
     }
   }
 
+  private openRestartRequiredModal(): void {
+    if (this.restartRequiredModalOpen) return;
+    this.restartRequiredModalOpen = true;
+    new RestartRequiredModal(this.app, () => { this.restartRequiredModalOpen = false; }).open();
+  }
+
   private persistDiagnosticLogs(entries: readonly LogEntry[]): void {
     this.diagnosticWrite = this.diagnosticWrite.then(async () => {
       const stored: unknown = await this.loadData() as unknown;
@@ -510,6 +518,40 @@ class MobileSyncProgressModal extends Modal {
       cls: "team-core-mobile-sync-item",
       text: progress?.item ?? "正在准备同步，请稍候……"
     });
+  }
+}
+
+class RestartRequiredModal extends Modal {
+  constructor(private readonly hostApp: App, private readonly onDismiss: () => void) {
+    super(hostApp);
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass("team-core-restart-modal");
+    this.titleEl.setText("需要重启 Obsidian");
+    this.contentEl.createEl("p", { text: "同步已完成，公共插件文件或启用状态已更新。重启 Obsidian 后，插件更改才会生效。" });
+    const actions = this.contentEl.createDiv("team-core-restart-actions");
+    new ButtonComponent(actions).setButtonText("稍后重启").onClick(() => this.close());
+    if (!Platform.isMobile) {
+      new ButtonComponent(actions)
+        .setButtonText("立即重启")
+        .setCta()
+        .onClick(() => {
+          const restartable = this.hostApp as App & { relaunch?: () => void };
+          if (typeof restartable.relaunch !== "function") {
+            new Notice("当前 Obsidian 版本不支持从插件重启，请手动重启应用。");
+            return;
+          }
+          restartable.relaunch();
+        });
+    } else {
+      new ButtonComponent(actions).setButtonText("知道了").setCta().onClick(() => this.close());
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    this.onDismiss();
   }
 }
 
