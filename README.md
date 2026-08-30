@@ -15,12 +15,15 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 
 - Automatically batches local changes, fetches remote commits, merges, and pushes through Git Smart HTTP.
 - Records each member's Git author identity and provides file-level history inside Obsidian.
+- Provides a searchable commit history page with merge-commit markers, a full-year contribution wall, and document-ownership author statistics.
+- Supports Git-tracked file author assignments in `.team/file-authors.json`, with automatic fallback to each file's complete Git author history when no assignment exists.
 - Stores `assets/` outside Git with immutable SHA-256 object IDs and a Git-tracked attachment manifest.
 - Hides the `assets/` folder from Obsidian's file explorer and search while keeping attachment synchronization unchanged.
 - Renames managed attachments to `assets/tc-sha256-<sha256>.<extension>` and updates Markdown and Wiki links.
 - Shows phase and numeric progress during synchronization.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
 - Provides explicit initialization, remote import, attachment normalization, diagnostics, and an in-app conflict editor.
+- Provides a destructive **重置本地并重新同步** command that leaves remote Git and S3 unchanged, clears local shared content, and downloads the complete remote Vault again without publishing local deletions.
 - Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
 - Lets the team choose trusted community plugin folders to share through a managed `.gitignore` whitelist. Obsidian remains responsible for installing and updating plugins.
 - Synchronizes the enabled state of whitelisted community plugins while preserving each member's personal plugin choices.
@@ -67,6 +70,10 @@ Oldeng Team Core automatically creates `私人笔记/`. That exact folder and al
 ## Attachment model
 
 Files under `assets/` are not committed to Git. Oldeng Team Core hashes changed or explicitly normalized attachments, uploads immutable objects to the configured S3 prefix, and commits `.team/assets-manifest.json` only after each required object is available. Ordinary synchronization is incremental; use **规范化全部附件** only for initial migration or recovery after external file changes.
+
+Pasting an image into a shared note writes it directly to its canonical `assets/tc-sha256-...` path and inserts that link into the editor. Images pasted into `私人笔记/` stay under `私人笔记/assets/` and are not uploaded. Git versions files rather than directories; after a remote merge or overwrite, Team Core removes ordinary directories that became empty. To preserve an intentionally empty shared directory, add a tracked placeholder such as `.gitkeep`.
+
+Use **重置本地并重新同步** when the remote revision must be authoritative or the complete repository should be downloaded again. This destructive recovery action leaves remote Git and S3 unchanged, clears queued local deletions, preserves `私人笔记/`, `.obsidian/`, and local trash, removes all other local content and Git metadata, and clones the remote repository again. Ordinary **立即同步** remains bidirectional and will publish intentional local file deletions.
 
 Concurrent changes to different attachment paths are merged semantically in the manifest rather than treated as a JSON text conflict. Competing content for the same logical path remains a real conflict.
 

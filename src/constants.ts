@@ -1,4 +1,5 @@
 export const MANIFEST_PATH = ".team/assets-manifest.json";
+export const FILE_AUTHORS_PATH = ".team/file-authors.json";
 export const ASSETS_PREFIX = "assets/";
 export const PRIVATE_FOLDER = "私人笔记";
 export const PRIVATE_PREFIX = `${PRIVATE_FOLDER}/`;

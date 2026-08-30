@@ -17,6 +17,7 @@ export interface TeamCoreSettings {
   s3Prefix: string;
   s3AccessKey: string;
   s3SecretKey: string;
+  autoSync: boolean;
   debounceMs: number;
   syncIntervalMs: number;
 }
@@ -31,6 +32,7 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   s3Prefix: "",
   s3AccessKey: "",
   s3SecretKey: "",
+  autoSync: false,
   debounceMs: 60_000,
   syncIntervalMs: 300_000
 };
@@ -51,6 +53,7 @@ export interface AssetManifest {
 export interface CommitSummary {
   oid: string;
   shortOid: string;
+  parents: string[];
   message: string;
   author: string;
   email: string;

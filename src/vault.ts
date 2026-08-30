@@ -49,8 +49,22 @@ export function isAssetPath(path: string): boolean {
   return normalizeVaultPath(path).startsWith(ASSETS_PREFIX);
 }
 
+export const PRIVATE_ASSETS_PREFIX = `${PRIVATE_FOLDER}/${ASSETS_PREFIX}`;
+
+export function isPrivateAssetPath(path: string): boolean {
+  return normalizeVaultPath(path).startsWith(PRIVATE_ASSETS_PREFIX);
+}
+
+const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "heic", "ico", "jpeg", "jpg", "png", "svg", "tif", "tiff", "webp"]);
+
+export function isImageAttachmentPath(path: string): boolean {
+  const normalized = normalizeVaultPath(path);
+  const extension = normalized.split("/").pop()?.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_EXTENSIONS.has(extension);
+}
+
 /**
- * Keep the attachment area out of Obsidian's file explorer and search results.
+ * Keep the attachment area out of Obsidian's indexing and search results.
  * This is a presentation-only setting; synchronization still handles assets
  * through the attachment manifest and S3 transport.
  */
@@ -64,10 +78,22 @@ export function ensureAssetsExcluded(vault: Vault): boolean {
   const filters = Array.isArray(configured)
     ? (configured as unknown[]).filter((filter): filter is string => typeof filter === "string")
     : [];
-  if (filters.some((filter) => filter === "assets")) return false;
-  filters.push("assets");
+  const required = [ASSETS_PREFIX.slice(0, -1), PRIVATE_ASSETS_PREFIX.slice(0, -1)];
+  const missing = required.filter((path) => !filters.includes(path));
+  if (!missing.length) return false;
+  filters.push(...missing);
   configurable.setConfig("userIgnoreFilters", filters);
   return true;
+}
+
+/** Returns true only for the root attachment folder, not nested folders. */
+export function isRootAssetsPath(path: string): boolean {
+  return normalizeVaultPath(path) === ASSETS_PREFIX.slice(0, -1);
+}
+
+export function isHiddenAssetsFolderPath(path: string): boolean {
+  const normalized = normalizeVaultPath(path);
+  return normalized === ASSETS_PREFIX.slice(0, -1) || normalized === PRIVATE_ASSETS_PREFIX.slice(0, -1);
 }
 
 export function isPrivatePath(path: string): boolean {
@@ -98,6 +124,80 @@ export function assetPathForHash(hash: string, extension?: string): string {
   if (!/^[0-9a-f]{64}$/i.test(hash)) throw new Error("Invalid attachment hash");
   const cleanExtension = (extension ?? "").replace(/^\.+/, "").replace(/[^a-z0-9_-]+/gi, "").toLowerCase();
   return `${ASSETS_PREFIX}${CONTENT_ADDRESSED_ASSET_PREFIX}${hash.toLowerCase()}${cleanExtension ? `.${cleanExtension}` : ""}`;
+}
+
+export function pastedImageExtension(filename: string, mime: string): string {
+  const named = filename.split(".").pop()?.toLowerCase() ?? "";
+  if (IMAGE_EXTENSIONS.has(named)) return named;
+  return ({
+    "image/avif": "avif",
+    "image/bmp": "bmp",
+    "image/gif": "gif",
+    "image/heic": "heic",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/svg+xml": "svg",
+    "image/tiff": "tiff",
+    "image/webp": "webp"
+  } as Record<string, string>)[mime.toLowerCase()] ?? "png";
+}
+
+export function pastedImageTargetPath(hash: string, extension: string, sourcePath: string): string {
+  const sharedPath = assetPathForHash(hash, extension);
+  return isPrivatePath(sourcePath) ? `${PRIVATE_FOLDER}/${sharedPath}` : sharedPath;
+}
+
+export async function pruneEmptyManagedFolders(vault: BinaryVault, configDir: string): Promise<string[]> {
+  const removed: string[] = [];
+  const protectedFolder = (path: string): boolean => path === ".git"
+    || path.startsWith(".git/")
+    || isConfigPath(path, configDir)
+    || isPrivatePath(path)
+    || isTrashPath(path)
+    || path === ASSETS_PREFIX.slice(0, -1)
+    || isAssetPath(path);
+  const visit = async (path: string): Promise<void> => {
+    const listed = await vault.list(path);
+    for (const folder of listed.folders.map(normalizeVaultPath).sort((a, b) => b.length - a.length)) {
+      if (protectedFolder(folder)) continue;
+      await visit(folder);
+      const after = await vault.list(folder);
+      if (!after.files.length && !after.folders.length) {
+        await vault.rmdir(folder, true);
+        removed.push(folder);
+      }
+    }
+  };
+  await visit("");
+  return removed.sort();
+}
+
+/**
+ * Lists every file that a confirmed remote overwrite may replace. This uses
+ * the adapter instead of Obsidian's index because dot-prefixed Team Core files
+ * and excluded attachment folders may not have a TFile entry.
+ */
+export async function listRemoteOverwriteFiles(vault: BinaryVault, configDir: string): Promise<string[]> {
+  const files: string[] = [];
+  const preserved = (path: string): boolean => {
+    const normalized = normalizeVaultPath(path);
+    return normalized === ".git"
+      || normalized.startsWith(".git/")
+      || isConfigPath(normalized, configDir)
+      || isPrivatePath(normalized)
+      || isTrashPath(normalized);
+  };
+  const visit = async (path: string): Promise<void> => {
+    const listed = await vault.list(path);
+    for (const file of listed.files.map(normalizeVaultPath)) {
+      if (!preserved(file)) files.push(file);
+    }
+    for (const folder of listed.folders.map(normalizeVaultPath)) {
+      if (!preserved(folder)) await visit(folder);
+    }
+  };
+  await visit("");
+  return files.sort();
 }
 
 export function createVaultAdapter(adapter: DataAdapter): BinaryVault {
@@ -138,18 +238,21 @@ export function createVaultAdapter(adapter: DataAdapter): BinaryVault {
   };
 }
 
-export function collectMarkdownReferences(markdown: string, sourcePath: string): string[] {
+function resolveReferencePath(value: string, sourcePath: string): string {
+  const cleaned = decodeURIComponent(value.trim().split(/[?#|]/, 1)[0]);
+  const normalized = normalizeVaultPath(cleaned);
+  if (normalized.startsWith(ASSETS_PREFIX) || normalized.startsWith(PRIVATE_ASSETS_PREFIX)) return normalized;
+  const parent = normalizeVaultPath(sourcePath).split("/").slice(0, -1).join("/");
+  return normalizeVaultPath(parent ? `${parent}/${cleaned}` : cleaned);
+}
+
+function collectReferences(markdown: string, sourcePath: string, accepts: (path: string) => boolean): string[] {
   const found = new Set<string>();
   const add = (value: string) => {
-    const cleaned = decodeURIComponent(value.trim().split(/[?#|]/, 1)[0]);
+    const cleaned = value.trim().split(/[?#|]/, 1)[0];
     if (!cleaned || cleaned.startsWith("http://") || cleaned.startsWith("https://")) return;
-    const normalized = normalizeVaultPath(cleaned);
-    if (normalized.startsWith(ASSETS_PREFIX)) found.add(normalized);
-    else if (normalized.includes("/") || /\.(png|jpe?g|gif|webp|svg|pdf|zip|docx?|xlsx?|pptx?)$/i.test(normalized)) {
-      const parent = normalizeVaultPath(sourcePath).split("/").slice(0, -1).join("/");
-      const resolved = normalizeVaultPath(parent ? `${parent}/${normalized}` : normalized);
-      if (resolved.startsWith(ASSETS_PREFIX)) found.add(resolved);
-    }
+    const resolved = resolveReferencePath(cleaned, sourcePath);
+    if (accepts(resolved)) found.add(resolved);
   };
   for (const match of markdown.matchAll(/!\[\[[^\]]+\]\]|!\[\]\(([^)]+)\)|!\[[^\]]*\]\(([^)]+)\)/g)) {
     if (match[0].startsWith("![[")) add(match[0].slice(3, -2));
@@ -159,11 +262,12 @@ export function collectMarkdownReferences(markdown: string, sourcePath: string):
   return [...found].sort();
 }
 
-function resolveReferencePath(value: string, sourcePath: string): string {
-  const cleaned = decodeURIComponent(value.trim().split(/[?#|]/, 1)[0]);
-  if (cleaned.replace(/^\/+/, "").startsWith(ASSETS_PREFIX)) return normalizeVaultPath(cleaned);
-  const parent = normalizeVaultPath(sourcePath).split("/").slice(0, -1).join("/");
-  return normalizeVaultPath(parent ? `${parent}/${cleaned}` : cleaned);
+export function collectMarkdownReferences(markdown: string, sourcePath: string): string[] {
+  return collectReferences(markdown, sourcePath, isAssetPath);
+}
+
+export function collectPrivateAttachmentReferences(markdown: string, sourcePath: string): string[] {
+  return collectReferences(markdown, sourcePath, isPrivateAssetPath);
 }
 
 function splitPathSuffix(value: string): { path: string; suffix: string } {
@@ -190,14 +294,14 @@ function replacementPath(original: string, sourcePath: string, destinationPath: 
  * Rewrites only links that resolve to oldPath. This complements FileManager.renameFile
  * when a vault has disabled Obsidian's automatic link-update preference.
  */
-export function rewriteAssetReferences(markdown: string, sourcePath: string, oldPath: string, newPath: string): string {
+export function rewriteAssetReferences(markdown: string, sourcePath: string, oldPath: string, newPath: string, referenceSourcePath = sourcePath): string {
   const expected = normalizeVaultPath(oldPath);
   const replaceWiki = (_match: string, bang: string, body: string): string => {
     const separator = body.indexOf("|");
     const target = separator < 0 ? body : body.slice(0, separator);
     const trailing = separator < 0 ? "" : body.slice(separator);
     const { path, suffix } = splitPathSuffix(target);
-    if (resolveReferencePath(path, sourcePath) !== expected) return `${bang}[[${body}]]`;
+    if (resolveReferencePath(path, referenceSourcePath) !== expected) return `${bang}[[${body}]]`;
     return `${bang}[[${replacementPath(path, sourcePath, newPath)}${suffix}${trailing}]]`;
   };
   const replaceMarkdown = (_match: string, prefix: string, body: string, suffix: string): string => {
@@ -206,7 +310,7 @@ export function rewriteAssetReferences(markdown: string, sourcePath: string, old
     const rawTarget = wrapped?.[1] ?? title?.[1] ?? body;
     const trailing = wrapped?.[2] ?? body.slice(rawTarget.length);
     const { path, suffix: fragment } = splitPathSuffix(rawTarget);
-    if (resolveReferencePath(path, sourcePath) !== expected) return `${prefix}${body}${suffix}`;
+    if (resolveReferencePath(path, referenceSourcePath) !== expected) return `${prefix}${body}${suffix}`;
     const replacement = `${replacementPath(path, sourcePath, newPath)}${fragment}`;
     return `${prefix}${wrapped ? `<${replacement}>${trailing}` : `${replacement}${trailing}`}${suffix}`;
   };

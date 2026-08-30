@@ -6,11 +6,11 @@ const IMPORT_VERSION = 1;
 
 interface ImportBundle {
   version: 1;
-  settings: Omit<TeamCoreSettings, "gitUsername">;
+  settings: Omit<TeamCoreSettings, "gitUsername" | "autoSync">;
 }
 
 function sharedSettings(settings: TeamCoreSettings): ImportBundle {
-  const { gitUsername: _ignored, ...general } = settings;
+  const { gitUsername: _ignored, autoSync: _localAutoSync, ...general } = settings;
   return { version: IMPORT_VERSION, settings: general };
 }
 
@@ -33,14 +33,21 @@ export function importSettings(encoded: string, current: TeamCoreSettings): Team
     ...DEFAULT_SETTINGS,
     ...current,
     ...input,
+    autoSync: current.autoSync,
     gitUsername: current.gitUsername
   };
   if (typeof merged.gitUrl !== "string" || typeof merged.gitPassword !== "string" || typeof merged.s3Endpoint !== "string" || typeof merged.s3Bucket !== "string") throw new Error("配置字段无效");
+  if (typeof merged.autoSync !== "boolean") throw new Error("自动同步开关无效");
   if (!Number.isFinite(merged.debounceMs) || merged.debounceMs < 1_000 || !Number.isFinite(merged.syncIntervalMs) || merged.syncIntervalMs < 10_000) throw new Error("同步时间必须为有效的毫秒数");
   return merged;
 }
 
 export function mergeSettings(data: unknown): TeamCoreSettings {
   const input = data && typeof data === "object" ? data as Partial<TeamCoreSettings> : {};
-  return { ...DEFAULT_SETTINGS, ...input, gitUsername: typeof input.gitUsername === "string" ? input.gitUsername : DEFAULT_SETTINGS.gitUsername };
+  return {
+    ...DEFAULT_SETTINGS,
+    ...input,
+    autoSync: typeof input.autoSync === "boolean" ? input.autoSync : DEFAULT_SETTINGS.autoSync,
+    gitUsername: typeof input.gitUsername === "string" ? input.gitUsername : DEFAULT_SETTINGS.gitUsername
+  };
 }

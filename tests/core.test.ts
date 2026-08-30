@@ -6,17 +6,18 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { exportSettings, importSettings } from "../src/config";
+import { exportSettings, importSettings, mergeSettings } from "../src/config";
 import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
-import { pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldProtectMismatchedLocalAttachment, shouldTrackVaultEvent } from "../src/sync";
-import { assetPathForHash, collectMarkdownReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences } from "../src/vault";
+import { planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
 import git from "isomorphic-git";
+import { assignedOrHistoricalAuthors, clearFileAuthors, countResolvedDocumentAuthors, createEmptyFileAuthorRegistry, FileAuthorService, mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry, setFileAuthors, validateFileAuthorRegistry, writeFileAuthorRegistry } from "../src/file-authors";
 
 const execFileAsync = promisify(execFile);
 
@@ -189,6 +190,14 @@ describe("configuration bundles", () => {
     const encoded = exportSettings(settings({ debounceMs: 0 }));
     expect(() => importSettings(encoded, settings())).toThrow("同步时间");
   });
+
+  it("preserves the automatic-sync choice and defaults legacy settings to enabled", () => {
+    const source = settings({ autoSync: false });
+    expect(importSettings(exportSettings(source), settings({ autoSync: true })).autoSync).toBe(true);
+    expect(importSettings(exportSettings(source), settings({ autoSync: false })).autoSync).toBe(false);
+    expect(mergeSettings({ autoSync: false }).autoSync).toBe(false);
+    expect(mergeSettings({}).autoSync).toBe(false);
+  });
 });
 
 describe("Git URL normalization", () => {
@@ -215,6 +224,90 @@ describe("crypto helpers", () => {
   });
 });
 
+describe("file author assignments", () => {
+  it("stores canonical file-level authors and falls back to Git history", () => {
+    const empty = createEmptyFileAuthorRegistry();
+    expect(assignedOrHistoricalAuthors(empty, "notes/a.md", ["Git Author"])).toEqual(["Git Author"]);
+
+    const assigned = setFileAuthors(empty, ["notes/b.md", "notes/a.md"], [" Alice ", "Bob", "Alice"]);
+    expect(assignedOrHistoricalAuthors(assigned, "notes/a.md", ["Git Author"])).toEqual(["Alice", "Bob"]);
+    expect(serializeFileAuthorRegistry(assigned)).toContain('"notes/a.md"');
+    expect(Object.keys(parseFileAuthorRegistry(serializeFileAuthorRegistry(assigned)).files)).toEqual(["notes/a.md", "notes/b.md"]);
+
+    const cleared = clearFileAuthors(assigned, ["notes/a.md"]);
+    expect(assignedOrHistoricalAuthors(cleared, "notes/a.md", ["Git Author"])).toEqual(["Git Author"]);
+    expect(() => validateFileAuthorRegistry({ version: 1, files: { "私人笔记/a.md": ["Alice"] } })).toThrow("路径无效");
+    expect(() => validateFileAuthorRegistry({ version: 1, files: { "notes/a.md": [] } })).toThrow("不能为空");
+  });
+
+  it("merges independent file assignments and rejects competing edits", () => {
+    const base = setFileAuthors(createEmptyFileAuthorRegistry(), ["notes/base.md"], ["Base"]);
+    const ours = setFileAuthors(base, ["notes/local.md"], ["Alice"]);
+    const theirs = setFileAuthors(base, ["notes/remote.md"], ["Bob"]);
+    expect(mergeFileAuthorRegistries(base, ours, theirs)?.files).toEqual({
+      "notes/base.md": ["Base"],
+      "notes/local.md": ["Alice"],
+      "notes/remote.md": ["Bob"]
+    });
+
+    const localEdit = setFileAuthors(base, ["notes/base.md"], ["Alice"]);
+    const remoteEdit = setFileAuthors(base, ["notes/base.md"], ["Bob"]);
+    expect(mergeFileAuthorRegistries(base, localEdit, remoteEdit)).toBeUndefined();
+  });
+
+  it("counts assigned document authors before falling back to file history", () => {
+    const resolved = new Map<string, readonly string[]>([
+      ["notes/manual.md", ["Manual Author"]],
+      ["notes/history.md", ["Git Author", "Coauthor", "Git Author"]]
+    ]);
+    expect(Object.fromEntries(countResolvedDocumentAuthors(resolved))).toEqual({
+      "Manual Author": 1,
+      "Git Author": 1,
+      Coauthor: 1
+    });
+  });
+
+  it("resolves title and chart authors through one cached service", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-author-service-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.write(".team/file-authors.json", encode(JSON.stringify({ version: 1, files: { "notes/manual.md": ["Manual Author"] } })));
+      const calls: string[] = [];
+      const service = new FileAuthorService(vault, {
+        exists: async () => true,
+        fileAuthors: async (path) => { calls.push(path); return ["Git Author"]; }
+      });
+      expect(await service.getAuthors("notes/manual.md")).toEqual(["Manual Author"]);
+      expect(await service.getAuthors("notes/history.md")).toEqual(["Git Author"]);
+      expect(await service.getAuthors("notes/history.md")).toEqual(["Git Author"]);
+      expect(calls).toEqual(["notes/history.md"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses an existing hidden team directory when saving assignments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-file-authors-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.mkdir(".team");
+      const originalMkdir = vault.mkdir.bind(vault);
+      let mkdirCalls = 0;
+      vault.mkdir = async (path: string): Promise<void> => {
+        mkdirCalls += 1;
+        if (await vault.exists(path)) throw new Error("Folder already exists");
+        await originalMkdir(path);
+      };
+      const registry = setFileAuthors(createEmptyFileAuthorRegistry(), ["notes/a.md"], ["Alice"]);
+      await writeFileAuthorRegistry(vault, registry);
+      expect(mkdirCalls).toBe(0);
+      expect(parseFileAuthorRegistry(decode(await vault.read(".team/file-authors.json")))).toEqual(registry);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("manifest and vault path rules", () => {
   it("adds assets to Obsidian excluded-file filters without replacing existing filters", () => {
     let filters: unknown = ["*.tmp"];
@@ -223,9 +316,83 @@ describe("manifest and vault path rules", () => {
       setConfig: (key: string, value: unknown) => { if (key === "userIgnoreFilters") filters = value; }
     } as unknown as Vault;
     expect(ensureAssetsExcluded(vault)).toBe(true);
-    expect(filters).toEqual(["*.tmp", "assets"]);
+    expect(filters).toEqual(["*.tmp", "assets", "私人笔记/assets"]);
     expect(ensureAssetsExcluded(vault)).toBe(false);
-    expect(filters).toEqual(["*.tmp", "assets"]);
+    expect(filters).toEqual(["*.tmp", "assets", "私人笔记/assets"]);
+  });
+
+  it("recognizes only the root assets folder for explorer hiding", () => {
+    expect(isRootAssetsPath("assets")).toBe(true);
+    expect(isRootAssetsPath("/assets/")).toBe(true);
+    expect(isRootAssetsPath("assets/screenshots/image.png")).toBe(false);
+    expect(isRootAssetsPath("notes/assets")).toBe(false);
+    expect(isHiddenAssetsFolderPath("assets")).toBe(true);
+    expect(isHiddenAssetsFolderPath("私人笔记/assets")).toBe(true);
+    expect(isHiddenAssetsFolderPath("私人笔记")).toBe(false);
+    expect(isHiddenAssetsFolderPath("notes/assets")).toBe(false);
+  });
+
+  it("recognizes pasted image attachment extensions outside assets", () => {
+    expect(isImageAttachmentPath("Pasted image.png")).toBe(true);
+    expect(isImageAttachmentPath("notes/photo.JPG")).toBe(true);
+    expect(isImageAttachmentPath("notes/readme.md")).toBe(false);
+    expect(isImageAttachmentPath("assets/photo.png")).toBe(true);
+    const hash = "a".repeat(64);
+    expect(pastedImageExtension("image", "image/jpeg")).toBe("jpg");
+    expect(pastedImageExtension("photo.WEBP", "application/octet-stream")).toBe("webp");
+    expect(pastedImageTargetPath(hash, "png", "notes/readme.md")).toBe(`assets/tc-sha256-${hash}.png`);
+    expect(pastedImageTargetPath(hash, "png", "私人笔记/readme.md")).toBe(`私人笔记/assets/tc-sha256-${hash}.png`);
+  });
+
+  it("prunes ordinary empty folders while preserving local-only roots", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-empty-folders-"));
+    try {
+      class WindowsDirectoryVault extends NodeVault {
+        override rmdir(path: string, recursive = false): Promise<void> {
+          if (!recursive) return Promise.reject(new Error(`Path is a directory: ${path}`));
+          return super.rmdir(path, recursive);
+        }
+      }
+      const vault = new WindowsDirectoryVault(root);
+      await vault.mkdir("gone/nested");
+      await vault.mkdir("kept");
+      await vault.write("kept/note.md", encode("note"));
+      await vault.mkdir("assets");
+      await vault.mkdir("私人笔记/empty");
+      await vault.mkdir(".obsidian/plugins");
+      expect(await pruneEmptyManagedFolders(vault, ".obsidian")).toEqual(["gone", "gone/nested"]);
+      expect(await vault.exists("gone")).toBe(false);
+      expect(await vault.exists("kept")).toBe(true);
+      expect(await vault.exists("assets")).toBe(true);
+      expect(await vault.exists("私人笔记/empty")).toBe(true);
+      expect(await vault.exists(".obsidian/plugins")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("finds hidden files that must be cleared before a confirmed remote overwrite", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-overwrite-files-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.write(".team/assets-manifest.json", encode(serializeManifest(createEmptyManifest())));
+      await vault.write(".gitignore", encode("assets/\n"));
+      await vault.write("assets/hidden.png", encode("asset"));
+      await vault.write("notes/readme.md", encode("note"));
+      await vault.write(".obsidian/app.json", encode("{}\n"));
+      await vault.write("私人笔记/draft.md", encode("draft"));
+      await vault.write(".trash/deleted.md", encode("deleted"));
+      await vault.write(".git/HEAD", encode("ref: refs/heads/main\n"));
+
+      expect(await listRemoteOverwriteFiles(vault, ".obsidian")).toEqual([
+        ".gitignore",
+        ".team/assets-manifest.json",
+        "assets/hidden.png",
+        "notes/readme.md"
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("normalizes and serializes asset entries deterministically", () => {
@@ -290,6 +457,10 @@ describe("manifest and vault path rules", () => {
       "![remote](https://example.test/image.png)"
     ].join("\n");
     expect(collectMarkdownReferences(markdown, "notes/readme.md")).toEqual(["assets/diagram.png", "assets/guide.pdf", "assets/notes.txt"]);
+    expect(collectPrivateAttachmentReferences("![[私人笔记/assets/draft.png]]", "notes/readme.md")).toEqual(["私人笔记/assets/draft.png"]);
+    expect(collectPrivateAttachmentReferences("![[assets/draft.png]]", "私人笔记/readme.md")).toEqual([]);
+    expect(isPrivateAssetPath("私人笔记/assets/draft.png")).toBe(true);
+    expect(isPrivateAssetPath("assets/draft.png")).toBe(false);
     expect(normalizeVaultPath("/notes\\../assets//a.png")).toBe("assets/a.png");
     expect(isAssetPath("assets/a.png")).toBe(true);
     expect(isManagedPath("notes/readme.md", ".obsidian")).toBe(true);
@@ -350,6 +521,32 @@ describe("manifest and vault path rules", () => {
     expect(shouldTrackVaultEvent(".obsidian/plugins/team-core/data.json", ".obsidian", ["team-core"])).toBe(false);
     expect(shouldTrackVaultEvent("私人笔记/private.md", ".obsidian", [])).toBe(false);
     expect(shouldTrackVaultEvent(".team/assets-manifest.json", ".obsidian", [])).toBe(false);
+    expect(shouldTrackVaultEvent(".team/file-authors.json", ".obsidian", [])).toBe(true);
+  });
+
+  it("publishes private drafts only when they move into a synchronized public path", () => {
+    expect(shouldPublishPrivateDraftRename("私人笔记/draft.md", "notes/draft.md", "md", ".obsidian", [])).toBe(true);
+    expect(shouldPublishPrivateDraftRename("私人笔记/draft.md", ".obsidian/plugins/calendar/draft.md", "md", ".obsidian", ["calendar"])).toBe(true);
+    expect(shouldPublishPrivateDraftRename("私人笔记/draft.md", ".trash/draft.md", "md", ".obsidian", [])).toBe(false);
+    expect(shouldPublishPrivateDraftRename("私人笔记/draft.md", ".obsidian/draft.md", "md", ".obsidian", [])).toBe(false);
+    expect(shouldPublishPrivateDraftRename("私人笔记/draft.md", ".obsidian/plugins/personal/draft.md", "md", ".obsidian", [])).toBe(false);
+    expect(shouldPublishPrivateDraftRename("私人笔记/draft.md", "notes/draft.txt", "txt", ".obsidian", [])).toBe(false);
+  });
+
+  it("consumes one pending generation without dropping later events for the same path", () => {
+    const pending = new Set(["notes/a.md", "assets/a.png"]);
+    expect([...takePendingPaths(pending)].sort()).toEqual(["assets/a.png", "notes/a.md"]);
+    expect(pending.size).toBe(0);
+    pending.add("notes/a.md");
+    expect([...pending]).toEqual(["notes/a.md"]);
+  });
+
+  it("normalizes attachments moved into public note folders without publishing local-only moves", () => {
+    expect(shouldNormalizeMovedAttachment("assets/image.png", "notes/image.png", ".obsidian")).toBe(true);
+    expect(shouldNormalizeMovedAttachment("私人笔记/assets/image.png", "drafts/image.png", ".obsidian")).toBe(true);
+    expect(shouldNormalizeMovedAttachment("assets/image.png", "私人笔记/assets/image.png", ".obsidian")).toBe(false);
+    expect(shouldNormalizeMovedAttachment("assets/image.png", ".trash/image.png", ".obsidian")).toBe(false);
+    expect(shouldNormalizeMovedAttachment("assets/image.png", ".obsidian/plugins/personal/image.png", ".obsidian")).toBe(false);
   });
 
   it("uses a distinct SHA-256 attachment prefix and preserves link decorations when renaming", () => {
@@ -379,6 +576,89 @@ describe("manifest and vault path rules", () => {
       `![image](../assets/tc-sha256-${hash}.png#page=3)`,
       "![other](assets/other.png)"
     ].join("\n"));
+  });
+
+  it("plans private draft publication without breaking attachments shared by other drafts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-publication-"));
+    try {
+      const vault = new NodeVault(root);
+      const sourcePath = "私人笔记/assets/draft image.png";
+      const data = encode("private image bytes");
+      await vault.write(sourcePath, data);
+      const hash = await sha256Hex(data);
+      const targetPath = `assets/tc-sha256-${hash}.png`;
+      const markdown = [
+        "![[私人笔记/assets/draft image.png|320]]",
+        "![draft](私人笔记/assets/draft%20image.png#preview)"
+      ].join("\n");
+
+      const shared = await planPrivateDraftPublication(vault, markdown, "私人笔记/draft.md", "notes/draft.md", [{
+        path: "私人笔记/other.md",
+        content: "![[私人笔记/assets/draft image.png]]"
+      }]);
+      expect(shared.attachments).toHaveLength(1);
+      expect(shared.attachments[0]).toMatchObject({ sourcePath, targetPath, createTarget: true, removeSource: false });
+      expect(shared.markdown).toBe([
+        `![[../${targetPath}|320]]`,
+        `![draft](../${targetPath}#preview)`
+      ].join("\n"));
+
+      await vault.write(targetPath, data);
+      const lastReference = await planPrivateDraftPublication(vault, markdown, "私人笔记/draft.md", "notes/draft.md", []);
+      expect(lastReference.attachments[0]).toMatchObject({ targetPath, createTarget: false, removeSource: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to publish a draft whose private attachment is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-publication-missing-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.mkdir("");
+      await expect(planPrivateDraftPublication(
+        vault,
+        "![[私人笔记/assets/missing.pdf]]",
+        "私人笔记/draft.md",
+        "draft.md",
+        []
+      )).rejects.toThrow("私人附件不存在");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("plans public note privatization without breaking attachments shared by public notes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-note-privatization-"));
+    try {
+      const vault = new NodeVault(root);
+      const data = encode("public attachment bytes");
+      const hash = await sha256Hex(data);
+      const sourcePath = `assets/tc-sha256-${hash}.pdf`;
+      const targetPath = `私人笔记/assets/tc-sha256-${hash}.pdf`;
+      await vault.write(sourcePath, data);
+      const markdown = `![document](../${sourcePath}#page=2)`;
+
+      const shared = await planPublicNotePrivatization(vault, markdown, "notes/public.md", "私人笔记/public.md", [{
+        path: "notes/other.md",
+        content: `![[${sourcePath}|Open]]`
+      }]);
+      expect(shared.attachments).toHaveLength(1);
+      expect(shared.attachments[0]).toMatchObject({ sourcePath, targetPath, createTarget: true, removeSource: false });
+      expect(shared.markdown).toBe(`![document](${targetPath}#page=2)`);
+
+      const privateReference = await planPublicNotePrivatization(vault, markdown, "notes/public.md", "私人笔记/public.md", [{
+        path: "私人笔记/draft.md",
+        content: `![[${sourcePath}|Draft attachment]]`
+      }]);
+      expect(privateReference.attachments[0]).toMatchObject({ sourcePath, removeSource: false });
+
+      await vault.write(targetPath, data);
+      const lastReference = await planPublicNotePrivatization(vault, markdown, "notes/public.md", "私人笔记/public.md", []);
+      expect(lastReference.attachments[0]).toMatchObject({ sourcePath, targetPath, createTarget: false, removeSource: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -535,6 +815,37 @@ describe("Git repository adapter", () => {
       const history = await repo.log("notes/readme.md", 10);
       expect(history).toHaveLength(2);
       expect(history[0]).toMatchObject({ message: "Update note", author: "Alice.Example", email: "alice.example@knowledgebase.local" });
+      expect(history[0].parents).toEqual([first]);
+      expect(await repo.fileAuthors("notes/readme.md")).toEqual(["Alice.Example"]);
+
+      await vault.write("notes/readme.md", new TextEncoder().encode("third\n").buffer);
+      const secondAuthor = new GitRepository(vault, settings({ gitUsername: "Bob.Example" }), logger, ".obsidian");
+      await secondAuthor.commit("Second author update");
+      expect(await secondAuthor.fileAuthors("notes/readme.md")).toEqual(["Alice.Example", "Bob.Example"]);
+      expect(await secondAuthor.fileAuthors("notes/missing.md")).toEqual([]);
+      expect(await secondAuthor.logSince(Date.now() - 60_000)).toHaveLength(3);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a private draft publication path out of an in-flight commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-git-draft-exclusion-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("draft.md", encode("draft base\n"));
+      await vault.write("normal.md", encode("normal base\n"));
+      await repo.commit("Base");
+
+      await vault.write("draft.md", encode("draft publishing\n"));
+      await vault.write("normal.md", encode("normal changed\n"));
+      expect(await repo.commit("Normal only", ["draft.md"])).toMatch(/^[0-9a-f]{40}$/);
+      const head = await git.resolveRef({ fs: repo.fs, dir: "", ref: "HEAD" });
+      expect(new TextDecoder().decode((await git.readBlob({ fs: repo.fs, dir: "", oid: head, filepath: "draft.md" })).blob)).toBe("draft base\n");
+      expect(new TextDecoder().decode((await git.readBlob({ fs: repo.fs, dir: "", oid: head, filepath: "normal.md" })).blob)).toBe("normal changed\n");
+      expect(await repo.hasUncommittedChanges()).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -564,6 +875,56 @@ describe("Git repository adapter", () => {
       expect(await repo.hasUncommittedChanges()).toBe(false);
       expect(await vault.exists(".obsidian/plugins/calendar/main.js")).toBe(true);
       expect(await vault.exists("remote.md")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a remote merge tree containing local-only configuration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-forbidden-merge-tree-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("base.md", encode("base\n"));
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write(".obsidian/app.json", encode("remote config\n"));
+      await git.add({ fs: repo.fs, dir: "", filepath: ".obsidian/app.json" });
+      const remoteCommit = await git.commit({
+        fs: repo.fs,
+        dir: "",
+        message: "Forbidden remote config",
+        author: { name: "Remote", email: "remote@example.test" }
+      });
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main", force: true });
+      await vault.write(".obsidian/app.json", encode("local config\n"));
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+
+      await expect(repo.mergeRemote()).rejects.toThrow("禁止同步路径");
+      expect(decode(await vault.read(".obsidian/app.json"))).toBe("local config\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("untracks legacy forbidden paths without deleting their local files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-untrack-forbidden-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      const paths = ["私人笔记/private.md", "assets/image.png", ".trash/deleted.md", ".obsidian/app.json", ".obsidian/plugins/team-core/data.json"];
+      for (const path of paths) {
+        await vault.write(path, encode(path));
+        await git.add({ fs: repo.fs, dir: "", filepath: path });
+      }
+      await git.commit({ fs: repo.fs, dir: "", message: "Legacy forbidden paths", author: { name: "Old client", email: "old@example.test" } });
+
+      expect(await repo.commit("Remove forbidden paths from Git")).toMatch(/^[0-9a-f]{40}$/);
+      expect(await git.listFiles({ fs: repo.fs, dir: "", ref: "HEAD" })).toEqual([]);
+      for (const path of paths) expect(await vault.exists(path)).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -856,6 +1217,25 @@ describe("Git repository adapter", () => {
     }
   });
 
+  it("rejects conflict resolution when the worktree changed after the conflict", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-conflict-dirty-worktree-"));
+    try {
+      const { vault, repo } = await createDivergence(
+        root,
+        { "shared.md": "base\n", "other.md": "unchanged\n" },
+        { "shared.md": "local\n" },
+        { "shared.md": "remote\n" }
+      );
+      expect(await repo.mergeRemote()).toEqual({ merged: false, conflicts: ["shared.md"] });
+      await vault.write("other.md", encode("edited while resolving\n"));
+      await expect(repo.resolveConflicts([{ path: "shared.md", content: "combined\n" }])).rejects.toThrow("本地文件又有修改");
+      expect(decode(await vault.read("other.md"))).toBe("edited while resolving\n");
+      expect(await repo.conflictedFiles()).toEqual(["shared.md"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("validates attachment manifest resolutions before changing the worktree", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-conflict-manifest-editor-"));
     const entry = (hash: string, uploadedBy: string) => ({ sha256: hash.repeat(64), size: 10, mime: "image/png", uploadedAt: "2026-08-28T00:00:00.000Z", uploadedBy });
@@ -896,6 +1276,89 @@ describe("Git repository adapter", () => {
       expect(Object.keys(merged.files).sort()).toEqual(["assets/local.png", "assets/remote.png"]);
       expect(await repo.hasUncommittedChanges()).toBe(false);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces a legacy bootstrap shared-plugin state during remote clone", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-clone-bootstrap-"));
+    const bare = join(root, "repo.git");
+    const seed = join(root, "seed");
+    const local = join(root, "local");
+    let server: Awaited<ReturnType<typeof startGitHttpServer>> | undefined;
+    try {
+      await runGit(["init", "--bare", bare]);
+      await runGit(["symbolic-ref", "HEAD", "refs/heads/main"], bare);
+      await mkdir(seed);
+      await runGit(["init"], seed);
+      await runGit(["checkout", "-b", "main"], seed);
+      await runGit(["config", "user.name", "Seed"], seed);
+      await runGit(["config", "user.email", "seed@example.test"], seed);
+      await mkdir(join(seed, ".team"));
+      const remoteState = serializeSharedPluginState(["calendar"]);
+      await writeFile(join(seed, ".team", "shared-plugins.json"), remoteState);
+      await writeFile(join(seed, ".gitignore"), updateSharedPluginsInGitignore("assets/\n私人笔记/\n", ".obsidian", ["calendar"]));
+      await mkdir(join(seed, ".obsidian", "plugins", "calendar"), { recursive: true });
+      await writeFile(join(seed, ".obsidian", "plugins", "calendar", "main.js"), "remote calendar\n");
+      await runGit(["add", ".team/shared-plugins.json", ".gitignore", ".obsidian/plugins/calendar/main.js"], seed);
+      await runGit(["commit", "-m", "Shared plugin state"], seed);
+      await runGit(["remote", "add", "origin", bare], seed);
+      await runGit(["push", "origin", "main"], seed);
+
+      server = await startGitHttpServer(root, async () => undefined);
+      const vault = new NodeVault(local);
+      await vault.mkdir("");
+      await vault.write(".team/shared-plugins.json", encode(serializeSharedPluginState([])));
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("local calendar\n"));
+      await vault.write(".obsidian/plugins/personal/main.js", encode("personal plugin\n"));
+      const repo = new GitRepository(vault, settings({ gitUrl: server.url }), logger, ".obsidian");
+      const progressEvents: Array<{ phase: string; loaded: number; total: number }> = [];
+      await repo.clone((progress) => {
+        progressEvents.push(progress);
+      });
+
+      expect(decode(await vault.read(".team/shared-plugins.json"))).toBe(remoteState);
+      expect(decode(await vault.read(".obsidian/plugins/calendar/main.js"))).toBe("remote calendar\n");
+      expect(decode(await vault.read(".obsidian/plugins/personal/main.js"))).toBe("personal plugin\n");
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+      expect(progressEvents.length).toBeGreaterThan(0);
+      expect(progressEvents.some(({ loaded, total }) => total > 0 && loaded >= 0 && loaded <= total)).toBe(true);
+    } finally {
+      if (server) await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a clone that tracks local-only Obsidian configuration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-clone-forbidden-tree-"));
+    const bare = join(root, "repo.git");
+    const seed = join(root, "seed");
+    const local = join(root, "local");
+    let server: Awaited<ReturnType<typeof startGitHttpServer>> | undefined;
+    try {
+      await runGit(["init", "--bare", bare]);
+      await runGit(["symbolic-ref", "HEAD", "refs/heads/main"], bare);
+      await mkdir(seed);
+      await runGit(["init"], seed);
+      await runGit(["checkout", "-b", "main"], seed);
+      await runGit(["config", "user.name", "Seed"], seed);
+      await runGit(["config", "user.email", "seed@example.test"], seed);
+      await mkdir(join(seed, ".obsidian"));
+      await writeFile(join(seed, ".obsidian", "app.json"), "remote config\n");
+      await runGit(["add", "-f", ".obsidian/app.json"], seed);
+      await runGit(["commit", "-m", "Forbidden config"], seed);
+      await runGit(["remote", "add", "origin", bare], seed);
+      await runGit(["push", "origin", "main"], seed);
+
+      server = await startGitHttpServer(root, async () => undefined);
+      const vault = new NodeVault(local);
+      await vault.write(".obsidian/app.json", encode("local config\n"));
+      const repo = new GitRepository(vault, settings({ gitUrl: server.url }), logger, ".obsidian");
+      await expect(repo.clone()).rejects.toThrow("禁止同步路径");
+      expect(decode(await vault.read(".obsidian/app.json"))).toBe("local config\n");
+      expect(await vault.exists(".git")).toBe(false);
+    } finally {
+      if (server) await server.close();
       await rm(root, { recursive: true, force: true });
     }
   });

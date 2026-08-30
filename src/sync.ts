@@ -1,4 +1,4 @@
-import { FileSystemAdapter, TFile, type App } from "obsidian";
+import { FileSystemAdapter, TFile, TFolder, type App, type Editor } from "obsidian";
 import { MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
 import { sha256Hex } from "./crypto";
 import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
@@ -6,7 +6,7 @@ import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, normalizeVaultPath, rewriteAssetReferences, type BinaryVault } from "./vault";
+import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
@@ -36,6 +36,127 @@ interface AttachmentPlan {
   mime: string;
   data?: ArrayBuffer;
   requiresUpload: boolean;
+}
+
+export interface MarkdownSnapshot {
+  path: string;
+  content: string;
+}
+
+export interface PrivateDraftAttachmentPlan {
+  sourcePath: string;
+  targetPath: string;
+  data: ArrayBuffer;
+  createTarget: boolean;
+  removeSource: boolean;
+}
+
+export interface PrivateDraftPublicationPlan {
+  markdown: string;
+  attachments: PrivateDraftAttachmentPlan[];
+}
+
+type AttachmentReferenceCollector = (markdown: string, sourcePath: string) => string[];
+
+async function planAttachmentTransfer(
+  vault: BinaryVault,
+  markdown: string,
+  originalPath: string,
+  currentPath: string,
+  otherNotes: readonly MarkdownSnapshot[],
+  collectReferences: AttachmentReferenceCollector,
+  targetForHash: (hash: string, extension?: string) => string,
+  sourceLabel: string,
+  targetLabel: string
+): Promise<PrivateDraftPublicationPlan> {
+  const referenced = new Set([
+    ...collectReferences(markdown, originalPath),
+    ...collectReferences(markdown, currentPath)
+  ]);
+  const shared = new Set<string>();
+  for (const note of otherNotes) {
+    for (const path of collectReferences(note.content, note.path)) shared.add(path);
+  }
+
+  const attachments: PrivateDraftAttachmentPlan[] = [];
+  let rewritten = markdown;
+  for (const sourcePath of [...referenced].sort()) {
+    const source = await vault.stat(sourcePath);
+    if (!source || source.type !== "file") throw new Error(`${sourceLabel}附件不存在：${sourcePath}`);
+    const data = await vault.read(sourcePath);
+    const hash = await sha256Hex(data);
+    const filename = sourcePath.split("/").pop() ?? "";
+    const dot = filename.lastIndexOf(".");
+    const extension = dot > 0 ? filename.slice(dot + 1) : undefined;
+    const targetPath = targetForHash(hash, extension);
+    const target = await vault.stat(targetPath);
+    let createTarget = true;
+    if (target) {
+      if (target.type !== "file") throw new Error(`${targetLabel}附件路径无法使用：${targetPath}`);
+      const targetData = await vault.read(targetPath);
+      if (targetData.byteLength !== data.byteLength || await sha256Hex(targetData) !== hash) {
+        throw new Error(`${targetLabel}哈希附件与${sourceLabel}附件内容不一致：${targetPath}`);
+      }
+      createTarget = false;
+    }
+    attachments.push({ sourcePath, targetPath, data, createTarget, removeSource: !shared.has(sourcePath) });
+    rewritten = rewriteAssetReferences(rewritten, currentPath, sourcePath, targetPath, originalPath);
+    rewritten = rewriteAssetReferences(rewritten, currentPath, sourcePath, targetPath, currentPath);
+  }
+
+  const remaining = new Set([
+    ...collectReferences(rewritten, originalPath),
+    ...collectReferences(rewritten, currentPath)
+  ]);
+  for (const sourcePath of referenced) {
+    if (remaining.has(sourcePath)) throw new Error(`无法改写${sourceLabel}附件链接：${sourcePath}`);
+  }
+  return { markdown: rewritten, attachments };
+}
+
+/**
+ * Builds a complete publication plan without changing the Vault. All private
+ * attachment bytes and existing public destinations are verified up front so
+ * the caller can safely materialize the plan before exposing the Markdown.
+ */
+export async function planPrivateDraftPublication(
+  vault: BinaryVault,
+  markdown: string,
+  originalPath: string,
+  currentPath: string,
+  otherPrivateNotes: readonly MarkdownSnapshot[]
+): Promise<PrivateDraftPublicationPlan> {
+  return planAttachmentTransfer(
+    vault,
+    markdown,
+    originalPath,
+    currentPath,
+    otherPrivateNotes,
+    collectPrivateAttachmentReferences,
+    assetPathForHash,
+    "私人",
+    "公共"
+  );
+}
+
+export async function planPublicNotePrivatization(
+  vault: BinaryVault,
+  markdown: string,
+  originalPath: string,
+  currentPath: string,
+  otherPublicNotes: readonly MarkdownSnapshot[]
+): Promise<PrivateDraftPublicationPlan> {
+  return planAttachmentTransfer(
+    vault,
+    markdown,
+    originalPath,
+    currentPath,
+    otherPublicNotes,
+    collectMarkdownReferences,
+    (hash, extension) => `${PRIVATE_FOLDER}/${assetPathForHash(hash, extension)}`,
+    "公共",
+    "私人"
+  );
 }
 
 export interface RemoteReconciliationResult {
@@ -77,12 +198,42 @@ export function shouldTrackVaultEvent(path: string, configDir: string, sharedPlu
     && (isAssetPath(normalized) || isManagedPath(normalized, configDir, sharedPluginIds));
 }
 
+export function shouldPublishPrivateDraftRename(
+  previousPath: string,
+  currentPath: string,
+  extension: string,
+  configDir: string,
+  sharedPluginIds: readonly string[]
+): boolean {
+  return extension === "md"
+    && isPrivatePath(previousPath)
+    && isManagedPath(currentPath, configDir, sharedPluginIds);
+}
+
+export function takePendingPaths(pending: Set<string>): Set<string> {
+  const snapshot = new Set(pending);
+  for (const path of snapshot) pending.delete(path);
+  return snapshot;
+}
+
+export function shouldNormalizeMovedAttachment(previousPath: string, currentPath: string, configDir: string): boolean {
+  const previous = normalizeVaultPath(previousPath);
+  const current = normalizeVaultPath(currentPath);
+  return (isAssetPath(previous) || isPrivateAssetPath(previous))
+    && !isConfigPath(current, configDir)
+    && isManagedPath(current, configDir);
+}
+
 export class SyncCoordinator {
   private state: SyncState = "uninitialized";
   private pendingFiles = new Set<string>();
   private pendingAssets = new Set<string>();
   private internalMarkdownWrites = new Set<string>();
   private internalAssetWrites = new Set<string>();
+  private internalDraftNoteMoves = new Set<string>();
+  private fileMoveRevisions = new WeakMap<TFile, number>();
+  private pendingDraftPublications = new Map<symbol, { file: TFile; originalPath: string }>();
+  private pendingNotePrivatizations = new Map<symbol, { file: TFile; originalPath: string }>();
   private internalCommunityPluginWriteDepth = 0;
   private debounceTimer: number | undefined;
   private periodicTimer: number | undefined;
@@ -99,8 +250,20 @@ export class SyncCoordinator {
     this.logger = logger ?? new PluginLogger();
   }
 
+  private createVault(): BinaryVault {
+    return createVaultAdapter(this.app.vault.adapter);
+  }
+
+  private createRepository(vault: BinaryVault = this.createVault(), settings: TeamCoreSettings = this.settings(), sharedPluginIds: readonly string[] = this.sharedPluginIds): GitRepository {
+    return new GitRepository(vault, settings, this.logger, this.app.vault.configDir, sharedPluginIds);
+  }
+
   start(): void {
     this.stop();
+    if (!this.settings().autoSync) return;
+    if (this.pendingFiles.size || this.pendingAssets.size) {
+      this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
+    }
     this.periodicTimer = window.setInterval(() => void this.runCycle(false), this.settings().syncIntervalMs);
   }
 
@@ -133,24 +296,124 @@ export class SyncCoordinator {
     this.scheduleSync();
   }
 
+  markManagedPathChanged(path: string): void {
+    const normalized = normalizeVaultPath(path);
+    if (!isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds)) return;
+    this.pendingFiles.add(normalized);
+    this.scheduleSync();
+  }
+
+  markFileDeleted(file: TFile): void {
+    const path = normalizeVaultPath(file.path);
+    if (path === MANIFEST_PATH) {
+      this.pendingFiles.add(path);
+      this.fullAttachmentScanPending = true;
+      this.scheduleSync();
+      return;
+    }
+    this.markFileChanged(file);
+  }
+
   markFileRenamed(file: TFile, oldPath: string): void {
     const previous = normalizeVaultPath(oldPath);
     const current = normalizeVaultPath(file.path);
+    const moveRevision = (this.fileMoveRevisions.get(file) ?? 0) + 1;
+    this.fileMoveRevisions.set(file, moveRevision);
+    if (this.internalDraftNoteMoves.has(previous) || this.internalDraftNoteMoves.has(current)) {
+      this.internalDraftNoteMoves.delete(previous);
+      this.internalDraftNoteMoves.delete(current);
+      return;
+    }
     if (this.internalAssetWrites.has(previous) || this.internalAssetWrites.has(current)) {
       this.internalAssetWrites.delete(previous);
       this.internalAssetWrites.delete(current);
       return;
     }
-    if (isAssetPath(previous)) this.pendingAssets.add(previous);
-    else if (isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds) && !isPrivatePath(previous) && previous !== MANIFEST_PATH) this.pendingFiles.add(previous);
+    if (previous === MANIFEST_PATH) {
+      this.pendingFiles.add(MANIFEST_PATH);
+      this.fullAttachmentScanPending = true;
+      this.scheduleSync();
+      return;
+    }
+    if (shouldPublishPrivateDraftRename(previous, current, file.extension, this.app.vault.configDir, this.sharedPluginIds)) {
+      const token = Symbol(current);
+      this.pendingDraftPublications.set(token, { file, originalPath: previous });
+      void this.runExclusive(() => this.publishPrivateDraft(file, previous, moveRevision))
+        .catch((error) => {
+          this.progress = undefined;
+          this.lastError = error instanceof Error ? error.message : String(error);
+          this.setState("error");
+          this.callbacks.onNotice(`私人草稿发布失败：${this.lastError}`);
+          this.logger.error("Private draft publication failed", { source: previous, error: this.lastError });
+        })
+        .finally(() => this.pendingDraftPublications.delete(token));
+      return;
+    }
+    if (file.extension === "md" && !isPrivatePath(previous) && isPrivatePath(current)
+      && isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds)) {
+      const token = Symbol(current);
+      this.pendingNotePrivatizations.set(token, { file, originalPath: previous });
+      void this.runExclusive(() => this.privatizePublicNote(file, previous, moveRevision))
+        .catch((error) => {
+          this.progress = undefined;
+          this.lastError = error instanceof Error ? error.message : String(error);
+          this.setState("error");
+          this.callbacks.onNotice(`笔记移入“私人笔记”失败：${this.lastError}`);
+          this.logger.error("Public note privatization failed", { source: previous, error: this.lastError });
+        })
+        .finally(() => this.pendingNotePrivatizations.delete(token));
+      return;
+    }
+    if (isAssetPath(previous)) {
+      this.pendingAssets.add(previous);
+      if (shouldNormalizeMovedAttachment(previous, current, this.app.vault.configDir)) this.pendingAssets.add(current);
+      this.scheduleSync();
+      return;
+    }
+    if (isPrivateAssetPath(previous) && shouldNormalizeMovedAttachment(previous, current, this.app.vault.configDir)) {
+      this.pendingAssets.add(current);
+      this.scheduleSync();
+      return;
+    }
+    if (isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds) && !isPrivatePath(previous) && previous !== MANIFEST_PATH) this.pendingFiles.add(previous);
     this.markFileChanged(file);
     if (this.pendingFiles.has(previous) || this.pendingAssets.has(previous)) this.scheduleSync();
   }
 
+  markFolderRenamed(folder: TFolder, oldPath: string): void {
+    const previousRoot = normalizeVaultPath(oldPath);
+    const currentRoot = normalizeVaultPath(folder.path);
+    const visit = (current: TFolder): void => {
+      for (const child of current.children) {
+        if (child instanceof TFile) {
+          const suffix = normalizeVaultPath(child.path).slice(currentRoot.length).replace(/^\/+/, "");
+          this.markFileRenamed(child, suffix ? `${previousRoot}/${suffix}` : previousRoot);
+        } else if (child instanceof TFolder) visit(child);
+      }
+    };
+    visit(folder);
+  }
+
+  markFolderDeleted(path: string): void {
+    const normalized = normalizeVaultPath(path);
+    if (!isAssetPath(normalized) && !isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds)) return;
+    this.pendingFiles.add(normalized);
+    this.fullAttachmentScanPending = true;
+    this.scheduleSync();
+  }
+
+  handleEditorPaste(event: ClipboardEvent, editor: Editor, sourceFile: TFile | null): boolean {
+    if (!sourceFile) return false;
+    const images = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.toLowerCase().startsWith("image/"));
+    if (!images.length) return false;
+    void this.insertPastedImages(images, editor, sourceFile);
+    return true;
+  }
+
   async prepareLocalVault(): Promise<void> {
-    const vault = createVaultAdapter(this.app.vault.adapter);
+    const vault = this.createVault();
     try {
-      if (ensureAssetsExcluded(this.app.vault)) this.logger.debug("已将 assets 加入 Obsidian 排除文件规则");
+      if (ensureAssetsExcluded(this.app.vault)) this.logger.debug("已将公共和私人附件目录加入 Obsidian 排除文件规则");
     } catch (error) {
       this.logger.warn("无法将 assets 加入 Obsidian 排除文件规则", error);
     }
@@ -158,11 +421,10 @@ export class SyncCoordinator {
     const existing = await vault.stat(PRIVATE_FOLDER);
     if (existing && existing.type !== "folder") throw new Error(`无法创建私人笔记文件夹：${PRIVATE_FOLDER} 已被文件占用`);
     await vault.mkdir(PRIVATE_FOLDER);
-    await this.ensureSharedPluginState(vault);
   }
 
   async setSharedPluginIds(ids: readonly string[]): Promise<void> {
-    const vault = createVaultAdapter(this.app.vault.adapter);
+    const vault = this.createVault();
     await writeSharedPluginIds(vault, this.app.vault.configDir, ids);
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     await this.refreshState();
@@ -174,6 +436,7 @@ export class SyncCoordinator {
 
   private scheduleSync(): void {
     if (this.state !== "conflict") this.setState("local-changes");
+    if (!this.settings().autoSync) return;
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
   }
@@ -201,10 +464,10 @@ export class SyncCoordinator {
   }
 
   async refreshState(): Promise<void> {
-    const vault = createVaultAdapter(this.app.vault.adapter);
+    const vault = this.createVault();
     try {
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
+      const git = this.createRepository(vault);
       if (!(await git.exists()) || !(await git.remoteUrl())) {
         this.setState("uninitialized");
         return;
@@ -224,19 +487,19 @@ export class SyncCoordinator {
 
   async getConflictEditorSession(): Promise<ConflictEditorSession> {
     return this.runExclusive(async () => {
-      const vault = createVaultAdapter(this.app.vault.adapter);
+      const vault = this.createVault();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
+      const git = this.createRepository(vault);
       return git.getConflictEditorSession();
     });
   }
 
   async resolveConflicts(resolutions: readonly ConflictResolution[]): Promise<SyncSnapshot> {
     await this.runExclusive(async () => {
-      const vault = createVaultAdapter(this.app.vault.adapter);
+      const vault = this.createVault();
       const previousSharedPluginIds = [...this.sharedPluginIds];
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
+      const git = this.createRepository(vault);
       await git.resolveConflicts(resolutions);
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const enabledStateChanged = await this.applySharedPluginState(vault);
@@ -270,6 +533,7 @@ export class SyncCoordinator {
 
   async runCycle(force: boolean): Promise<void> {
     if (this.running) return this.running;
+    if (!force && !this.settings().autoSync) return;
     if (!force && this.debounceTimer !== undefined) return;
     this.running = this.executeCycle().finally(() => { this.running = undefined; });
     return this.running;
@@ -283,9 +547,9 @@ export class SyncCoordinator {
     this.setState("syncing");
     try {
       const settings = this.settings();
-      const vault = createVaultAdapter(this.app.vault.adapter);
+      const vault = this.createVault();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, settings, this.logger, this.app.vault.configDir, this.sharedPluginIds);
+      const git = this.createRepository(vault, settings);
       const remote = await git.remoteInfo();
       if (Object.keys(remote.heads).length > 0) throw new Error("远端仓库已有提交，请使用“从远端知识库导入”或“立即同步”，不能重复初始化");
       this.startProgress("准备本地仓库", 1);
@@ -324,38 +588,59 @@ export class SyncCoordinator {
   }
 
   async inspectConnection(): Promise<ConnectionInfo> {
-    const vault = createVaultAdapter(this.app.vault.adapter);
+    const vault = this.createVault();
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-    const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
-    const files = this.app.vault.getFiles().filter((file) => {
-      const path = normalizeVaultPath(file.path);
-      return (isAssetPath(path) || isManagedPath(path, this.app.vault.configDir, this.sharedPluginIds)) && !isPrivatePath(path);
-    });
+    const git = this.createRepository(vault);
+    const files = await listRemoteOverwriteFiles(vault, this.app.vault.configDir);
     const info = await git.remoteInfo();
     return {
       localRepository: await git.exists(),
-      localHasManagedFiles: files.length > 0,
+      localHasManagedFiles: files.length > 0 || await vault.exists(".git"),
       localRemoteUrl: await git.remoteUrl(),
       remoteHasCommits: Object.keys(info.heads).length > 0
     };
   }
 
   async cloneRemote(force = false): Promise<void> {
+    if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
+    this.debounceTimer = undefined;
+    this.setState("syncing");
+    this.startProgress(force ? "等待重新同步" : "等待远端导入", 1);
+    return this.runExclusive(() => this.executeCloneRemote(force));
+  }
+
+  private async executeCloneRemote(force: boolean): Promise<void> {
     this.setState("syncing");
     try {
+      this.pendingFiles.clear();
+      this.pendingAssets.clear();
+      this.fullAttachmentScanPending = false;
       if (force) await this.clearForRemoteClone();
-      const vault = createVaultAdapter(this.app.vault.adapter);
+      const vault = this.createVault();
       const previousSharedPluginIds = [...this.sharedPluginIds];
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
-      await git.clone();
+      const git = this.createRepository(vault);
+      this.startProgress("拉取远端 Git", 1);
+      await git.clone((event) => this.updateProgress("拉取远端 Git", event.loaded, event.total, event.phase));
+      this.updateProgress("拉取远端 Git", 1, 1, "Git 工作区已写入");
+      this.startProgress("应用远端配置", 2);
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      this.advanceProgress("公共插件白名单");
       const enabledStateChanged = await this.applySharedPluginState(vault);
+      this.advanceProgress("公共插件启用状态");
       this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
-      await this.materializeRemoteAttachments(createEmptyManifest(), await readManifest(vault));
+      this.startProgress("检查远端附件", 1);
+      const remoteManifest = await readManifest(vault);
+      this.advanceProgress(MANIFEST_PATH);
+      await this.materializeRemoteAttachments(createEmptyManifest(), remoteManifest);
+      this.startProgress("整理本地目录", 1);
+      await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
+      this.advanceProgress();
       this.lastSyncAt = Date.now();
       this.lastError = "";
       this.progress = undefined;
+      this.pendingFiles.clear();
+      this.pendingAssets.clear();
       this.setState("synced");
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
@@ -370,24 +655,33 @@ export class SyncCoordinator {
   }
 
   private async clearForRemoteClone(): Promise<void> {
-    const files = this.app.vault.getFiles()
-      .filter((file) => {
-        const path = normalizeVaultPath(file.path);
-        return !isConfigPath(path, this.app.vault.configDir) && !isPrivatePath(path) && !isTrashPath(path);
-      })
-      .sort((a, b) => b.path.length - a.path.length);
-    for (const file of files) await this.app.fileManager.trashFile(file);
-    const adapter = createVaultAdapter(this.app.vault.adapter);
-    if (await adapter.exists(".git")) await adapter.rmdir(".git", true);
+    const adapter = this.createVault();
+    const files = await listRemoteOverwriteFiles(adapter, this.app.vault.configDir);
+    const hasGitDirectory = await adapter.exists(".git");
+    const cleanupItems = files.length + (hasGitDirectory ? 1 : 0);
+    this.startProgress("清理本地知识库", Math.max(cleanupItems, 1));
+    for (const path of files) {
+      const indexed = this.app.vault.getAbstractFileByPath(path);
+      if (indexed instanceof TFile) await this.app.fileManager.trashFile(indexed);
+      else await adapter.remove(path);
+      this.advanceProgress(path);
+    }
+    await pruneEmptyManagedFolders(adapter, this.app.vault.configDir);
+    if (hasGitDirectory) {
+      await adapter.rmdir(".git", true);
+      this.advanceProgress(".git");
+    } else if (!cleanupItems) {
+      this.advanceProgress("无需清理本地文件");
+    }
   }
 
   private async executeRemoteClear(): Promise<RemoteClearResult> {
     this.progress = undefined;
     this.setState("syncing");
     try {
-      const vault = createVaultAdapter(this.app.vault.adapter);
+      const vault = this.createVault();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, this.settings(), this.logger, this.app.vault.configDir, this.sharedPluginIds);
+      const git = this.createRepository(vault);
       const s3 = new S3Transport(this.settings(), this.logger);
       if (!s3.enabled()) throw new Error("S3 配置不完整，未执行任何删除");
 
@@ -434,18 +728,18 @@ export class SyncCoordinator {
   private async executeCycle(): Promise<void> {
     this.progress = undefined;
     this.setState("syncing");
-    const pendingNotes = new Set(this.pendingFiles);
-    const pendingAssets = new Set(this.pendingAssets);
+    // Consume only the captured generation. Events arriving after this point,
+    // including another edit to the same path, remain queued for the next run.
+    const pendingNotes = takePendingPaths(this.pendingFiles);
+    const pendingAssets = takePendingPaths(this.pendingAssets);
     const forceFullAttachmentScan = this.fullAttachmentScanPending;
+    if (forceFullAttachmentScan) this.fullAttachmentScanPending = false;
     try {
       const settings = this.settings();
-      const vault = createVaultAdapter(this.app.vault.adapter);
+      const vault = this.createVault();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
-      const git = new GitRepository(vault, settings, this.logger, this.app.vault.configDir, this.sharedPluginIds);
+      const git = this.createRepository(vault, settings);
       if (!(await git.exists())) {
-        this.pendingFiles.clear();
-        this.pendingAssets.clear();
-        this.fullAttachmentScanPending = false;
         this.progress = undefined;
         this.setState("uninitialized");
         return;
@@ -455,17 +749,25 @@ export class SyncCoordinator {
         this.enterConflict(existingConflicts, false);
         return;
       }
-      this.pendingFiles.clear();
-      this.pendingAssets.clear();
-      this.fullAttachmentScanPending = false;
       await git.ensureRemote();
       await git.ensureGitignore();
       await this.syncSharedPluginStateBeforeCommit(vault);
       const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
       const hasGitChanges = await git.hasUncommittedChanges();
+      if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
+        for (const path of pendingNotes) this.pendingFiles.add(path);
+        for (const path of pendingAssets) this.pendingAssets.add(path);
+        if (forceFullAttachmentScan) this.fullAttachmentScanPending = true;
+        this.deferForLocalChanges();
+        return;
+      }
       if (changed || pendingNotes.size || hasGitChanges) {
         this.startProgress("提交本地更改", 1);
-        await git.commit(`Update vault: ${pendingNotes.size || 1} files`);
+        await git.commit(
+          `Update vault: ${pendingNotes.size || 1} files`,
+          () => [...this.pendingDraftPublications.values(), ...this.pendingNotePrivatizations.values()]
+            .flatMap(({ file, originalPath }) => [normalizeVaultPath(file.path), normalizeVaultPath(originalPath)])
+        );
         this.advanceProgress();
       }
       const manifestBeforeRemote = await readManifest(vault);
@@ -509,11 +811,8 @@ export class SyncCoordinator {
       this.lastError = "";
       this.progress = undefined;
       const remainingChanges = await git.hasUncommittedChanges();
-      if (!remainingChanges) {
-        this.pendingFiles.clear();
-        this.pendingAssets.clear();
-      }
-      this.setState(remainingChanges ? "local-changes" : "synced");
+      const queuedChanges = this.pendingFiles.size > 0 || this.pendingAssets.size > 0 || this.fullAttachmentScanPending;
+      this.setState(remainingChanges || queuedChanges ? "local-changes" : "synced");
     } catch (error) {
       for (const path of pendingNotes) this.pendingFiles.add(path);
       for (const path of pendingAssets) this.pendingAssets.add(path);
@@ -541,6 +840,7 @@ export class SyncCoordinator {
     const enabledStateChanged = await this.applySharedPluginState(vault);
     this.notifySharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
     await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
+    await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
     return { conflicts: [], deferred: false };
   }
 
@@ -589,7 +889,7 @@ export class SyncCoordinator {
   }
 
   private async prepareAttachments(pendingNotes: ReadonlySet<string>, pendingAssets: ReadonlySet<string>, forceFullScan = false): Promise<boolean> {
-    const vault = createVaultAdapter(this.app.vault.adapter);
+    const vault = this.createVault();
     const manifest = await readManifest(vault);
     let next = manifest;
     for (const path of pendingAssets) {
@@ -598,12 +898,18 @@ export class SyncCoordinator {
         next = removeManifestEntry(next, normalized);
       }
     }
+    if (forceFullScan) {
+      for (const path of Object.keys(next.files)) {
+        if (!(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) next = removeManifestEntry(next, path);
+      }
+    }
     const discovered = await this.collectAttachmentCandidates(pendingNotes, pendingAssets, forceFullScan);
     const candidates = forceFullScan
       ? new Set([...discovered].filter((path) => {
         const file = this.app.vault.getAbstractFileByPath(path);
-        if (!(file instanceof TFile) || !isAssetPath(file.path)) return false;
+        if (!(file instanceof TFile)) return false;
         const normalizedPath = normalizeVaultPath(file.path);
+        if (!isAssetPath(file.path) && !pendingAssets.has(normalizedPath)) return false;
         const namedHash = hashFromAssetPath(normalizedPath);
         const entry = manifest.files[normalizedPath];
         return pendingAssets.has(normalizedPath)
@@ -614,8 +920,9 @@ export class SyncCoordinator {
       }))
       : discovered;
     if (!candidates.size) {
-      if (next !== manifest) await writeManifest(vault, next);
-      return next !== manifest;
+      const manifestMissing = !(await vault.exists(MANIFEST_PATH));
+      if (next !== manifest || manifestMissing) await writeManifest(vault, next);
+      return next !== manifest || manifestMissing;
     }
 
     const plans: AttachmentPlan[] = [];
@@ -623,7 +930,7 @@ export class SyncCoordinator {
     this.startProgress(forceFullScan ? "筛选待规范附件" : "检查改动附件", candidates.size);
     for (const sourcePath of candidates) {
       const file = this.app.vault.getAbstractFileByPath(sourcePath);
-      if (!(file instanceof TFile) || !isAssetPath(file.path)) {
+      if (!(file instanceof TFile) || (!isAssetPath(file.path) && !pendingAssets.has(normalizeVaultPath(file.path)))) {
         this.advanceProgress(sourcePath);
         continue;
       }
@@ -701,7 +1008,7 @@ export class SyncCoordinator {
   }
 
   private async collectAttachmentCandidates(pendingNotes: ReadonlySet<string>, pendingAssets: ReadonlySet<string>, fullScan: boolean): Promise<Set<string>> {
-    const candidates = new Set([...pendingAssets].map(normalizeVaultPath).filter(isAssetPath));
+    const candidates = new Set([...pendingAssets].map(normalizeVaultPath));
     if (fullScan) {
       for (const file of this.app.vault.getFiles()) if (isAssetPath(file.path)) candidates.add(normalizeVaultPath(file.path));
     }
@@ -716,6 +1023,302 @@ export class SyncCoordinator {
       this.advanceProgress(file.path);
     }
     return candidates;
+  }
+
+  private async insertPastedImages(images: readonly File[], editor: Editor, sourceFile: TFile): Promise<void> {
+    try {
+      const vault = this.createVault();
+      const links: string[] = [];
+      for (const image of images) {
+        const data = await image.arrayBuffer();
+        const hash = await sha256Hex(data);
+        const extension = pastedImageExtension(image.name, image.type);
+        const targetPath = pastedImageTargetPath(hash, extension, sourceFile.path);
+        const destination = this.app.vault.getAbstractFileByPath(targetPath);
+        this.internalAssetWrites.add(targetPath);
+        try {
+          if (destination instanceof TFile) {
+            const destinationHash = await sha256Hex(await vault.read(targetPath));
+            if (destinationHash !== hash) throw new Error(`哈希附件路径已被不同内容占用：${targetPath}`);
+          } else if (destination) {
+            throw new Error(`哈希附件路径无法使用：${targetPath}`);
+          } else {
+            const parent = targetPath.split("/").slice(0, -1).join("/");
+            await vault.mkdir(parent);
+            await this.app.vault.createBinary(targetPath, data);
+          }
+        } finally {
+          this.internalAssetWrites.delete(targetPath);
+        }
+        links.push(`![[${targetPath}]]`);
+        if (isAssetPath(targetPath)) this.pendingAssets.add(targetPath);
+      }
+      editor.replaceSelection(links.join("\n"));
+      if (links.some((link) => link.startsWith("![[assets/"))) this.scheduleSync();
+    } catch (error) {
+      this.callbacks.onNotice(`图片整理失败：${error instanceof Error ? error.message : String(error)}`);
+      this.logger.warn("Pasted image organization failed", { source: sourceFile.path, error: String(error) });
+    }
+  }
+
+  private isStableNoteMove(file: TFile, expectedPath: string, revision: number): boolean {
+    return this.fileMoveRevisions.get(file) === revision
+      && normalizeVaultPath(file.path) === expectedPath
+      && this.app.vault.getAbstractFileByPath(expectedPath) === file;
+  }
+
+  private assertStableNoteMove(file: TFile, expectedPath: string, revision: number): void {
+    if (!this.isStableNoteMove(file, expectedPath, revision)) throw new Error("笔记在附件迁移期间再次移动，旧迁移任务已取消");
+  }
+
+  private async publishPrivateDraft(file: TFile, originalPath: string, moveRevision: number): Promise<void> {
+    const currentPath = normalizeVaultPath(file.path);
+    if (isPrivatePath(currentPath) || file.extension !== "md") return;
+    const currentFile = this.app.vault.getAbstractFileByPath(currentPath);
+    if (!(currentFile instanceof TFile)) return;
+
+    this.setState("syncing");
+    const vault = this.createVault();
+    const originalMarkdown = await this.app.vault.read(currentFile);
+    const privateNotes = this.app.vault.getMarkdownFiles().filter((note) => isPrivatePath(note.path));
+    const pendingNotes = [...this.pendingDraftPublications.values()].filter(({ file: pending }) => pending !== file);
+    this.startProgress("发布私人草稿", privateNotes.length + pendingNotes.length + 1);
+    const snapshots: MarkdownSnapshot[] = [];
+    for (const note of privateNotes) {
+      snapshots.push({ path: normalizeVaultPath(note.path), content: await this.app.vault.read(note) });
+      this.advanceProgress(note.path);
+    }
+    for (const pending of pendingNotes) {
+      const pendingPath = normalizeVaultPath(pending.file.path);
+      const pendingFile = this.app.vault.getAbstractFileByPath(pendingPath);
+      if (!(pendingFile instanceof TFile) || pendingFile.extension !== "md") continue;
+      snapshots.push({ path: pending.originalPath, content: await this.app.vault.read(pendingFile) });
+      this.advanceProgress(pendingPath);
+    }
+
+    const createdTargets: string[] = [];
+    const removedSources = new Set<string>();
+    let plan: PrivateDraftPublicationPlan | undefined;
+    let noteUpdated = false;
+    try {
+      this.assertStableNoteMove(file, currentPath, moveRevision);
+      plan = await planPrivateDraftPublication(vault, originalMarkdown, originalPath, currentPath, snapshots);
+      this.assertStableNoteMove(file, currentPath, moveRevision);
+      const materialized = new Set<string>();
+      for (const attachment of plan.attachments) {
+        if (!attachment.createTarget || materialized.has(attachment.targetPath)) continue;
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        this.internalAssetWrites.add(attachment.targetPath);
+        try {
+          await vault.mkdir(attachment.targetPath.split("/").slice(0, -1).join("/"));
+          await this.app.vault.createBinary(attachment.targetPath, attachment.data);
+        } finally {
+          this.internalAssetWrites.delete(attachment.targetPath);
+        }
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        materialized.add(attachment.targetPath);
+        createdTargets.push(attachment.targetPath);
+      }
+
+      if (plan.markdown !== originalMarkdown) {
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        this.internalMarkdownWrites.add(currentPath);
+        try {
+          await this.app.vault.modify(currentFile, plan.markdown);
+          noteUpdated = true;
+        } finally {
+          this.internalMarkdownWrites.delete(currentPath);
+        }
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+      }
+
+      for (const attachment of plan.attachments) {
+        if (!attachment.removeSource) continue;
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        const source = this.app.vault.getAbstractFileByPath(attachment.sourcePath);
+        if (!(source instanceof TFile)) continue;
+        try {
+          await this.app.fileManager.trashFile(source);
+          removedSources.add(attachment.sourcePath);
+        } catch (error) {
+          this.logger.warn("Unable to remove published private attachment", { path: attachment.sourcePath, error: String(error) });
+        }
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+      }
+
+      this.assertStableNoteMove(file, currentPath, moveRevision);
+      this.advanceProgress(currentPath);
+      this.progress = undefined;
+      this.lastError = "";
+      this.pendingFiles.add(currentPath);
+      for (const attachment of plan.attachments) this.pendingAssets.add(attachment.targetPath);
+      this.scheduleSync();
+      if (plan.attachments.length) {
+        this.callbacks.onNotice(`私人草稿已发布，并整理 ${plan.attachments.length} 个附件。`);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (plan) {
+        for (const attachment of plan.attachments) {
+          if (removedSources.has(attachment.sourcePath) && !(await vault.exists(attachment.sourcePath))) {
+            await vault.write(attachment.sourcePath, attachment.data).catch(() => undefined);
+          }
+        }
+      }
+      const stable = this.isStableNoteMove(file, currentPath, moveRevision);
+      if (noteUpdated && stable) {
+        this.internalMarkdownWrites.add(currentPath);
+        try {
+          await this.app.vault.modify(currentFile, originalMarkdown);
+        } finally {
+          this.internalMarkdownWrites.delete(currentPath);
+        }
+      }
+      for (const targetPath of createdTargets.reverse()) {
+        const target = this.app.vault.getAbstractFileByPath(targetPath);
+        if (target instanceof TFile) await this.app.fileManager.trashFile(target).catch(() => undefined);
+        else if (await vault.exists(targetPath)) await vault.remove(targetPath).catch(() => undefined);
+      }
+      let rolledBack = false;
+      if (stable && this.app.vault.getAbstractFileByPath(currentPath) instanceof TFile && !(await vault.exists(originalPath))) {
+        this.internalDraftNoteMoves.add(currentPath);
+        this.internalDraftNoteMoves.add(normalizeVaultPath(originalPath));
+        try {
+          await this.app.vault.rename(currentFile, normalizeVaultPath(originalPath));
+          rolledBack = true;
+        } finally {
+          this.internalDraftNoteMoves.delete(currentPath);
+          this.internalDraftNoteMoves.delete(normalizeVaultPath(originalPath));
+        }
+      }
+      throw new Error(rolledBack
+        ? `${reason}；笔记已移回“私人笔记”`
+        : `${reason}；无法自动移回原路径，请检查当前笔记位置`);
+    }
+  }
+
+  private async privatizePublicNote(file: TFile, originalPath: string, moveRevision: number): Promise<void> {
+    const currentPath = normalizeVaultPath(file.path);
+    if (!isPrivatePath(currentPath) || file.extension !== "md") return;
+    const currentFile = this.app.vault.getAbstractFileByPath(currentPath);
+    if (!(currentFile instanceof TFile)) return;
+
+    this.setState("syncing");
+    const vault = this.createVault();
+    const originalMarkdown = await this.app.vault.read(currentFile);
+    const referenceNotes = this.app.vault.getMarkdownFiles().filter((note) => note !== currentFile && !isTrashPath(note.path));
+    const pendingNotes = [...this.pendingNotePrivatizations.values()].filter(({ file: pending }) => pending !== file);
+    this.startProgress("移入私人笔记", referenceNotes.length + pendingNotes.length + 1);
+    const snapshots: MarkdownSnapshot[] = [];
+    for (const note of referenceNotes) {
+      snapshots.push({ path: normalizeVaultPath(note.path), content: await this.app.vault.read(note) });
+      this.advanceProgress(note.path);
+    }
+    for (const pending of pendingNotes) {
+      const pendingPath = normalizeVaultPath(pending.file.path);
+      const pendingFile = this.app.vault.getAbstractFileByPath(pendingPath);
+      if (!(pendingFile instanceof TFile) || pendingFile.extension !== "md") continue;
+      snapshots.push({ path: pending.originalPath, content: await this.app.vault.read(pendingFile) });
+      this.advanceProgress(pendingPath);
+    }
+
+    const createdTargets: string[] = [];
+    const removedSources = new Set<string>();
+    let plan: PrivateDraftPublicationPlan | undefined;
+    let noteUpdated = false;
+    try {
+      this.assertStableNoteMove(file, currentPath, moveRevision);
+      plan = await planPublicNotePrivatization(vault, originalMarkdown, originalPath, currentPath, snapshots);
+      this.assertStableNoteMove(file, currentPath, moveRevision);
+      const materialized = new Set<string>();
+      for (const attachment of plan.attachments) {
+        if (!attachment.createTarget || materialized.has(attachment.targetPath)) continue;
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        await vault.mkdir(attachment.targetPath.split("/").slice(0, -1).join("/"));
+        await this.app.vault.createBinary(attachment.targetPath, attachment.data);
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        materialized.add(attachment.targetPath);
+        createdTargets.push(attachment.targetPath);
+      }
+
+      if (plan.markdown !== originalMarkdown) {
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        this.internalMarkdownWrites.add(currentPath);
+        try {
+          await this.app.vault.modify(currentFile, plan.markdown);
+          noteUpdated = true;
+        } finally {
+          this.internalMarkdownWrites.delete(currentPath);
+        }
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+      }
+
+      for (const attachment of plan.attachments) {
+        if (!attachment.removeSource) continue;
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+        const source = this.app.vault.getAbstractFileByPath(attachment.sourcePath);
+        if (!(source instanceof TFile)) continue;
+        this.internalAssetWrites.add(attachment.sourcePath);
+        try {
+          await this.app.fileManager.trashFile(source);
+          removedSources.add(attachment.sourcePath);
+        } catch (error) {
+          this.logger.warn("Unable to remove privatized public attachment", { path: attachment.sourcePath, error: String(error) });
+        } finally {
+          this.internalAssetWrites.delete(attachment.sourcePath);
+        }
+        this.assertStableNoteMove(file, currentPath, moveRevision);
+      }
+
+      this.assertStableNoteMove(file, currentPath, moveRevision);
+      this.advanceProgress(currentPath);
+      this.progress = undefined;
+      this.lastError = "";
+      this.pendingFiles.add(normalizeVaultPath(originalPath));
+      for (const sourcePath of removedSources) this.pendingAssets.add(sourcePath);
+      this.scheduleSync();
+      if (plan.attachments.length) {
+        this.callbacks.onNotice(`笔记已移入“私人笔记”，并整理 ${plan.attachments.length} 个附件。`);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (plan) {
+        for (const attachment of plan.attachments) {
+          if (removedSources.has(attachment.sourcePath) && !(await vault.exists(attachment.sourcePath))) {
+            await vault.write(attachment.sourcePath, attachment.data).catch(() => undefined);
+          }
+        }
+      }
+      const stable = this.isStableNoteMove(file, currentPath, moveRevision);
+      if (noteUpdated && stable) {
+        this.internalMarkdownWrites.add(currentPath);
+        try {
+          await this.app.vault.modify(currentFile, originalMarkdown);
+        } finally {
+          this.internalMarkdownWrites.delete(currentPath);
+        }
+      }
+      for (const targetPath of createdTargets.reverse()) {
+        const target = this.app.vault.getAbstractFileByPath(targetPath);
+        if (target instanceof TFile) await this.app.fileManager.trashFile(target).catch(() => undefined);
+        else if (await vault.exists(targetPath)) await vault.remove(targetPath).catch(() => undefined);
+      }
+      let rolledBack = false;
+      if (stable && this.app.vault.getAbstractFileByPath(currentPath) instanceof TFile && !(await vault.exists(originalPath))) {
+        this.internalDraftNoteMoves.add(currentPath);
+        this.internalDraftNoteMoves.add(normalizeVaultPath(originalPath));
+        try {
+          await this.app.vault.rename(currentFile, normalizeVaultPath(originalPath));
+          rolledBack = true;
+        } finally {
+          this.internalDraftNoteMoves.delete(currentPath);
+          this.internalDraftNoteMoves.delete(normalizeVaultPath(originalPath));
+        }
+      }
+      throw new Error(rolledBack
+        ? `${reason}；笔记已移回原公共路径`
+        : `${reason}；无法自动移回原路径，请检查当前笔记位置`);
+    }
   }
 
   private manifestEntry(plan: AttachmentPlan): AssetManifestEntry {
@@ -759,7 +1362,7 @@ export class SyncCoordinator {
       return shouldMaterializeRemoteAttachment(previous, entry, localFileExists);
     });
     if (!entries.length) return;
-    const vault = createVaultAdapter(this.app.vault.adapter);
+    const vault = this.createVault();
     const s3 = new S3Transport(this.settings(), this.logger);
     const username = this.settings().gitUsername.trim() || "unknown";
     this.startProgress("下载远端附件", entries.length);
@@ -804,6 +1407,17 @@ export class SyncCoordinator {
 
   private startProgress(phase: string, total: number): void {
     this.progress = { phase, current: 0, total, item: undefined };
+    this.callbacks.onSnapshot(this.snapshot());
+  }
+
+  private updateProgress(phase: string, current: number, total: number, item?: string): void {
+    const safeTotal = Math.max(total, 1);
+    this.progress = {
+      phase,
+      current: Math.min(Math.max(current, 0), safeTotal),
+      total: safeTotal,
+      item
+    };
     this.callbacks.onSnapshot(this.snapshot());
   }
 

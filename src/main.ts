@@ -1,4 +1,4 @@
-import { ButtonComponent, Modal, Notice, Plugin, TFile, type App } from "obsidian";
+import { ButtonComponent, MarkdownView, Modal, Notice, Plugin, TFile, TFolder, type App } from "obsidian";
 import { DEFAULT_SETTINGS, type SyncSnapshot, type TeamCoreSettings } from "./types";
 import { mergeSettings } from "./config";
 import { PluginLogger } from "./logger";
@@ -6,6 +6,10 @@ import { SyncCoordinator } from "./sync";
 import { HISTORY_VIEW_TYPE, TeamCoreHistoryView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
 import { requestConfirmation } from "./confirm";
+import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
+import { GitRepository } from "./git";
+import { FileAuthorService } from "./file-authors";
+import { FILE_AUTHORS_PATH } from "./constants";
 
 export default class TeamCorePlugin extends Plugin {
   teamCoreSettings: TeamCoreSettings = { ...DEFAULT_SETTINGS };
@@ -17,6 +21,8 @@ export default class TeamCorePlugin extends Plugin {
   private logger!: PluginLogger;
   private conflictEditor: ConflictEditorModal | undefined;
   private openingConflictEditor = false;
+  private authorService!: FileAuthorService;
+  private lastAuthorRefreshAt: number | undefined;
 
   async onload(): Promise<void> {
     this.teamCoreSettings = mergeSettings(await this.loadData());
@@ -31,25 +37,61 @@ export default class TeamCorePlugin extends Plugin {
       onSnapshot: (snapshot) => this.updateSnapshot(snapshot),
       onNotice: (message) => new Notice(message)
     }, this.logger);
+    this.authorService = this.createFileAuthorService();
     this.addSettingTab(new TeamCoreSettingTab(this.app, this));
-    this.registerView(HISTORY_VIEW_TYPE, (leaf) => new TeamCoreHistoryView(leaf, () => this.teamCoreSettings, () => this.coordinator));
+    this.registerView(HISTORY_VIEW_TYPE, (leaf) => new TeamCoreHistoryView(
+      leaf,
+      () => this.teamCoreSettings,
+      () => this.coordinator,
+      () => this.authorService
+    ));
     this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.handleSyncAction() });
     this.addCommand({ id: "resolve-conflicts", name: "解决同步冲突", callback: () => void this.openConflictEditor() });
     this.addCommand({ id: "normalize-attachments", name: "规范化全部附件", callback: () => void this.coordinator.normalizeAllAttachments() });
     this.addCommand({ id: "open-history", name: "打开历史窗口", callback: () => void this.openHistory() });
     this.addCommand({ id: "initialize-remote", name: "初始化并同步当前知识库", callback: () => void this.confirmInitialize() });
     this.addCommand({ id: "clone-remote", name: "从远端知识库导入", callback: () => void this.confirmClone() });
+    this.addCommand({ id: "overwrite-from-remote", name: "重置本地并重新同步", callback: () => void this.confirmRemoteOverwrite() });
     this.addCommand({ id: "clear-remote-test-data", name: "测试：清空远端 Git 与 S3", callback: () => this.confirmClearRemote() });
     this.addCommand({ id: "copy-diagnostics", name: "复制诊断信息", callback: () => void this.copyDiagnostics() });
-    this.registerEvent(this.app.vault.on("modify", (file) => { if (file instanceof TFile) this.coordinator.markFileChanged(file); }));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => { if (file instanceof TFile) this.coordinator.markFileRenamed(file, oldPath); }));
-    this.registerEvent(this.app.vault.on("delete", (file) => { if (file instanceof TFile) this.coordinator.markFileChanged(file); }));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (!(file instanceof TFile)) return;
+      if (file.path === FILE_AUTHORS_PATH) this.invalidateFileAuthors();
+      this.coordinator.markFileChanged(file);
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFile) {
+        this.authorService.invalidate();
+        this.coordinator.markFileRenamed(file, oldPath);
+        void this.refreshNoteAuthors();
+      }
+      else if (file instanceof TFolder) this.coordinator.markFolderRenamed(file, oldPath);
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (file instanceof TFile) {
+        if (file.path === FILE_AUTHORS_PATH) this.invalidateFileAuthors();
+        this.coordinator.markFileDeleted(file);
+      }
+      else if (file instanceof TFolder) this.coordinator.markFolderDeleted(file.path);
+    }));
+    this.registerEvent(this.app.workspace.on("editor-paste", (event, editor, info) => {
+      if (event.defaultPrevented) return;
+      if (this.coordinator.handleEditorPaste(event, editor, info.file)) event.preventDefault();
+    }));
+    this.registerEvent(this.app.workspace.on("file-open", () => void this.refreshNoteAuthors()));
+    this.registerEvent(this.app.workspace.on("layout-change", () => void this.refreshNoteAuthors()));
     this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(this.app.vault.on("create", (file) => {
+        if (file instanceof TFile) this.coordinator.markFileChanged(file);
+      }));
       void this.coordinator.prepareLocalVault()
         .then(() => this.coordinator.refreshState())
         .catch((error) => new Notice(`无法创建“私人笔记”文件夹：${error instanceof Error ? error.message : String(error)}`))
         .finally(() => this.coordinator.start());
+      void this.refreshNoteAuthors();
     });
+    this.register(() => this.removeNoteAuthorDecorations());
+    this.hideAssetsInFileExplorer();
     this.updateSnapshot(this.latestSnapshot);
   }
 
@@ -61,12 +103,81 @@ export default class TeamCorePlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.teamCoreSettings);
+    this.authorService = this.createFileAuthorService();
+    void this.refreshNoteAuthors();
     this.coordinator?.start();
   }
 
+  private hideAssetsInFileExplorer(): void {
+    const apply = (): void => {
+      const titles = document.body?.findAll(".nav-files-container .nav-folder-title") ?? [];
+      for (const title of titles) {
+        const folder = title.matchParent(".tree-item.nav-folder");
+        if (!folder) continue;
+        folder.toggleClass("team-core-assets-hidden", isHiddenAssetsFolderPath(title.getAttr("data-path") ?? ""));
+      }
+    };
+    apply();
+    const observer = new MutationObserver(apply);
+    observer.observe(document.body, { attributes: true, attributeFilter: ["data-path"], childList: true, subtree: true });
+    this.register(() => observer.disconnect());
+  }
+
+  private async refreshNoteAuthors(): Promise<void> {
+    const views = this.app.workspace.getLeavesOfType("markdown")
+      .map((leaf) => leaf.view)
+      .filter((view): view is MarkdownView => view instanceof MarkdownView);
+    await Promise.all(views.map((view) => this.decorateNoteAuthors(view)));
+  }
+
+  private invalidateFileAuthors(): void {
+    this.authorService.invalidate();
+    void this.refreshNoteAuthors();
+  }
+
+  private createFileAuthorService(): FileAuthorService {
+    const vault = createVaultAdapter(this.app.vault.adapter);
+    const repository = new GitRepository(vault, this.teamCoreSettings, this.logger, this.app.vault.configDir);
+    return new FileAuthorService(vault, repository, () => {
+      this.coordinator.markManagedPathChanged(FILE_AUTHORS_PATH);
+      void this.refreshNoteAuthors();
+    });
+  }
+
+  private async decorateNoteAuthors(view: MarkdownView): Promise<void> {
+    const file = view.file;
+    const title = view.containerEl.querySelector<HTMLElement>(".inline-title");
+    if (!file || !title) return;
+    const authors = await this.authorService.getAuthors(file.path).catch((error: unknown) => {
+      this.logger.warn("Unable to load note authors", { filepath: file.path, error });
+      return [];
+    });
+    if (view.file?.path !== file.path || !title.isConnected) return;
+    if (!authors.length) {
+      title.removeClass("team-core-inline-title-decorated");
+      title.removeAttribute("data-team-core-authors");
+      return;
+    }
+    title.addClass("team-core-inline-title-decorated");
+    title.setAttr("data-team-core-authors", ` - ${authors.join(", ")}`);
+    title.setAttr("aria-description", `作者：${authors.join("、")}`);
+  }
+
+  private removeNoteAuthorDecorations(): void {
+    document.querySelectorAll<HTMLElement>(".team-core-inline-title-decorated").forEach((title) => {
+      title.removeClass("team-core-inline-title-decorated");
+      title.removeAttribute("data-team-core-authors");
+      title.removeAttribute("aria-description");
+    });
+  }
 
   private updateSnapshot(snapshot: SyncSnapshot): void {
     this.latestSnapshot = snapshot;
+    if (snapshot.state === "synced" && snapshot.lastSyncAt !== undefined && snapshot.lastSyncAt !== this.lastAuthorRefreshAt) {
+      this.lastAuthorRefreshAt = snapshot.lastSyncAt;
+      this.authorService.invalidate();
+      void this.refreshNoteAuthors();
+    }
     if (!this.statusBar) return;
     const state = { uninitialized: "未初始化", synced: "已同步", "local-changes": "有本地修改", syncing: "同步中", conflict: "有冲突", offline: "离线", error: "同步错误" }[snapshot.state];
     const author = snapshot.currentAuthor ? ` · 作者：${snapshot.currentAuthor}` : "";
@@ -171,8 +282,7 @@ export default class TeamCorePlugin extends Plugin {
       const configuredRemote = this.teamCoreSettings.gitUrl.replace(/\/+$/, "");
       const localRemote = info.localRemoteUrl?.replace(/\/+$/, "");
       if (info.localRepository && localRemote === configuredRemote) {
-        await this.coordinator.runManual();
-        new Notice("已按同一知识库执行同步");
+        new Notice("当前知识库已连接该远端。“从远端知识库导入”不会覆盖本地；需要完整重新下载时，请使用“重置本地并重新同步”。", 10_000);
         return;
       }
       if (!info.localHasManagedFiles) {
@@ -185,15 +295,10 @@ export default class TeamCorePlugin extends Plugin {
       } else {
         const path = this.coordinator.getVaultBasePath();
         const location = path ? `\n\n备份目录：${path}` : "";
-        if (path) {
-          const backupNotice = new Notice(`请先备份知识库目录：${path}`, 0);
-          const copy = backupNotice.messageEl.createEl("button", { text: "复制路径" });
-          copy.addEventListener("click", () => void navigator.clipboard.writeText(path));
-        }
         if (!await requestConfirmation(this.app, {
-          title: "确认覆盖本地知识库",
-          message: `本地已有内容。请先备份后确认远端覆盖本地。${location}\n\n确定后将删除本地非配置目录文件。`,
-          confirmText: "覆盖并导入",
+          title: "确认重置本地知识库",
+          message: `远端 Git 与 S3 不会修改。本地已有内容，请先备份。${location}\n\n确定后将清空本地公共知识库和 Git 元数据，保留 Obsidian 配置、私人笔记和本地回收站，再从远端完整下载。`,
+          confirmText: "清空并重新同步",
           destructive: true
         })) return;
         await this.coordinator.cloneRemote(true);
@@ -201,6 +306,27 @@ export default class TeamCorePlugin extends Plugin {
       new Notice("远端知识库已导入");
     }
     catch (error) { new Notice(`导入失败：${error instanceof Error ? error.message : String(error)}`); }
+  }
+
+  async confirmRemoteOverwrite(): Promise<void> {
+    if (!this.teamCoreSettings.gitUrl) { new Notice("请先配置 Git 远端 URL"); return; }
+    try {
+      const info = await this.coordinator.inspectConnection();
+      if (!info.remoteHasCommits) {
+        new Notice("远端仓库为空，无法重新同步。请使用“初始化并同步当前知识库”。");
+        return;
+      }
+      const path = this.coordinator.getVaultBasePath();
+      const location = path ? `\n\n备份目录：${path}` : "";
+      if (!await requestConfirmation(this.app, {
+        title: "重置本地知识库并重新同步",
+        message: `远端 Git 与 S3 不会修改。将清空本地公共知识库和 Git 元数据，保留 Obsidian 配置、私人笔记和本地回收站，再从远端完整下载。请确认已备份本地知识库。${location}`,
+        confirmText: "清空并重新同步",
+        destructive: true
+      })) return;
+      await this.coordinator.cloneRemote(true);
+      new Notice("已重置本地知识库并从远端重新同步");
+    } catch (error) { new Notice(`重新同步失败：${error instanceof Error ? error.message : String(error)}`, 10_000); }
   }
 
   private confirmClearRemote(): void {

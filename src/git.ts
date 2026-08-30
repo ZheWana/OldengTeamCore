@@ -1,11 +1,12 @@
-import git, { type MergeDriverParams } from "isomorphic-git";
+import git, { type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
 import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
 import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./types";
-import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
-import { DEFAULT_BRANCH, MANIFEST_PATH } from "./constants";
+import { isManagedPath, normalizeVaultPath, type BinaryVault } from "./vault";
+import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
-import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
+import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
+import { mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry } from "./file-authors";
 
 const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
 const LINEBREAKS = /^.*(\r?\n|$)/gm;
@@ -167,6 +168,15 @@ function teamCoreMergeDriver(params: MergeDriverParams, configDir: string): { cl
       return { cleanMerge: true, mergedText: mergeSharedPluginState(base, ours, theirs) };
     } catch {
       return textMerge(params);
+    }
+  }
+  if (params.path === FILE_AUTHORS_PATH || params.path === "file-authors.json") {
+    try {
+      const [base, ours, theirs] = params.contents.map(parseFileAuthorRegistry);
+      const merged = mergeFileAuthorRegistries(base, ours, theirs);
+      if (merged) return { cleanMerge: true, mergedText: serializeFileAuthorRegistry(merged) };
+    } catch {
+      // Preserve malformed or competing edits for the conflict editor.
     }
   }
   return textMerge(params);
@@ -343,13 +353,58 @@ export class GitRepository {
     await git.addRemote({ fs: this.fs, dir: "", remote: "origin", url: gitUrl });
   }
 
-  async clone(): Promise<void> {
+  async clone(onProgress?: (progress: GitProgressEvent) => void): Promise<void> {
     const gitUrl = normalizeGitUrl(this.settings.gitUrl);
     if (!gitUrl) throw new Error("Git URL is not configured");
+    // Older plugin versions created this state file during startup, before a
+    // remote clone had a chance to materialize the tracked version. Remove a
+    // valid bootstrap file when no local repository exists so checkout can
+    // proceed without weakening Git's protection for real local files.
+    let bootstrapState: ArrayBuffer | undefined;
+    if (!(await this.vault.exists(".git/HEAD")) && await this.vault.exists(SHARED_PLUGIN_STATE_PATH)) {
+      try {
+        await readSharedPluginState(this.vault);
+        bootstrapState = await this.vault.read(SHARED_PLUGIN_STATE_PATH);
+        await this.vault.remove(SHARED_PLUGIN_STATE_PATH);
+      } catch {
+        // Preserve malformed state rather than deleting unknown content.
+      }
+    }
     const personalPluginFiles = await this.snapshotPersonalPluginFiles();
-    await git.clone({ ...(await this.gitOptions()), url: gitUrl, ref: DEFAULT_BRANCH, singleBranch: true, noCheckout: false });
-    await this.materializeSharedPluginFiles();
-    await this.restorePersonalPluginFiles(personalPluginFiles);
+    try {
+      await git.clone({ ...(await this.gitOptions()), url: gitUrl, ref: DEFAULT_BRANCH, singleBranch: true, noCheckout: true, onProgress });
+      const remoteTree = await this.validateManagedTree("HEAD");
+      for (const path of remoteTree.files) {
+        if (isSharedPluginPath(path, this.configDir, remoteTree.sharedPluginIds) && await this.vault.exists(path)) {
+          await this.vault.remove(path);
+        }
+      }
+      await git.checkout({ fs: this.fs, dir: "", ref: DEFAULT_BRANCH });
+      await this.materializeSharedPluginFiles();
+      await this.restorePersonalPluginFiles(personalPluginFiles);
+    } catch (error) {
+      if (await this.vault.exists(".git")) await this.vault.rmdir(".git", true).catch(() => undefined);
+      await this.restoreAllPluginFiles(personalPluginFiles).catch(() => undefined);
+      if (bootstrapState) await this.vault.write(SHARED_PLUGIN_STATE_PATH, bootstrapState).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async validateManagedTree(ref: string): Promise<{ files: string[]; sharedPluginIds: string[] }> {
+    const files = await git.listFiles({ fs: this.fs, dir: "", ref });
+    let sharedPluginIds: string[] = [];
+    if (files.includes(".gitignore")) {
+      const oid = await git.resolveRef({ fs: this.fs, dir: "", ref });
+      const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid, filepath: ".gitignore" });
+      sharedPluginIds = readSharedPluginIdsFromGitignore(new TextDecoder().decode(blob), this.configDir);
+    }
+    const forbidden = files.filter((path) => !isManagedPath(path, this.configDir, sharedPluginIds));
+    if (forbidden.length) {
+      const preview = forbidden.slice(0, 5).join(", ");
+      const remaining = forbidden.length > 5 ? ` 等 ${forbidden.length} 个文件` : "";
+      throw new Error(`远端仓库包含禁止同步路径，已拒绝写入本地：${preview}${remaining}`);
+    }
+    return { files, sharedPluginIds };
   }
 
   async remoteInfo(): Promise<GitRemoteInfo> {
@@ -468,6 +523,9 @@ export class GitRepository {
 
   async resolveConflicts(resolutions: readonly ConflictResolution[]): Promise<string> {
     const state = await this.requireConflictState();
+    if (await this.hasUncommittedChanges()) {
+      throw new Error("冲突发生后本地文件又有修改，已拒绝覆盖；请先备份或提交这些修改，再重新打开冲突编辑器");
+    }
     const expected = [...state.files].sort();
     const provided = resolutions.map(({ path }) => path).sort();
     if (new Set(provided).size !== provided.length || provided.length !== expected.length || provided.some((path, index) => path !== expected[index])) {
@@ -500,6 +558,14 @@ export class GitRepository {
           return { path: resolution.path, content: serializeSharedPluginState(parseSharedPluginState(resolution.content)) };
         } catch (error) {
           throw new Error(`公共插件启用状态格式无效：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (resolution.path === FILE_AUTHORS_PATH) {
+        if (resolution.content === undefined) throw new Error("文件作者归属表不能删除，请选择或编辑一个有效版本");
+        try {
+          return { path: resolution.path, content: serializeFileAuthorRegistry(parseFileAuthorRegistry(resolution.content)) };
+        } catch (error) {
+          throw new Error(`文件作者归属表格式无效：${error instanceof Error ? error.message : String(error)}`);
         }
       }
       return { ...resolution };
@@ -595,34 +661,42 @@ export class GitRepository {
     return this.sharedPluginIds;
   }
 
-  async stageManagedChanges(): Promise<string[]> {
+  async stageManagedChanges(excludedPaths: readonly string[] | (() => readonly string[]) = []): Promise<string[]> {
     const sharedPluginIds = await this.currentSharedPluginIds();
+    const currentExcluded = (): Set<string> => new Set(
+      (typeof excludedPaths === "function" ? excludedPaths() : excludedPaths).map(normalizeVaultPath)
+    );
     const matrix = await git.statusMatrix({ fs: this.fs, dir: "", filepaths: undefined });
     const changed: string[] = [];
     for (const [filepath, head, workdir, stage] of matrix as Array<[string, number, number, number]>) {
-      if (isPrivatePath(filepath)) {
-        if (head !== 0 || stage !== 0) changed.push(filepath);
-        if (stage !== 0) await git.remove({ fs: this.fs, dir: "", filepath });
+      if (currentExcluded().has(normalizeVaultPath(filepath))) {
+        if (head !== stage) await git.resetIndex({ fs: this.fs, dir: "", filepath });
         continue;
       }
       if (isManagedPath(filepath, this.configDir, sharedPluginIds) && (head !== workdir || workdir !== stage)) {
         changed.push(filepath);
         if (workdir === 0) await git.remove({ fs: this.fs, dir: "", filepath });
         else await git.add({ fs: this.fs, dir: "", filepath });
-      } else if (!isManagedPath(filepath, this.configDir, sharedPluginIds)
-        && isPotentialPluginPath(filepath, this.configDir)
-        && (head !== 0 || stage !== 0)) {
-        // Removing a directory from the whitelist untracks it without deleting
-        // its local files, so it becomes a personal plugin immediately.
+      } else if (!isManagedPath(filepath, this.configDir, sharedPluginIds) && (head !== 0 || stage !== 0)) {
+        // Any path outside the synchronization boundary is removed from the
+        // index without deleting its local bytes. This also repairs histories
+        // produced by older clients that tracked private/config/asset paths.
         changed.push(filepath);
         await git.remove({ fs: this.fs, dir: "", filepath });
       }
     }
-    return changed;
+    const excludedAfterStaging = currentExcluded();
+    const included = changed.filter((filepath) => !excludedAfterStaging.has(normalizeVaultPath(filepath)));
+    for (const filepath of changed) {
+      if (excludedAfterStaging.has(normalizeVaultPath(filepath))) {
+        await git.resetIndex({ fs: this.fs, dir: "", filepath });
+      }
+    }
+    return included;
   }
 
-  async commit(message: string): Promise<string | undefined> {
-    const changed = await this.stageManagedChanges();
+  async commit(message: string, excludedPaths: readonly string[] | (() => readonly string[]) = []): Promise<string | undefined> {
+    const changed = await this.stageManagedChanges(excludedPaths);
     if (!changed.length) return undefined;
     const username = this.settings.gitUsername.trim() || "unknown";
     const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
@@ -642,6 +716,7 @@ export class GitRepository {
     const remote = await git.resolveRef({ fs: this.fs, dir: "", ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }).catch(() => undefined);
     const local = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
     if (!remote || !local || remote === local) return { merged: false, conflicts: [] };
+    await this.validateManagedTree(remote);
     const personalPluginFiles = await this.snapshotPersonalPluginFiles();
     const currentBranch = await git.currentBranch({ fs: this.fs, dir: "", fullname: false }).catch(() => undefined);
     try {
@@ -709,6 +784,10 @@ export class GitRepository {
     }
   }
 
+  private async restoreAllPluginFiles(snapshot: ReadonlyMap<string, ArrayBuffer>): Promise<void> {
+    for (const [path, data] of snapshot) await this.vault.write(path, data);
+  }
+
   private async materializeSharedPluginFiles(): Promise<void> {
     const sharedPluginIds = await readSharedPluginIds(this.vault, this.configDir);
     const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
@@ -753,11 +832,17 @@ export class GitRepository {
     }
   }
 
-  async log(filepath?: string, depth = 200): Promise<CommitSummary[]> {
-    const entries = await git.log({ fs: this.fs, dir: "", depth, filepath });
+  async log(filepath?: string, depth?: number, since?: number): Promise<CommitSummary[]> {
+    const entries = await git.log({
+      fs: this.fs,
+      dir: "",
+      filepath,
+      ...(since === undefined ? { depth: depth ?? 200 } : { since: new Date(since) })
+    });
     return entries.map((entry) => ({
       oid: entry.oid,
       shortOid: entry.oid.slice(0, 7),
+      parents: [...entry.commit.parent],
       message: entry.commit.message.trim(),
       author: entry.commit.author.name,
       email: entry.commit.author.email,
@@ -765,12 +850,28 @@ export class GitRepository {
     }));
   }
 
+  async logSince(since: number, filepath?: string): Promise<CommitSummary[]> {
+    return this.log(filepath, undefined, since);
+  }
+
+  async fileAuthors(filepath: string): Promise<string[]> {
+    const entries = await git.log({ fs: this.fs, dir: "", filepath }).catch((error: unknown) => {
+      if (error && typeof error === "object" && "code" in error && error.code === "NotFoundError") return [];
+      throw error;
+    });
+    const authors = new Set<string>();
+    for (const entry of entries.reverse()) {
+      const author = entry.commit.author.name.trim();
+      if (author) authors.add(author);
+    }
+    return [...authors];
+  }
+
   async hasUncommittedChanges(): Promise<boolean> {
     const sharedPluginIds = await this.currentSharedPluginIds();
     return (await git.statusMatrix({ fs: this.fs, dir: "" })).some(([filepath, head, workdir, stage]) => {
-      if (isPrivatePath(filepath)) return head !== 0 || stage !== 0;
       if (isManagedPath(filepath, this.configDir, sharedPluginIds)) return head !== workdir || workdir !== stage;
-      return isPotentialPluginPath(filepath, this.configDir) && (head !== 0 || stage !== 0);
+      return head !== 0 || stage !== 0;
     });
   }
 }
