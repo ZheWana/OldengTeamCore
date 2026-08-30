@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.14 - 2026-08-30
+
+- Show a mobile-friendly synchronization progress modal with phase, `current/total`, current item, and a progress bar when the mobile status bar is unavailable.
+
 ## 0.1.13 - 2026-08-30
 
 - Fix mobile vault import failing with `Buffer is not defined` by bundling and injecting the browser-compatible Buffer implementation required by `isomorphic-git`.
