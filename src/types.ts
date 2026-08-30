@@ -20,6 +20,7 @@ export interface TeamCoreSettings {
   autoSync: boolean;
   debounceMs: number;
   syncIntervalMs: number;
+  authorDisplayMappings: Record<string, string>;
 }
 
 export const DEFAULT_SETTINGS: TeamCoreSettings = {
@@ -34,7 +35,8 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   s3SecretKey: "",
   autoSync: false,
   debounceMs: 60_000,
-  syncIntervalMs: 300_000
+  syncIntervalMs: 300_000,
+  authorDisplayMappings: {}
 };
 
 export interface AssetManifestEntry {

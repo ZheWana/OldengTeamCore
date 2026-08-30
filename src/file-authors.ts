@@ -1,6 +1,7 @@
 import { FILE_AUTHORS_PATH } from "./constants";
 import type { TFile, Vault } from "obsidian";
 import { isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
+import { AuthorDisplayService } from "./author-display";
 
 const FILE_AUTHORS_VERSION = 1 as const;
 
@@ -128,7 +129,8 @@ export class FileAuthorService {
   constructor(
     private readonly vault: BinaryVault,
     private readonly history: FileAuthorHistory,
-    private readonly onRegistryChanged?: () => void
+    private readonly onRegistryChanged?: () => void,
+    private readonly authorDisplay = new AuthorDisplayService({})
   ) {}
 
   invalidate(): void {
@@ -197,12 +199,16 @@ export class FileAuthorService {
     return registry;
   }
 
+  displayAuthors(authors: readonly string[]): string[] {
+    return this.authorDisplay.displayMany(authors);
+  }
+
   private async resolveAuthors(path: string): Promise<string[]> {
     const registry = await this.getRegistry();
     const assigned = registry.files[path];
-    if (assigned) return [...assigned];
+    if (assigned) return this.displayAuthors(assigned);
     if (!await this.repositoryExists()) return [];
-    return assignedOrHistoricalAuthors(registry, path, await this.history.fileAuthors(path));
+    return this.displayAuthors(assignedOrHistoricalAuthors(registry, path, await this.history.fileAuthors(path)));
   }
 
   private repositoryExists(): Promise<boolean> {

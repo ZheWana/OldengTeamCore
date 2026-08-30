@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.21 - 2026-08-30
+
+- Add a protected Git author display-name manager with case-insensitive local mappings, consistent author rendering across titles/history/statistics/status, and configuration-string import/export support. Mappings do not rewrite Git history or server accounts.
+- Rename the provider-specific S3 settings section to the provider-neutral `S3 对象存储`.
+
+## 0.1.20 - 2026-08-30
 
 - Show a completion modal after any successful synchronization when shared plugin files or enablement changed, reminding users to restart Obsidian. Desktop users can restart Obsidian directly from the modal.
+
+## 0.1.19 - 2026-08-30
+
 - Raise the minimum Obsidian version to 1.12.3 and download attachments larger than 8 MiB in 8 MiB ranged chunks with incremental SHA-256 verification and atomic temporary-file replacement, removing the temporary mobile 32 MB download restriction.
 
 ## 0.1.18 - 2026-08-30

@@ -10,6 +10,7 @@ import { requestConfirmation } from "./confirm";
 import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
 import { GitRepository } from "./git";
 import { FileAuthorService } from "./file-authors";
+import { AuthorDisplayService } from "./author-display";
 import { FILE_AUTHORS_PATH, PRIVATE_FOLDER } from "./constants";
 
 export default class TeamCorePlugin extends Plugin {
@@ -58,7 +59,8 @@ export default class TeamCorePlugin extends Plugin {
       leaf,
       () => this.teamCoreSettings,
       () => this.coordinator,
-      () => this.authorService
+      () => this.authorService,
+      () => this.authorDisplayService()
     ));
     this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.handleSyncAction() });
     this.addCommand({ id: "resolve-conflicts", name: "解决同步冲突", callback: () => void this.openConflictEditor() });
@@ -129,6 +131,14 @@ export default class TeamCorePlugin extends Plugin {
     this.coordinator?.start();
   }
 
+  refreshAuthorDisplays(): void {
+    void this.refreshNoteAuthors();
+    for (const leaf of this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)) {
+      const view = leaf.view;
+      if (view instanceof TeamCoreHistoryView) void view.render();
+    }
+  }
+
   private hideAssetsInFileExplorer(): void {
     const apply = (): void => {
       const titles = document.body?.findAll(".nav-files-container .nav-folder-title") ?? [];
@@ -162,7 +172,11 @@ export default class TeamCorePlugin extends Plugin {
     return new FileAuthorService(vault, repository, () => {
       this.coordinator.markManagedPathChanged(FILE_AUTHORS_PATH);
       void this.refreshNoteAuthors();
-    });
+    }, this.authorDisplayService());
+  }
+
+  private authorDisplayService(): AuthorDisplayService {
+    return new AuthorDisplayService(this.teamCoreSettings.authorDisplayMappings);
   }
 
   private async decorateNoteAuthors(view: MarkdownView): Promise<void> {
@@ -202,7 +216,7 @@ export default class TeamCorePlugin extends Plugin {
     }
     if (!this.statusBar) return;
     const state = { uninitialized: "未初始化", synced: "已同步", "local-changes": "有本地修改", syncing: "同步中", conflict: "有冲突", offline: "离线", error: "同步错误" }[snapshot.state];
-    const author = snapshot.currentAuthor ? ` · 作者：${snapshot.currentAuthor}` : "";
+    const author = snapshot.currentAuthor ? ` · 作者：${this.authorDisplayService().display(snapshot.currentAuthor)}` : "";
     const progress = snapshot.progress;
     const progressLabel = progress && progress.total > 0 ? `${progress.phase} ${progress.current}/${progress.total}` : progress?.phase;
     const progressText = progressLabel ? ` · ${progressLabel}` : "";

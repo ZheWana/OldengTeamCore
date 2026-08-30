@@ -28,6 +28,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
 - Lets the team choose trusted community plugin folders to share through a managed `.gitignore` whitelist. Obsidian remains responsible for installing and updating plugins.
 - Synchronizes the enabled state of whitelisted community plugins while preserving each member's personal plugin choices.
+- Maps Git author names to local display names without rewriting Git history.
 
 ## Requirements
 
@@ -62,9 +63,11 @@ Open **Settings → Oldeng Team Core** and configure:
 
 In **团队公共插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. The enabled state of selected plugins is stored in `.team/shared-plugins.json` and applied to each member's local `community-plugins.json`. Unselected plugins and their enabled states remain local and are never removed, disabled, or overwritten. `team-core` itself and the local `community-plugins.json` file are never committed.
 
+In **Git 作者显示**, choose **管理显示名称** and confirm access to add mappings from an original Git author name to a display name. Matching is case-insensitive. The mapping is applied consistently to note-title authors, commit history, document-author statistics, manual author assignments, and the status bar. It only affects local rendering and never changes a Git commit, repository account, or note content. It is included in the quick configuration export/import string so teammates can share the same display rules; the importing member's own Git username and automatic-sync choice remain local.
+
 When investigating a sync problem, run **导出诊断日志** from the command palette. It writes a JSON file under `私人笔记/`, which is excluded from synchronization and can be shared as a normal file. The export contains recent sync phases and attachment transfer metadata, keeps the latest 800 entries locally, and redacts credential-like fields. It does not include note contents or attachment bytes. **复制诊断信息** remains available as a clipboard fallback.
 
-The quick export string contains shared Git and S3 secrets. Treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import.
+The quick export string contains shared Git and S3 secrets, plus non-secret author display mappings. Treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import.
 
 ## Private notes
 

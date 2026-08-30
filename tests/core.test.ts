@@ -20,6 +20,7 @@ import git from "isomorphic-git";
 import { assignedOrHistoricalAuthors, clearFileAuthors, countResolvedDocumentAuthors, createEmptyFileAuthorRegistry, FileAuthorService, mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry, setFileAuthors, validateFileAuthorRegistry, writeFileAuthorRegistry } from "../src/file-authors";
 import { Buffer as BrowserBuffer } from "../src/browser-shims";
 import { PluginLogger, parseLogEntries } from "../src/logger";
+import { AuthorDisplayService, parseAuthorDisplayMappings, serializeAuthorDisplayMappings } from "../src/author-display";
 
 const execFileAsync = promisify(execFile);
 
@@ -227,6 +228,34 @@ describe("configuration bundles", () => {
     expect(importSettings(exportSettings(source), settings({ autoSync: false })).autoSync).toBe(false);
     expect(mergeSettings({ autoSync: false }).autoSync).toBe(false);
     expect(mergeSettings({}).autoSync).toBe(false);
+  });
+
+  it("imports Git author display mappings without replacing the local login identity", () => {
+    const source = settings({ gitUsername: "source-user", authorDisplayMappings: { xuchenrui: "许宸瑞" } });
+    const imported = importSettings(exportSettings(source), settings({ gitUsername: "local-user" }));
+    expect(imported.gitUsername).toBe("local-user");
+    expect(imported.authorDisplayMappings).toEqual({ xuchenrui: "许宸瑞" });
+  });
+
+  it("rejects a malformed Git author display mapping in a configuration bundle", () => {
+    const encoded = base64UrlEncode(JSON.stringify({ version: 1, settings: { authorDisplayMappings: "not-a-map" } }));
+    expect(() => importSettings(encoded, settings())).toThrow("映射无效");
+  });
+});
+
+describe("Git author display mappings", () => {
+  it("uses canonical case-insensitive mappings and preserves unmapped names", () => {
+    const mappings = parseAuthorDisplayMappings("xuchenrui = 许宸瑞\nWangZhe = 王哲");
+    expect(mappings).toEqual({ wangzhe: "王哲", xuchenrui: "许宸瑞" });
+    expect(serializeAuthorDisplayMappings(mappings)).toBe("wangzhe = 王哲\nxuchenrui = 许宸瑞");
+    const display = new AuthorDisplayService(mappings);
+    expect(display.display("XuChenRui")).toBe("许宸瑞");
+    expect(display.displayMany(["xuchenrui", "许宸瑞", "unknown"])).toEqual(["许宸瑞", "unknown"]);
+  });
+
+  it("rejects malformed and duplicate mapping rows", () => {
+    expect(() => parseAuthorDisplayMappings("xuchenrui 许宸瑞")).toThrow("第 1 行");
+    expect(() => parseAuthorDisplayMappings("xuchenrui = 许宸瑞\nXuChenRui = 许宸瑞")).toThrow("重复");
   });
 });
 

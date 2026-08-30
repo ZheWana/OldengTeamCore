@@ -8,6 +8,7 @@ import type { SyncCoordinator } from "./sync";
 import { listLocalCommunityPlugins, readSharedPluginIds } from "./shared-plugins";
 import { requestConfirmation } from "./confirm";
 import { createEmptyFileAuthorRegistry, listAuthorableMarkdownFiles, type FileAuthorRegistry, type FileAuthorService } from "./file-authors";
+import { AuthorDisplayService, parseAuthorDisplayMappings, type AuthorDisplayMappings } from "./author-display";
 
 export const HISTORY_VIEW_TYPE = "team-core-history";
 
@@ -18,7 +19,8 @@ export class TeamCoreHistoryView extends ItemView {
     leaf: WorkspaceLeaf,
     private readonly getSettings: () => TeamCoreSettings,
     private readonly getSync: () => SyncCoordinator,
-    private readonly getAuthorService: () => FileAuthorService
+    private readonly getAuthorService: () => FileAuthorService,
+    private readonly getAuthorDisplay: () => AuthorDisplayService
   ) {
     super(leaf);
   }
@@ -48,6 +50,7 @@ export class TeamCoreHistoryView extends ItemView {
     }
     const repo = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, consoleLogger(), this.app.vault.configDir);
     const authorService = this.getAuthorService();
+    const authorDisplay = this.getAuthorDisplay();
     let commits: CommitSummary[] = [];
     try { commits = await repo.log(undefined, 200); } catch (error) { container.createEl("p", { text: `历史暂不可用：${String(error)}` }); return; }
     let authorRegistry = createEmptyFileAuthorRegistry();
@@ -103,7 +106,7 @@ export class TeamCoreHistoryView extends ItemView {
         if (currentRequest !== requestId) return;
         results.empty();
         if (filepath) results.createEl("p", { text: filtered.length ? `${filepath} · ${filtered.length} 次提交` : `${filepath} · 暂无提交记录`, cls: "team-core-history-filter-result" });
-        this.renderCommitList(results, filtered);
+        this.renderCommitList(results, filtered, authorDisplay);
       } catch (error) {
         if (currentRequest !== requestId) return;
         results.empty();
@@ -113,7 +116,7 @@ export class TeamCoreHistoryView extends ItemView {
     searchButton.addEventListener("click", () => void renderResults());
     clearButton.addEventListener("click", () => { input.value = ""; void renderResults(); });
     input.addEventListener("keydown", (event) => { if (event.key === "Enter") void renderResults(); });
-    this.renderCommitList(results, commits);
+    this.renderCommitList(results, commits, authorDisplay);
   }
 
   private renderAuthorAssignments(container: HTMLElement, registry: FileAuthorRegistry, authorService: FileAuthorService): void {
@@ -244,7 +247,7 @@ export class TeamCoreHistoryView extends ItemView {
     }
   }
 
-  private renderCommitList(container: HTMLElement, commits: CommitSummary[]): void {
+  private renderCommitList(container: HTMLElement, commits: CommitSummary[], authorDisplay: AuthorDisplayService): void {
     if (!commits.length) {
       container.createEl("p", { text: "暂无提交历史", cls: "team-core-history-empty" });
       return;
@@ -260,7 +263,7 @@ export class TeamCoreHistoryView extends ItemView {
       const message = row.createEl("td", { cls: "team-core-commit-message" });
       message.createSpan({ text: commit.message || "无提交说明" });
       if (index === 0) message.createSpan({ text: "最新", cls: "team-core-commit-latest" });
-      row.createEl("td", { text: commit.author, cls: "team-core-commit-author" });
+      row.createEl("td", { text: authorDisplay.display(commit.author), cls: "team-core-commit-author" });
       row.createEl("td", { text: new Date(commit.timestamp).toLocaleString(), cls: "team-core-commit-date" });
       row.createEl("td", { text: commit.shortOid, cls: "team-core-commit-oid" });
       const type = row.createEl("td");
@@ -369,7 +372,7 @@ class FileAuthorManagerModal extends Modal {
         const detail = label.createDiv("team-core-file-author-detail");
         detail.createSpan({ text: file.path, cls: "team-core-file-author-path" });
         const assigned = this.registry.files[file.path];
-        detail.createSpan({ text: assigned ? assigned.join(", ") : "使用 Git 历史", cls: assigned ? "team-core-file-author-assigned" : "team-core-file-author-fallback" });
+        detail.createSpan({ text: assigned ? this.authorService.displayAuthors(assigned).join(", ") : "使用 Git 历史", cls: assigned ? "team-core-file-author-assigned" : "team-core-file-author-fallback" });
         checkbox.addEventListener("change", () => {
           if (checkbox.checked) this.selected.add(file.path);
           else this.selected.delete(file.path);
@@ -423,8 +426,11 @@ type TeamCorePluginHost = Plugin & {
   teamCoreSettings: TeamCoreSettings;
   coordinator: SyncCoordinator;
   saveSettings(): Promise<void>;
+  refreshAuthorDisplays(): void;
   confirmRemoteOverwrite(): Promise<void>;
 };
+
+type TextSettingKey = "gitUrl" | "gitUsername" | "gitPassword" | "s3Endpoint" | "s3Region" | "s3Bucket" | "s3Prefix" | "s3AccessKey" | "s3SecretKey";
 
 export class TeamCoreSettingTab extends PluginSettingTab {
   private readonly teamCorePlugin: TeamCorePluginHost;
@@ -443,7 +449,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
         this.textDefinition("个人 username", "gitUsername", false),
         this.textDefinition("团队密码", "gitPassword", true)
       ]),
-      this.group("七牛 S3", [
+      this.group("S3 对象存储", [
         this.textDefinition("Endpoint", "s3Endpoint", false),
         this.textDefinition("Region", "s3Region", false),
         this.textDefinition("Bucket / Space", "s3Bucket", false),
@@ -458,6 +464,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
         this.remoteOverwriteDefinition()
       ]),
       this.group("团队公共插件", [this.sharedPluginsDefinition()]),
+      this.group("Git 作者显示", [this.authorDisplayMappingsDefinition()]),
       this.group("快速导入 / 导出", [this.transferDefinition()])
     ];
   }
@@ -474,7 +481,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     this.addTextControl(new Setting(containerEl).setName("Git 远端 URL"), "gitUrl", false);
     this.addTextControl(new Setting(containerEl).setName("个人 username"), "gitUsername", false);
     this.addTextControl(new Setting(containerEl).setName("团队密码"), "gitPassword", true);
-    new Setting(containerEl).setName("七牛 S3").setHeading();
+    new Setting(containerEl).setName("S3 对象存储").setHeading();
     for (const [name, key, secret] of [["Endpoint", "s3Endpoint", false], ["Region", "s3Region", false], ["Bucket / Space", "s3Bucket", false], ["Prefix", "s3Prefix", false], ["Access Key", "s3AccessKey", true], ["Secret Key", "s3SecretKey", true]] as const) {
       this.addTextControl(new Setting(containerEl).setName(name), key, secret);
     }
@@ -485,6 +492,8 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     this.addRemoteOverwriteEntry(new Setting(containerEl).setName("重置本地并重新同步"));
     new Setting(containerEl).setName("团队公共插件").setHeading();
     this.addSharedPluginsEntry(new Setting(containerEl).setName("公共插件管理"));
+    new Setting(containerEl).setName("Git 作者显示").setHeading();
+    this.addAuthorDisplayMappingsEntry(new Setting(containerEl).setName("Git 作者显示名称"));
     new Setting(containerEl).setName("快速导入 / 导出").setHeading();
     this.addTransferControl(new Setting(containerEl).setName("配置字符串"));
   }
@@ -493,7 +502,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     return { type: "group", heading, cls: "team-core-settings", items };
   }
 
-  private textDefinition(name: string, key: keyof TeamCoreSettings, secret: boolean): SettingDefinition {
+  private textDefinition(name: string, key: TextSettingKey, secret: boolean): SettingDefinition {
     return { name, aliases: [String(key)], render: (setting) => this.addTextControl(setting, key, secret) };
   }
 
@@ -538,6 +547,15 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     };
   }
 
+  private authorDisplayMappingsDefinition(): SettingDefinition {
+    return {
+      name: "Git 作者显示名称",
+      desc: "将 Git 历史中的原始作者名映射为本地显示名称，不修改 Git 提交。",
+      aliases: ["作者映射", "用户名映射", "中文作者", "Git 作者"],
+      render: (setting) => this.addAuthorDisplayMappingsEntry(setting)
+    };
+  }
+
   private transferDefinition(): SettingDefinition {
     return {
       name: "配置字符串",
@@ -566,6 +584,34 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     });
     if (!confirmed) return;
     new SharedPluginsModal(this.app, (container) => this.renderSharedPlugins(container)).open();
+  }
+
+  private addAuthorDisplayMappingsEntry(setting: Setting): void {
+    setting.setDesc("仅修改本机的作者显示；导出的配置字符串可同步给团队成员，不会改写 Git 历史。");
+    setting.addButton((button) => {
+      button
+        .setIcon("languages")
+        .setTooltip("管理 Git 作者显示名称")
+        .onClick(() => void this.openAuthorDisplayMappingsManager());
+      button.buttonEl.appendText("管理显示名称");
+    });
+  }
+
+  private async openAuthorDisplayMappingsManager(): Promise<void> {
+    const confirmed = await requestConfirmation(this.app, {
+      title: "管理 Git 作者显示名称",
+      message: "这里的设置会改变本机笔记标题、提交历史和作者统计中的显示名称。它不会修改 Git 提交或服务器账户；通过配置字符串导入的成员会获得相同显示规则。",
+      confirmText: "进入管理",
+      destructive: true
+    });
+    if (!confirmed) return;
+    new AuthorDisplayMappingsModal(this.app, this.teamPlugin.teamCoreSettings.authorDisplayMappings, async (mappings) => {
+      this.teamPlugin.teamCoreSettings.authorDisplayMappings = mappings;
+      await this.teamPlugin.saveSettings();
+      this.teamPlugin.refreshAuthorDisplays();
+      this.refreshSettings();
+      new Notice("Git 作者显示名称已保存");
+    }).open();
   }
 
   private addTransferControl(transfer: Setting): void {
@@ -638,12 +684,12 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     }
   }
 
-  private addTextControl(setting: Setting, key: keyof TeamCoreSettings, secret: boolean): void {
+  private addTextControl(setting: Setting, key: TextSettingKey, secret: boolean): void {
     setting.addText((component) => {
-      component.setValue(String(this.teamPlugin.teamCoreSettings[key] ?? ""));
+      component.setValue(this.teamPlugin.teamCoreSettings[key]);
       component.inputEl.type = secret ? "password" : "text";
       component.onChange(async (value) => {
-        (this.teamPlugin.teamCoreSettings[key] as string) = value;
+        this.teamPlugin.teamCoreSettings[key] = value;
         await this.teamPlugin.saveSettings();
       });
     });
@@ -697,6 +743,95 @@ class SharedPluginsModal extends Modal {
     void this.renderPlugins(list);
     const footer = this.contentEl.createDiv("team-core-shared-plugins-footer");
     new ButtonComponent(footer).setButtonText("完成").setCta().onClick(() => this.close());
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class AuthorDisplayMappingsModal extends Modal {
+  constructor(
+    app: App,
+    private readonly mappings: AuthorDisplayMappings,
+    private readonly onSave: (mappings: AuthorDisplayMappings) => Promise<void>
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass("team-core-author-display-modal");
+    this.titleEl.setText("Git 作者显示名称");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: "为每个需要替换显示名称的 Git 作者添加一行映射。原始名称匹配不区分大小写。",
+      cls: "team-core-author-display-intro"
+    });
+    this.contentEl.createEl("p", {
+      text: "映射仅影响本机显示和配置字符串，不会改写任何 Git 提交、服务器账户或文件内容。",
+      cls: "team-core-author-display-note"
+    });
+    const table = this.contentEl.createDiv("team-core-author-display-table");
+    const header = table.createDiv("team-core-author-display-header");
+    header.createSpan({ text: "原始 Git 作者名称" });
+    header.createSpan({ text: "=" });
+    header.createSpan({ text: "显示名称" });
+    header.createSpan({ text: "操作" });
+    const rows = table.createDiv("team-core-author-display-rows");
+    const rowInputs: Array<{ source: HTMLInputElement; display: HTMLInputElement }> = [];
+    const addRow = (source = "", display = ""): void => {
+      const row = rows.createDiv("team-core-author-display-row");
+      const sourceInput = row.createEl("input", { type: "text", placeholder: "团队成员账号" });
+      sourceInput.value = source;
+      sourceInput.setAttr("aria-label", "原始 Git 作者名称");
+      sourceInput.setAttr("spellcheck", "false");
+      row.createSpan({ text: "=", cls: "team-core-author-display-equals" });
+      const displayInput = row.createEl("input", { type: "text", placeholder: "显示名称" });
+      displayInput.value = display;
+      displayInput.setAttr("aria-label", "显示名称");
+      const remove = new ButtonComponent(row)
+        .setIcon("trash-2")
+        .setTooltip("删除此映射")
+        .onClick(() => {
+          const index = rowInputs.findIndex((inputs) => inputs.source === sourceInput);
+          if (index >= 0) rowInputs.splice(index, 1);
+          row.remove();
+        });
+      remove.buttonEl.addClass("team-core-author-display-remove");
+      rowInputs.push({ source: sourceInput, display: displayInput });
+    };
+    for (const [source, display] of Object.entries(this.mappings)) addRow(source, display);
+    new ButtonComponent(this.contentEl.createDiv("team-core-author-display-add"))
+      .setIcon("plus")
+      .setButtonText("新增映射")
+      .onClick(() => {
+        addRow();
+        rowInputs[rowInputs.length - 1]?.source.focus();
+      });
+    const error = this.contentEl.createEl("p", { cls: "team-core-author-display-error" });
+    const actions = this.contentEl.createDiv("team-core-author-display-actions");
+    const cancel = new ButtonComponent(actions).setButtonText("取消").onClick(() => this.close());
+    const save = new ButtonComponent(actions).setButtonText("保存显示名称").setCta().onClick(async () => {
+      let mappings: AuthorDisplayMappings;
+      try {
+        mappings = parseAuthorDisplayMappings(rowInputs.map(({ source, display }) => `${source.value}=${display.value}`).join("\n"));
+        error.empty();
+      } catch (cause) {
+        error.setText(cause instanceof Error ? cause.message : String(cause));
+        rowInputs.find(({ source, display }) => !source.value.trim() || !display.value.trim())?.source.focus();
+        return;
+      }
+      cancel.setDisabled(true);
+      save.setDisabled(true);
+      try {
+        await this.onSave(mappings);
+        this.close();
+      } catch (cause) {
+        error.setText(`保存失败：${cause instanceof Error ? cause.message : String(cause)}`);
+        cancel.setDisabled(false);
+        save.setDisabled(false);
+      }
+    });
   }
 
   onClose(): void {
