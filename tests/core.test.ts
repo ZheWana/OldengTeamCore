@@ -11,7 +11,7 @@ import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3Transport } from "../src/s3";
-import { planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { MOBILE_ATTACHMENT_DOWNLOAD_LIMIT, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldDeferLargeMobileAttachment, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -705,6 +705,11 @@ describe("S3 transport", () => {
 });
 
 describe("remote attachment materialization", () => {
+  it("defers oversized mobile attachments before allocating an HTTP response", () => {
+    expect(shouldDeferLargeMobileAttachment(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT, true)).toBe(false);
+    expect(shouldDeferLargeMobileAttachment(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT + 1, true)).toBe(true);
+    expect(shouldDeferLargeMobileAttachment(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT + 1, false)).toBe(false);
+  });
   const entry = {
     sha256: "a".repeat(64),
     size: 10,

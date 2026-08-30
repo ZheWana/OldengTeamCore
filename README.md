@@ -21,6 +21,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Hides the `assets/` folder from Obsidian's file explorer and search while keeping attachment synchronization unchanged.
 - Renames managed attachments to `assets/tc-sha256-<sha256>.<extension>` and updates Markdown and Wiki links.
 - Shows phase and numeric progress during synchronization.
+- On mobile, defers remote attachments larger than 32 MB before starting the HTTP download to avoid platform-level memory termination; these files should be synchronized once on desktop first.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
 - Provides explicit initialization, remote import, attachment normalization, diagnostics export, and an in-app conflict editor.
 - Provides a destructive **重置本地并重新同步** command that leaves remote Git and S3 unchanged, clears local shared content, and downloads the complete remote Vault again without publishing local deletions.

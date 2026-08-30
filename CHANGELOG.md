@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.18 - 2026-08-30
+
+- Guard the mobile large-attachment crash path: remote objects over 32 MB are deferred before `requestUrl()` allocation, while normal attachments retain full SHA-256 verification and detailed transfer-stage logging.
+
 ## 0.1.17 - 2026-08-30
 
 - Export diagnostic logs as a JSON file in the local-only `私人笔记/` folder instead of requiring the full report to fit in the clipboard.

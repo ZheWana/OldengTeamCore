@@ -1,7 +1,7 @@
 {
   "id": "team-core",
   "name": "Oldeng Team Core",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "minAppVersion": "1.8.7",
   "description": "Synchronize shared Markdown knowledge bases with Git history and S3 attachments.",
   "author": "ZheWana",

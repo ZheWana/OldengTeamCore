@@ -1,4 +1,4 @@
-import { FileSystemAdapter, TFile, TFolder, type App, type Editor } from "obsidian";
+import { FileSystemAdapter, Platform, TFile, TFolder, type App, type Editor } from "obsidian";
 import { MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
 import { sha256Hex } from "./crypto";
 import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
@@ -10,6 +10,11 @@ import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentRe
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
+export const MOBILE_ATTACHMENT_DOWNLOAD_LIMIT = 32 * 1024 * 1024;
+
+export function shouldDeferLargeMobileAttachment(size: number, isMobile: boolean): boolean {
+  return isMobile && size > MOBILE_ATTACHMENT_DOWNLOAD_LIMIT;
+}
 
 export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
@@ -1375,27 +1380,39 @@ export class SyncCoordinator {
     const vault = this.createVault();
     const s3 = new S3Transport(this.settings(), this.logger);
     const username = this.settings().gitUsername.trim() || "unknown";
+    const deferred: string[] = [];
     this.startProgress("下载远端附件", entries.length);
     for (const [path, entry] of entries) {
-      const localStat = await vault.stat(path);
-      const localHashNameMatches = hashFromAssetPath(path) === entry.sha256 && localStat?.type === "file" && localStat.size === entry.size;
-      const local = localHashNameMatches ? undefined : localStat?.type === "file" ? await vault.read(path) : undefined;
-      const matches = localHashNameMatches || Boolean(local && await sha256Hex(local) === entry.sha256);
-      if (matches) {
-        this.advanceProgress(path);
-        continue;
-      }
-      if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, username)) {
-        this.logger.warn("Local attachment differs from same-user manifest entry", { path });
-        this.advanceProgress(path);
-        continue;
-      }
       try {
+        const localStat = await vault.stat(path);
+        const localHashNameMatches = hashFromAssetPath(path) === entry.sha256 && localStat?.type === "file" && localStat.size === entry.size;
+        if (!localHashNameMatches && shouldDeferLargeMobileAttachment(entry.size, Platform.isMobile)) {
+          this.logger.warn("Large mobile attachment deferred", { path, hash: entry.sha256, size: entry.size, limit: MOBILE_ATTACHMENT_DOWNLOAD_LIMIT });
+          deferred.push(path);
+          this.advanceProgress(path);
+          continue;
+        }
+        let matches = localHashNameMatches;
+        if (!matches && localStat?.type === "file") {
+          const local = await vault.read(path);
+          matches = await sha256Hex(local) === entry.sha256;
+        }
+        if (matches) {
+          this.advanceProgress(path);
+          continue;
+        }
+        if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, username)) {
+          this.logger.warn("Local attachment differs from same-user manifest entry", { path });
+          this.advanceProgress(path);
+          continue;
+        }
         const downloadStartedAt = Date.now();
         this.logger.debug("Attachment download started", { path, hash: entry.sha256, expectedSize: entry.size });
         const data = await s3.download(entry.sha256);
         if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
+        this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
         await vault.write(path, data);
+        this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
         this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
       } catch (error) {
         if (error instanceof S3NotFoundError) {
@@ -1407,7 +1424,9 @@ export class SyncCoordinator {
         throw error;
       }
       this.advanceProgress(path);
+      if (Platform.isMobile) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
     }
+    if (deferred.length) throw new Error(`移动端暂不下载超过 ${Math.round(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT / (1024 * 1024))} MB 的附件：${deferred.join(", ")}。请使用桌面端同步后再在手机端继续。`);
   }
 
   private mime(path: string): string {

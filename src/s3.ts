@@ -99,8 +99,11 @@ export class S3Transport {
     const response = await this.request("GET", key);
     if (response.status === 404) throw new S3NotFoundError(key);
     if (response.status < 200 || response.status >= 300) throw await this.httpError("GET", key, response);
+    this.logger.debug("S3 response received", { method: "GET", key, status: response.status, size: response.arrayBuffer.byteLength });
+    this.logger.debug("S3 download hash verification started", { key, size: response.arrayBuffer.byteLength });
     const actual = await sha256Hex(response.arrayBuffer);
     if (actual !== hash.toLowerCase()) throw new S3PermanentError(`S3 hash verification failed for ${key}`);
+    this.logger.debug("S3 download hash verification completed", { key, size: response.arrayBuffer.byteLength });
     return response.arrayBuffer;
   }
 
