@@ -1,7 +1,8 @@
 import { ButtonComponent, MarkdownView, Modal, Notice, Platform, Plugin, TFile, TFolder, type App } from "obsidian";
 import { DEFAULT_SETTINGS, type SyncSnapshot, type TeamCoreSettings } from "./types";
 import { mergeSettings } from "./config";
-import { PluginLogger } from "./logger";
+import { DiagnosticsModal } from "./diagnostics-ui";
+import { parseLogEntries, PluginLogger, type LogEntry } from "./logger";
 import { SyncCoordinator } from "./sync";
 import { HISTORY_VIEW_TYPE, TeamCoreHistoryView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
@@ -24,10 +25,21 @@ export default class TeamCorePlugin extends Plugin {
   private openingConflictEditor = false;
   private authorService!: FileAuthorService;
   private lastAuthorRefreshAt: number | undefined;
+  private diagnosticWrite: Promise<void> = Promise.resolve();
 
   async onload(): Promise<void> {
-    this.teamCoreSettings = mergeSettings(await this.loadData());
-    this.logger = new PluginLogger(() => false);
+    const storedData: unknown = await this.loadData() as unknown;
+    this.teamCoreSettings = mergeSettings(storedData);
+    const storedLogs = storedData && typeof storedData === "object" && !Array.isArray(storedData)
+      ? (storedData as { diagnosticLogs?: unknown }).diagnosticLogs
+      : undefined;
+    this.logger = new PluginLogger(() => false, parseLogEntries(storedLogs), (entries) => this.persistDiagnosticLogs(entries));
+    this.registerDomEvent(window, "error", (event) => {
+      this.logger.error("未捕获运行时错误", { message: event.message, source: event.filename, line: event.lineno, column: event.colno });
+    });
+    this.registerDomEvent(window, "unhandledrejection", (event) => {
+      this.logger.error("未处理的 Promise 异常", { reason: event.reason instanceof Error ? event.reason : String(event.reason) });
+    });
     this.statusBar = this.addStatusBarItem();
     this.statusBar.addClass("team-core-status");
     this.statusBar.addEventListener("click", () => void this.handleSyncAction());
@@ -55,6 +67,7 @@ export default class TeamCorePlugin extends Plugin {
     this.addCommand({ id: "overwrite-from-remote", name: "重置本地并重新同步", callback: () => void this.confirmRemoteOverwrite() });
     this.addCommand({ id: "clear-remote-test-data", name: "测试：清空远端 Git 与 S3", callback: () => this.confirmClearRemote() });
     this.addCommand({ id: "copy-diagnostics", name: "复制诊断信息", callback: () => void this.copyDiagnostics() });
+    this.addCommand({ id: "export-diagnostics-log", name: "导出诊断日志", callback: () => void this.copyDiagnostics() });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof TFile)) return;
       if (file.path === FILE_AUTHORS_PATH) this.invalidateFileAuthors();
@@ -97,6 +110,7 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   onunload(): void {
+    this.logger?.flush();
     this.conflictEditor?.close();
     this.conflictEditor = undefined;
     this.mobileSyncProgress?.close();
@@ -105,7 +119,9 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.teamCoreSettings);
+    const stored: unknown = await this.loadData() as unknown;
+    const base = stored && typeof stored === "object" && !Array.isArray(stored) ? stored as Record<string, unknown> : {};
+    await this.saveData({ ...base, ...this.teamCoreSettings });
     this.authorService = this.createFileAuthorService();
     void this.refreshNoteAuthors();
     this.coordinator?.start();
@@ -361,9 +377,32 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   private async copyDiagnostics(): Promise<void> {
-    const diagnostics = JSON.stringify({ state: this.latestSnapshot.state, progress: this.latestSnapshot.progress, pendingFiles: this.latestSnapshot.pendingFiles, pendingAssets: this.latestSnapshot.pendingAssets, lastSyncAt: this.latestSnapshot.lastSyncAt, lastError: this.latestSnapshot.lastError, pluginVersion: this.manifest.version }, null, 2);
-    await navigator.clipboard.writeText(diagnostics);
-    new Notice("已复制脱敏诊断信息");
+    const diagnostics = this.logger.exportText({
+      pluginVersion: this.manifest.version,
+      state: this.latestSnapshot.state,
+      progress: this.latestSnapshot.progress,
+      pendingFiles: this.latestSnapshot.pendingFiles,
+      pendingAssets: this.latestSnapshot.pendingAssets,
+      lastSyncAt: this.latestSnapshot.lastSyncAt,
+      lastError: this.latestSnapshot.lastError
+    });
+    try {
+      await navigator.clipboard.writeText(diagnostics);
+      new Notice("已复制脱敏诊断日志");
+    } catch (error) {
+      this.logger.warn("无法写入系统剪贴板，打开诊断日志窗口", { error: String(error) });
+      new DiagnosticsModal(this.app, diagnostics).open();
+    }
+  }
+
+  private persistDiagnosticLogs(entries: readonly LogEntry[]): void {
+    this.diagnosticWrite = this.diagnosticWrite.then(async () => {
+      const stored: unknown = await this.loadData() as unknown;
+      const base = stored && typeof stored === "object" && !Array.isArray(stored) ? stored as Record<string, unknown> : {};
+      await this.saveData({ ...base, diagnosticLogs: entries });
+    }).catch((error: unknown) => {
+      console.warn("[Oldeng Team Core] 无法持久化诊断日志", error);
+    });
   }
 }
 

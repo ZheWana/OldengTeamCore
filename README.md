@@ -22,7 +22,7 @@ Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown �
 - Renames managed attachments to `assets/tc-sha256-<sha256>.<extension>` and updates Markdown and Wiki links.
 - Shows phase and numeric progress during synchronization.
 - Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
-- Provides explicit initialization, remote import, attachment normalization, diagnostics, and an in-app conflict editor.
+- Provides explicit initialization, remote import, attachment normalization, diagnostics export, and an in-app conflict editor.
 - Provides a destructive **重置本地并重新同步** command that leaves remote Git and S3 unchanged, clears local shared content, and downloads the complete remote Vault again without publishing local deletions.
 - Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
 - Lets the team choose trusted community plugin folders to share through a managed `.gitignore` whitelist. Obsidian remains responsible for installing and updating plugins.
@@ -60,6 +60,8 @@ Open **Settings → Oldeng Team Core** and configure:
 - save debounce and automatic synchronization intervals.
 
 In **团队公共插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. The enabled state of selected plugins is stored in `.team/shared-plugins.json` and applied to each member's local `community-plugins.json`. Unselected plugins and their enabled states remain local and are never removed, disabled, or overwritten. `team-core` itself and the local `community-plugins.json` file are never committed.
+
+When investigating a sync problem, run **导出诊断日志** (or **复制诊断信息**) from the command palette. The export contains recent sync phases and attachment transfer metadata, keeps the latest 800 entries locally, and redacts credential-like fields. It does not include note contents or attachment bytes.
 
 The quick export string contains shared Git and S3 secrets. Treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import.
 

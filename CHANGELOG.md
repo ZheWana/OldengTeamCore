@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.16 - 2026-08-30
+
+- Add persistent, redacted diagnostic logging with attachment read/upload/download timing, uncaught-error capture, and a mobile-friendly export window.
+
 ## 0.1.15 - 2026-08-30
 
 - Include the mobile synchronization progress modal in the published plugin build.

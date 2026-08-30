@@ -1,6 +1,9 @@
 .team-core-status { cursor: pointer; display: inline-flex; align-items: center; gap: .35em; }
 .team-core-status-text { white-space: nowrap; }
 .team-core-status-progress { width: 4.5em; height: .7em; accent-color: var(--interactive-accent); }
+.team-core-diagnostics-modal { width: min(94vw, 54rem); }
+.team-core-diagnostics-text { box-sizing: border-box; width: 100%; min-height: min(62vh, 32rem); resize: vertical; font-family: var(--font-monospace); font-size: var(--font-ui-smaller); line-height: 1.45; }
+.team-core-diagnostics-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: .7rem; }
 .team-core-mobile-sync-modal { width: min(92vw, 26rem); }
 .team-core-mobile-sync-summary { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: .8rem; }
 .team-core-mobile-sync-summary strong { min-width: 0; overflow-wrap: anywhere; }

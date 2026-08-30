@@ -919,6 +919,7 @@ export class SyncCoordinator {
           || entry.size !== file.stat.size;
       }))
       : discovered;
+    this.logger.debug("Attachment candidates selected", { count: candidates.size, fullScan: forceFullScan, pendingAssets: pendingAssets.size, pendingNotes: pendingNotes.size });
     if (!candidates.size) {
       const manifestMissing = !(await vault.exists(MANIFEST_PATH));
       if (next !== manifest || manifestMissing) await writeManifest(vault, next);
@@ -946,9 +947,12 @@ export class SyncCoordinator {
       let size = current?.size;
       let data: ArrayBuffer | undefined;
       if (!hash || size === undefined) {
+        const readStartedAt = Date.now();
+        this.logger.debug("Attachment read started", { path: normalizedSource, expectedSize: size });
         data = await vault.read(normalizedSource);
         hash = await sha256Hex(data);
         size = data.byteLength;
+        this.logger.debug("Attachment read completed", { path: normalizedSource, size, durationMs: Date.now() - readStartedAt, hash });
       }
       const targetPath = assetPathForHash(hash, file.extension);
       const objectId = `${hash}:${size}`;
@@ -963,9 +967,15 @@ export class SyncCoordinator {
       const s3 = new S3Transport(this.settings(), this.logger);
       this.startProgress("上传新附件", uploads.length);
       for (const plan of uploads) {
+        const uploadStartedAt = Date.now();
+        this.logger.debug("Attachment upload started", { path: plan.sourcePath, hash: plan.hash, size: plan.size, mime: plan.mime });
         const data = plan.data ?? await vault.read(plan.sourcePath);
-        if (data.byteLength !== plan.size || await sha256Hex(data) !== plan.hash) throw new Error(`附件在同步时发生变化：${plan.sourcePath}`);
+        if (data.byteLength !== plan.size || await sha256Hex(data) !== plan.hash) {
+          this.logger.error("Attachment changed before upload", { path: plan.sourcePath, expectedSize: plan.size, actualSize: data.byteLength, hash: plan.hash });
+          throw new Error(`附件在同步时发生变化：${plan.sourcePath}`);
+        }
         await s3.ensureUploaded(plan.hash, data, plan.mime);
+        this.logger.debug("Attachment upload completed", { path: plan.sourcePath, hash: plan.hash, size: plan.size, durationMs: Date.now() - uploadStartedAt });
         this.advanceProgress(plan.sourcePath);
       }
     }
@@ -1381,14 +1391,19 @@ export class SyncCoordinator {
         continue;
       }
       try {
+        const downloadStartedAt = Date.now();
+        this.logger.debug("Attachment download started", { path, hash: entry.sha256, expectedSize: entry.size });
         const data = await s3.download(entry.sha256);
         if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
         await vault.write(path, data);
+        this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
       } catch (error) {
         if (error instanceof S3NotFoundError) {
+          this.logger.warn("Remote attachment object is missing", { path, hash: entry.sha256 });
           this.advanceProgress(path);
           continue;
         }
+        this.logger.error("Attachment download failed", { path, hash: entry.sha256, error: String(error) });
         throw error;
       }
       this.advanceProgress(path);
@@ -1406,6 +1421,7 @@ export class SyncCoordinator {
   }
 
   private startProgress(phase: string, total: number): void {
+    this.logger.debug("Sync phase started", { phase, total });
     this.progress = { phase, current: 0, total, item: undefined };
     this.callbacks.onSnapshot(this.snapshot());
   }
@@ -1428,6 +1444,7 @@ export class SyncCoordinator {
       current: Math.min(this.progress.current + 1, this.progress.total),
       item
     };
+    this.logger.debug("Sync progress advanced", { phase: this.progress.phase, current: this.progress.current, total: this.progress.total, item });
     this.callbacks.onSnapshot(this.snapshot());
   }
 

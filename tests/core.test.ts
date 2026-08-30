@@ -19,6 +19,7 @@ import type { BinaryVault } from "../src/vault";
 import git from "isomorphic-git";
 import { assignedOrHistoricalAuthors, clearFileAuthors, countResolvedDocumentAuthors, createEmptyFileAuthorRegistry, FileAuthorService, mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry, setFileAuthors, validateFileAuthorRegistry, writeFileAuthorRegistry } from "../src/file-authors";
 import { Buffer as BrowserBuffer } from "../src/browser-shims";
+import { PluginLogger, parseLogEntries } from "../src/logger";
 
 const execFileAsync = promisify(execFile);
 
@@ -81,6 +82,23 @@ describe("browser runtime shims", () => {
   it("provides the Buffer operations required by isomorphic-git", () => {
     expect(BrowserBuffer.from("mobile import").toString("base64")).toBe("bW9iaWxlIGltcG9ydA==");
     expect(BrowserBuffer.concat([BrowserBuffer.from([1]), BrowserBuffer.from([2])])).toEqual(BrowserBuffer.from([1, 2]));
+  });
+});
+
+describe("diagnostic logging", () => {
+  it("keeps operational details while redacting secrets", () => {
+    const logger = new PluginLogger(() => false);
+    logger.warn("Attachment upload failed", { path: "assets/tc-sha256-image.png", password: "do-not-export", error: "HTTP 413" });
+    const exported = JSON.parse(logger.exportText({ gitUrl: "https://git.example.test/team.git" })) as { entries: Array<{ details: { path: string; password: string; error: string } }> };
+    expect(exported.entries[0].details).toEqual({ path: "assets/tc-sha256-image.png", password: "[redacted]", error: "HTTP 413" });
+  });
+
+  it("loads only valid persisted entries", () => {
+    expect(parseLogEntries([
+      { timestamp: "2026-08-30T00:00:00.000Z", level: "debug", message: "ok" },
+      { timestamp: "bad", level: "unknown", message: "ignored" },
+      null
+    ])).toHaveLength(1);
   });
 });
 
