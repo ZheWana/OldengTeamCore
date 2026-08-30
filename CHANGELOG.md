@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13 - 2026-08-30
+
+- Fix mobile vault import failing with `Buffer is not defined` by bundling and injecting the browser-compatible Buffer implementation required by `isomorphic-git`.
+
 ## 0.1.12 - 2026-08-30
 
 - Centralize file-author resolution in `FileAuthorService`, including manual assignments, complete Git-history fallback, caching, batch progress, and document-level counting.

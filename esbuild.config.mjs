@@ -11,6 +11,7 @@ await esbuild.build({
   format: "cjs",
   platform: "browser",
   target: "es2018",
+  inject: ["./src/browser-shims.ts"],
   sourcemap: production ? false : "inline",
   treeShaking: true,
   minify: production,

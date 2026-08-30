@@ -18,6 +18,7 @@ import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/typ
 import type { BinaryVault } from "../src/vault";
 import git from "isomorphic-git";
 import { assignedOrHistoricalAuthors, clearFileAuthors, countResolvedDocumentAuthors, createEmptyFileAuthorRegistry, FileAuthorService, mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry, setFileAuthors, validateFileAuthorRegistry, writeFileAuthorRegistry } from "../src/file-authors";
+import { Buffer as BrowserBuffer } from "../src/browser-shims";
 
 const execFileAsync = promisify(execFile);
 
@@ -75,6 +76,13 @@ class NodeVault implements BinaryVault {
 
 const encode = (value: string): ArrayBuffer => new TextEncoder().encode(value).buffer;
 const decode = (value: ArrayBuffer): string => new TextDecoder().decode(value);
+
+describe("browser runtime shims", () => {
+  it("provides the Buffer operations required by isomorphic-git", () => {
+    expect(BrowserBuffer.from("mobile import").toString("base64")).toBe("bW9iaWxlIGltcG9ydA==");
+    expect(BrowserBuffer.concat([BrowserBuffer.from([1]), BrowserBuffer.from([2])])).toEqual(BrowserBuffer.from([1, 2]));
+  });
+});
 
 async function applyFiles(vault: NodeVault, changes: Record<string, string | null>): Promise<void> {
   for (const [path, content] of Object.entries(changes)) {
