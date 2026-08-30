@@ -1,4 +1,4 @@
-import { ButtonComponent, MarkdownView, Modal, Notice, Plugin, TFile, TFolder, type App } from "obsidian";
+import { ButtonComponent, MarkdownView, Modal, Notice, Platform, Plugin, TFile, TFolder, type App } from "obsidian";
 import { DEFAULT_SETTINGS, type SyncSnapshot, type TeamCoreSettings } from "./types";
 import { mergeSettings } from "./config";
 import { PluginLogger } from "./logger";
@@ -20,6 +20,7 @@ export default class TeamCorePlugin extends Plugin {
   private latestSnapshot: SyncSnapshot = { state: "uninitialized", pendingFiles: [] };
   private logger!: PluginLogger;
   private conflictEditor: ConflictEditorModal | undefined;
+  private mobileSyncProgress: MobileSyncProgressModal | undefined;
   private openingConflictEditor = false;
   private authorService!: FileAuthorService;
   private lastAuthorRefreshAt: number | undefined;
@@ -98,6 +99,8 @@ export default class TeamCorePlugin extends Plugin {
   onunload(): void {
     this.conflictEditor?.close();
     this.conflictEditor = undefined;
+    this.mobileSyncProgress?.close();
+    this.mobileSyncProgress = undefined;
     this.coordinator?.stop();
   }
 
@@ -173,6 +176,7 @@ export default class TeamCorePlugin extends Plugin {
 
   private updateSnapshot(snapshot: SyncSnapshot): void {
     this.latestSnapshot = snapshot;
+    this.updateMobileSyncProgress(snapshot);
     if (snapshot.state === "synced" && snapshot.lastSyncAt !== undefined && snapshot.lastSyncAt !== this.lastAuthorRefreshAt) {
       this.lastAuthorRefreshAt = snapshot.lastSyncAt;
       this.authorService.invalidate();
@@ -197,6 +201,25 @@ export default class TeamCorePlugin extends Plugin {
     const actionLabel = snapshot.state === "conflict" ? "点击解决同步冲突" : "点击立即同步";
     this.statusBar.setAttr("aria-label", progressLabel ? `${actionLabel}，${progressLabel}` : actionLabel);
     this.statusBar.setAttr("title", progress?.item ? `${progressLabel ?? progress.phase}：${progress.item}` : actionLabel);
+  }
+
+  private updateMobileSyncProgress(snapshot: SyncSnapshot): void {
+    if (!Platform.isMobile) return;
+    if (snapshot.state === "syncing") {
+      if (!this.mobileSyncProgress) {
+        this.mobileSyncProgress = new MobileSyncProgressModal(this.app, snapshot, () => {
+          this.mobileSyncProgress = undefined;
+        });
+        this.mobileSyncProgress.open();
+      } else {
+        this.mobileSyncProgress.setSnapshot(snapshot);
+      }
+      return;
+    }
+    if (this.mobileSyncProgress) {
+      this.mobileSyncProgress.close();
+      this.mobileSyncProgress = undefined;
+    }
   }
 
   private async handleSyncAction(): Promise<void> {
@@ -377,6 +400,55 @@ class ClearRemoteConfirmationModal extends Modal {
         }
       });
     confirm.buttonEl.addClass("team-core-destructive-button");
+  }
+}
+
+class MobileSyncProgressModal extends Modal {
+  private snapshot: SyncSnapshot;
+  private readonly onClosed: () => void;
+
+  constructor(hostApp: App, snapshot: SyncSnapshot, onClosed: () => void) {
+    super(hostApp);
+    this.snapshot = snapshot;
+    this.onClosed = onClosed;
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass("team-core-mobile-sync-modal");
+    this.render();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    this.onClosed();
+  }
+
+  setSnapshot(snapshot: SyncSnapshot): void {
+    this.snapshot = snapshot;
+    if (this.contentEl) this.render();
+  }
+
+  private render(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("同步进度");
+    const progress = this.snapshot.progress;
+    const summary = this.contentEl.createDiv("team-core-mobile-sync-summary");
+    summary.createEl("strong", { text: progress?.phase ?? "同步中" });
+    if (progress && progress.total > 0) {
+      summary.createSpan({ text: `${progress.current}/${progress.total}` });
+      const progressBar = this.contentEl.createEl("progress", { cls: "team-core-mobile-sync-progress" });
+      progressBar.max = progress.total;
+      progressBar.value = progress.current;
+      progressBar.setAttr("aria-label", `${progress.phase} ${progress.current}/${progress.total}`);
+    } else {
+      const progressBar = this.contentEl.createEl("progress", { cls: "team-core-mobile-sync-progress" });
+      progressBar.removeAttribute("value");
+      progressBar.setAttr("aria-label", progress?.phase ?? "同步中");
+    }
+    this.contentEl.createEl("p", {
+      cls: "team-core-mobile-sync-item",
+      text: progress?.item ?? "正在准备同步，请稍候……"
+    });
   }
 }
 

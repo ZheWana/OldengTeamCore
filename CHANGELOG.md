@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.15 - 2026-08-30
+
+- Include the mobile synchronization progress modal in the published plugin build.
+
 ## 0.1.14 - 2026-08-30
 
 - Show a mobile-friendly synchronization progress modal with phase, `current/total`, current item, and a progress bar when the mobile status bar is unavailable.

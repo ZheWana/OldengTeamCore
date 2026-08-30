@@ -1,6 +1,6 @@
 {
   "name": "team-core",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Cross-platform Oldeng Team Core collaboration plugin for Obsidian",
   "main": "main.js",
   "type": "module",
