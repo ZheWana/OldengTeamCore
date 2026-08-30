@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.17 - 2026-08-30
+
+- Export diagnostic logs as a JSON file in the local-only `私人笔记/` folder instead of requiring the full report to fit in the clipboard.
+
 ## 0.1.16 - 2026-08-30
 
 - Add persistent, redacted diagnostic logging with attachment read/upload/download timing, uncaught-error capture, and a mobile-friendly export window.

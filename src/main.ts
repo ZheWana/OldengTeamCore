@@ -10,7 +10,7 @@ import { requestConfirmation } from "./confirm";
 import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
 import { GitRepository } from "./git";
 import { FileAuthorService } from "./file-authors";
-import { FILE_AUTHORS_PATH } from "./constants";
+import { FILE_AUTHORS_PATH, PRIVATE_FOLDER } from "./constants";
 
 export default class TeamCorePlugin extends Plugin {
   teamCoreSettings: TeamCoreSettings = { ...DEFAULT_SETTINGS };
@@ -67,7 +67,7 @@ export default class TeamCorePlugin extends Plugin {
     this.addCommand({ id: "overwrite-from-remote", name: "重置本地并重新同步", callback: () => void this.confirmRemoteOverwrite() });
     this.addCommand({ id: "clear-remote-test-data", name: "测试：清空远端 Git 与 S3", callback: () => this.confirmClearRemote() });
     this.addCommand({ id: "copy-diagnostics", name: "复制诊断信息", callback: () => void this.copyDiagnostics() });
-    this.addCommand({ id: "export-diagnostics-log", name: "导出诊断日志", callback: () => void this.copyDiagnostics() });
+    this.addCommand({ id: "export-diagnostics-log", name: "导出诊断日志", callback: () => void this.exportDiagnosticsFile() });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof TFile)) return;
       if (file.path === FILE_AUTHORS_PATH) this.invalidateFileAuthors();
@@ -392,6 +392,28 @@ export default class TeamCorePlugin extends Plugin {
     } catch (error) {
       this.logger.warn("无法写入系统剪贴板，打开诊断日志窗口", { error: String(error) });
       new DiagnosticsModal(this.app, diagnostics).open();
+    }
+  }
+
+  private async exportDiagnosticsFile(): Promise<void> {
+    const diagnostics = this.logger.exportText({
+      pluginVersion: this.manifest.version,
+      state: this.latestSnapshot.state,
+      progress: this.latestSnapshot.progress,
+      pendingFiles: this.latestSnapshot.pendingFiles,
+      pendingAssets: this.latestSnapshot.pendingAssets,
+      lastSyncAt: this.latestSnapshot.lastSyncAt,
+      lastError: this.latestSnapshot.lastError
+    });
+    const filename = `team-core-diagnostics-${new Date().toISOString().replace(/[.:]/g, "-")}.json`;
+    const path = `${PRIVATE_FOLDER}/${filename}`;
+    try {
+      if (!this.app.vault.getAbstractFileByPath(PRIVATE_FOLDER)) await this.app.vault.createFolder(PRIVATE_FOLDER);
+      await this.app.vault.create(path, diagnostics);
+      new Notice(`诊断日志已保存：${path}`, 10_000);
+    } catch (error) {
+      this.logger.error("无法保存诊断日志文件", { path, error: String(error) });
+      new Notice(`诊断日志保存失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
     }
   }
 

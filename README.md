@@ -61,7 +61,7 @@ Open **Settings → Oldeng Team Core** and configure:
 
 In **团队公共插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. The enabled state of selected plugins is stored in `.team/shared-plugins.json` and applied to each member's local `community-plugins.json`. Unselected plugins and their enabled states remain local and are never removed, disabled, or overwritten. `team-core` itself and the local `community-plugins.json` file are never committed.
 
-When investigating a sync problem, run **导出诊断日志** (or **复制诊断信息**) from the command palette. The export contains recent sync phases and attachment transfer metadata, keeps the latest 800 entries locally, and redacts credential-like fields. It does not include note contents or attachment bytes.
+When investigating a sync problem, run **导出诊断日志** from the command palette. It writes a JSON file under `私人笔记/`, which is excluded from synchronization and can be shared as a normal file. The export contains recent sync phases and attachment transfer metadata, keeps the latest 800 entries locally, and redacts credential-like fields. It does not include note contents or attachment bytes. **复制诊断信息** remains available as a clipboard fallback.
 
 The quick export string contains shared Git and S3 secrets. Treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import.
 
