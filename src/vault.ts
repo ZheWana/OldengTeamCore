@@ -5,6 +5,7 @@ import type { ReferenceInfo } from "./types";
 export interface BinaryVault {
   read(path: string): Promise<ArrayBuffer>;
   write(path: string, data: ArrayBuffer): Promise<void>;
+  append(path: string, data: ArrayBuffer): Promise<void>;
   exists(path: string): Promise<boolean>;
   stat(path: string): Promise<{ type: "file" | "folder"; size: number; mtime: number } | null>;
   list(path: string): Promise<{ files: string[]; folders: string[] }>;
@@ -215,6 +216,11 @@ export function createVaultAdapter(adapter: DataAdapter): BinaryVault {
       const normalized = normalizeVaultPath(path);
       await ensureParent(normalized);
       await adapter.writeBinary(normalized, data);
+    },
+    append: async (path, data) => {
+      const normalized = normalizeVaultPath(path);
+      await ensureParent(normalized);
+      await adapter.appendBinary(normalized, data);
     },
     exists: (path) => adapter.exists(normalizeVaultPath(path)),
     stat: async (path) => {

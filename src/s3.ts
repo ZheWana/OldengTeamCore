@@ -1,4 +1,5 @@
 import { requestUrl, type RequestUrlParam } from "obsidian";
+import { createSHA256 } from "hash-wasm";
 import { hmacSha256, sha256Hex, bytesToHex } from "./crypto";
 import type { Logger, TeamCoreSettings } from "./types";
 
@@ -20,6 +21,13 @@ interface S3Response {
   status: number;
   headers: Record<string, string>;
   arrayBuffer: ArrayBuffer;
+}
+
+export const S3_DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
+export const S3_CHUNKED_DOWNLOAD_THRESHOLD = S3_DOWNLOAD_CHUNK_SIZE;
+
+export interface ChunkDownloadTarget {
+  (chunk: ArrayBuffer, offset: number, total: number): Promise<void>;
 }
 
 const encodePath = (value: string): string => value.split("/").map((part) => encodeURIComponent(part).replace(/%2F/gi, "/")).join("/");
@@ -107,6 +115,36 @@ export class S3Transport {
     return response.arrayBuffer;
   }
 
+  async downloadInChunks(hash: string, expectedSize: number, onChunk: ChunkDownloadTarget, chunkSize = S3_DOWNLOAD_CHUNK_SIZE): Promise<void> {
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new S3PermanentError("Invalid expected attachment size");
+    if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) throw new S3PermanentError("Invalid attachment chunk size");
+    const key = this.objectKey(hash);
+    const remote = await this.head(hash);
+    if (remote.size !== expectedSize) throw new S3PermanentError(`S3 object size mismatch for ${key}`);
+    const hasher = await createSHA256();
+    hasher.init();
+    let offset = 0;
+    while (offset < expectedSize) {
+      const end = Math.min(offset + chunkSize, expectedSize) - 1;
+      const response = await this.request("GET", key, undefined, undefined, {}, { range: `bytes=${offset}-${end}` });
+      if (response.status === 404) throw new S3NotFoundError(key);
+      if (response.status < 200 || response.status >= 300) throw await this.httpError("GET", key, response);
+      if (response.status !== 206) throw new S3PermanentError(`S3 range request was not honored for ${key}`);
+      const expectedChunkSize = end - offset + 1;
+      const contentRange = response.headers["content-range"] ?? "";
+      const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
+      if (!range || Number(range[1]) !== offset || Number(range[2]) !== end || Number(range[3]) !== expectedSize || response.arrayBuffer.byteLength !== expectedChunkSize) {
+        throw new S3PermanentError(`S3 range response was invalid for ${key}`);
+      }
+      hasher.update(new Uint8Array(response.arrayBuffer));
+      await onChunk(response.arrayBuffer, offset, expectedSize);
+      this.logger.debug("S3 download chunk completed", { key, offset, size: expectedChunkSize, total: expectedSize });
+      offset = end + 1;
+    }
+    const actual = hasher.digest();
+    if (actual !== hash.toLowerCase()) throw new S3PermanentError(`S3 hash verification failed for ${key}`);
+  }
+
   async listManagedObjects(): Promise<string[]> {
     const keys: string[] = [];
     const seenTokens = new Set<string>();
@@ -144,7 +182,7 @@ export class S3Transport {
     }
   }
 
-  private async request(method: string, key: string, body?: ArrayBuffer, contentType?: string, query: Record<string, string> = {}): Promise<S3Response> {
+  private async request(method: string, key: string, body?: ArrayBuffer, contentType?: string, query: Record<string, string> = {}, extraHeaders: Record<string, string> = {}): Promise<S3Response> {
     if (!this.enabled()) throw new Error("S3 settings are incomplete");
     const canonicalQuery = Object.entries(query)
       .map(([name, value]) => [encodeQuery(name), encodeQuery(value)] as const)
@@ -162,6 +200,7 @@ export class S3Transport {
       "x-amz-date": stamp.long
     };
     if (contentType) headers["content-type"] = contentType;
+    for (const [name, value] of Object.entries(extraHeaders)) headers[name.toLowerCase()] = value;
     const signedHeaderNames = Object.keys(headers).sort();
     const canonicalHeaders = signedHeaderNames.map((name) => `${name}:${headers[name].trim()}\n`).join("");
     const canonicalRequest = [method, parsed.pathname, canonicalQuery, canonicalHeaders, signedHeaderNames.join(";"), payloadHash].join("\n");

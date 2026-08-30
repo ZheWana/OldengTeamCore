@@ -10,8 +10,8 @@ import { exportSettings, importSettings, mergeSettings } from "../src/config";
 import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
-import { S3Transport } from "../src/s3";
-import { MOBILE_ATTACHMENT_DOWNLOAD_LIMIT, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldDeferLargeMobileAttachment, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
+import { planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -50,6 +50,10 @@ class NodeVault implements BinaryVault {
   async write(path: string, data: ArrayBuffer): Promise<void> {
     await mkdir(dirname(this.resolve(path)), { recursive: true });
     await writeFile(this.resolve(path), new Uint8Array(data));
+  }
+  async append(path: string, data: ArrayBuffer): Promise<void> {
+    await mkdir(dirname(this.resolve(path)), { recursive: true });
+    await writeFile(this.resolve(path), new Uint8Array(data), { flag: "a" });
   }
   async exists(path: string): Promise<boolean> {
     try { await stat(this.resolve(path)); return true; } catch { return false; }
@@ -689,6 +693,46 @@ describe("manifest and vault path rules", () => {
 });
 
 describe("S3 transport", () => {
+  it("downloads ranged chunks with incremental verification", async () => {
+    const data = new TextEncoder().encode("0123456789abcdefghijklmnopqrstuv");
+    const hash = await sha256Hex(data);
+    const ranges: string[] = [];
+    const server = createServer((request, response) => {
+      if (request.method === "HEAD") {
+        response.writeHead(200, { "content-length": String(data.byteLength) });
+        response.end();
+        return;
+      }
+      const range = /^bytes=(\d+)-(\d+)$/.exec(request.headers.range ?? "");
+      if (!range) { response.writeHead(416); response.end(); return; }
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      ranges.push(`${start}-${end}`);
+      response.writeHead(206, {
+        "content-length": String(end - start + 1),
+        "content-range": `bytes ${start}-${end}/${data.byteLength}`
+      });
+      response.end(data.subarray(start, end + 1));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve S3 test server port");
+    try {
+      const chunks: Uint8Array[] = [];
+      const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
+      await transport.downloadInChunks(hash, data.byteLength, async (chunk) => { chunks.push(new Uint8Array(chunk)); }, 8);
+      expect(ranges).toEqual(["0-7", "8-15", "16-23", "24-31"]);
+      expect(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))).toEqual(Buffer.from(data));
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("keeps the production chunk size at 8 MiB", () => {
+    expect(S3_DOWNLOAD_CHUNK_SIZE).toBe(8 * 1024 * 1024);
+    expect(S3_CHUNKED_DOWNLOAD_THRESHOLD).toBe(S3_DOWNLOAD_CHUNK_SIZE);
+  });
+
   it("uses immutable content-addressed object keys", () => {
     const transport = new S3Transport(settings(), { debug() {}, warn() {}, error() {} });
     expect(transport.enabled()).toBe(true);
@@ -705,11 +749,6 @@ describe("S3 transport", () => {
 });
 
 describe("remote attachment materialization", () => {
-  it("defers oversized mobile attachments before allocating an HTTP response", () => {
-    expect(shouldDeferLargeMobileAttachment(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT, true)).toBe(false);
-    expect(shouldDeferLargeMobileAttachment(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT + 1, true)).toBe(true);
-    expect(shouldDeferLargeMobileAttachment(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT + 1, false)).toBe(false);
-  });
   const entry = {
     sha256: "a".repeat(64),
     size: 10,

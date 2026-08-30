@@ -4,18 +4,12 @@ import { sha256Hex } from "./crypto";
 import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
 import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
-import { S3NotFoundError, S3Transport } from "./s3";
+import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError, S3Transport } from "./s3";
 import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
-export const MOBILE_ATTACHMENT_DOWNLOAD_LIMIT = 32 * 1024 * 1024;
-
-export function shouldDeferLargeMobileAttachment(size: number, isMobile: boolean): boolean {
-  return isMobile && size > MOBILE_ATTACHMENT_DOWNLOAD_LIMIT;
-}
-
 export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
   onNotice(message: string): void;
@@ -1380,20 +1374,13 @@ export class SyncCoordinator {
     const vault = this.createVault();
     const s3 = new S3Transport(this.settings(), this.logger);
     const username = this.settings().gitUsername.trim() || "unknown";
-    const deferred: string[] = [];
     this.startProgress("下载远端附件", entries.length);
     for (const [path, entry] of entries) {
       try {
         const localStat = await vault.stat(path);
         const localHashNameMatches = hashFromAssetPath(path) === entry.sha256 && localStat?.type === "file" && localStat.size === entry.size;
-        if (!localHashNameMatches && shouldDeferLargeMobileAttachment(entry.size, Platform.isMobile)) {
-          this.logger.warn("Large mobile attachment deferred", { path, hash: entry.sha256, size: entry.size, limit: MOBILE_ATTACHMENT_DOWNLOAD_LIMIT });
-          deferred.push(path);
-          this.advanceProgress(path);
-          continue;
-        }
         let matches = localHashNameMatches;
-        if (!matches && localStat?.type === "file") {
+        if (!matches && localStat?.type === "file" && entry.size <= S3_CHUNKED_DOWNLOAD_THRESHOLD) {
           const local = await vault.read(path);
           matches = await sha256Hex(local) === entry.sha256;
         }
@@ -1408,12 +1395,28 @@ export class SyncCoordinator {
         }
         const downloadStartedAt = Date.now();
         this.logger.debug("Attachment download started", { path, hash: entry.sha256, expectedSize: entry.size });
-        const data = await s3.download(entry.sha256);
-        if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
-        this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
-        await vault.write(path, data);
-        this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
-        this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
+        if (entry.size > S3_CHUNKED_DOWNLOAD_THRESHOLD) {
+          const temporaryPath = `${this.app.vault.configDir}/plugins/team-core/.downloads/${entry.sha256}.part`;
+          if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
+          this.internalAssetWrites.add(path);
+          try {
+            await s3.downloadInChunks(entry.sha256, entry.size, (chunk) => vault.append(temporaryPath, chunk));
+            this.logger.debug("Attachment Vault write started", { path, size: entry.size });
+            await vault.rename(temporaryPath, path);
+          } finally {
+            this.internalAssetWrites.delete(path);
+            if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
+          }
+          this.logger.debug("Attachment Vault write completed", { path, size: entry.size, durationMs: Date.now() - downloadStartedAt });
+          this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: entry.size, durationMs: Date.now() - downloadStartedAt });
+        } else {
+          const data = await s3.download(entry.sha256);
+          if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
+          this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
+          await vault.write(path, data);
+          this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
+          this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
+        }
       } catch (error) {
         if (error instanceof S3NotFoundError) {
           this.logger.warn("Remote attachment object is missing", { path, hash: entry.sha256 });
@@ -1426,7 +1429,6 @@ export class SyncCoordinator {
       this.advanceProgress(path);
       if (Platform.isMobile) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
     }
-    if (deferred.length) throw new Error(`移动端暂不下载超过 ${Math.round(MOBILE_ATTACHMENT_DOWNLOAD_LIMIT / (1024 * 1024))} MB 的附件：${deferred.join(", ")}。请使用桌面端同步后再在手机端继续。`);
   }
 
   private mime(path: string): string {

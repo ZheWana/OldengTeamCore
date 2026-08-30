@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Raise the minimum Obsidian version to 1.12.3 and download attachments larger than 8 MiB in 8 MiB ranged chunks with incremental SHA-256 verification and atomic temporary-file replacement, removing the temporary mobile 32 MB download restriction.
+
 ## 0.1.18 - 2026-08-30
 
 - Guard the mobile large-attachment crash path: remote objects over 32 MB are deferred before `requestUrl()` allocation, while normal attachments retain full SHA-256 verification and detailed transfer-stage logging.
