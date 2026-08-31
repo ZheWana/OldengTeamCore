@@ -345,6 +345,28 @@ describe("file author assignments", () => {
     }
   });
 
+  it("uses one full-history index for chart authors while preserving manual assignments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-author-index-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.write(".team/file-authors.json", encode(JSON.stringify({ version: 1, files: { "notes/manual.md": ["Manual Author"] } })));
+      let indexCalls = 0;
+      const service = new FileAuthorService(vault, {
+        exists: async () => true,
+        fileAuthors: async () => { throw new Error("per-file lookup should not run"); },
+        fileAuthorsIndex: async () => {
+          indexCalls += 1;
+          return new Map([["notes/history.md", ["Git Author", "Coauthor"]]]);
+        }
+      });
+      const counts = await service.getDocumentAuthorCounts(["notes/manual.md", "notes/history.md"]);
+      expect(Object.fromEntries(counts)).toEqual({ "Manual Author": 1, "Git Author": 1, Coauthor: 1 });
+      expect(indexCalls).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reuses an existing hidden team directory when saving assignments", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-file-authors-"));
     try {
@@ -904,6 +926,13 @@ describe("Git repository adapter", () => {
       const first = await repo.commit("Initial vault");
       expect(first).toMatch(/^[0-9a-f]{40}$/);
       expect(await repo.hasUncommittedChanges()).toBe(false);
+
+      // Older clients could leave a private path with a missing blob in the
+      // Git index. It must not make an otherwise valid sync fail.
+      await execFileAsync("git", ["-C", root, "update-index", "--add", "--cacheinfo", `100644,${"a".repeat(40)},私人笔记/旧索引.md`]);
+      await expect(repo.hasUncommittedChanges()).resolves.toBe(false);
+      await expect(repo.log("私人笔记/旧索引.md")).resolves.toEqual([]);
+      await expect(repo.fileAuthors("私人笔记/旧索引.md")).resolves.toEqual([]);
       expect(await repo.commit("Private note must stay local")).toBeUndefined();
 
       await vault.write("notes/readme.md", new TextEncoder().encode("second\n").buffer);
@@ -921,6 +950,8 @@ describe("Git repository adapter", () => {
       const secondAuthor = new GitRepository(vault, settings({ gitUsername: "Bob.Example" }), logger, ".obsidian");
       await secondAuthor.commit("Second author update");
       expect(await secondAuthor.fileAuthors("notes/readme.md")).toEqual(["Alice.Example", "Bob.Example"]);
+      expect((await secondAuthor.fileAuthorsIndex()).get("notes/readme.md")).toEqual(["Bob.Example", "Alice.Example"]);
+      expect((await secondAuthor.fileAuthorsIndex()).has("私人笔记/秘密.md")).toBe(false);
       expect(await secondAuthor.fileAuthors("notes/missing.md")).toEqual([]);
       expect(await secondAuthor.logSince(Date.now() - 60_000)).toHaveLength(3);
     } finally {

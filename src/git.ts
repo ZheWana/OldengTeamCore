@@ -1,8 +1,8 @@
-import git, { type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
+import git, { TREE, walk, type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
 import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
 import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./types";
-import { isManagedPath, normalizeVaultPath, type BinaryVault } from "./vault";
+import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
 import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
 import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
@@ -10,6 +10,7 @@ import { mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthor
 
 const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
 const LINEBREAKS = /^.*(\r?\n|$)/gm;
+const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 interface GitConflictState {
   version: 1;
@@ -663,10 +664,20 @@ export class GitRepository {
 
   async stageManagedChanges(excludedPaths: readonly string[] | (() => readonly string[]) = []): Promise<string[]> {
     const sharedPluginIds = await this.currentSharedPluginIds();
+    await this.unstageLocalPrivateFiles();
+    const trackedPrivatePaths = await this.trackedPrivatePaths();
     const currentExcluded = (): Set<string> => new Set(
       (typeof excludedPaths === "function" ? excludedPaths() : excludedPaths).map(normalizeVaultPath)
     );
-    const matrix = await git.statusMatrix({ fs: this.fs, dir: "", filepaths: undefined });
+    const matrix = await git.statusMatrix({
+      fs: this.fs,
+      dir: "",
+      filepaths: undefined,
+      // Filter before isomorphic-git resolves staged blobs. A private path
+      // from an older, interrupted client can point at a pruned blob; it is
+      // outside Team Core's boundary and must never block public syncing.
+      filter: (filepath) => !isPrivatePath(filepath) || trackedPrivatePaths.has(normalizeVaultPath(filepath))
+    });
     const changed: string[] = [];
     for (const [filepath, head, workdir, stage] of matrix as Array<[string, number, number, number]>) {
       if (currentExcluded().has(normalizeVaultPath(filepath))) {
@@ -833,6 +844,10 @@ export class GitRepository {
   }
 
   async log(filepath?: string, depth?: number, since?: number): Promise<CommitSummary[]> {
+    // Private notes are intentionally outside Git. The active editor can be
+    // private immediately after a successful sync, so never ask
+    // isomorphic-git to traverse history for one.
+    if (filepath && isPrivatePath(filepath)) return [];
     const entries = await git.log({
       fs: this.fs,
       dir: "",
@@ -855,6 +870,7 @@ export class GitRepository {
   }
 
   async fileAuthors(filepath: string): Promise<string[]> {
+    if (isPrivatePath(filepath)) return [];
     const entries = await git.log({ fs: this.fs, dir: "", filepath }).catch((error: unknown) => {
       if (error && typeof error === "object" && "code" in error && error.code === "NotFoundError") return [];
       throw error;
@@ -867,11 +883,70 @@ export class GitRepository {
     return [...authors];
   }
 
+  async fileAuthorsIndex(onProgress?: (current: number, total: number) => void): Promise<Map<string, string[]>> {
+    const commits = await git.log({ fs: this.fs, dir: "" });
+    const authorsByPath = new Map<string, Set<string>>();
+    const cache = {};
+    const configDirectory = normalizeVaultPath(this.configDir);
+    for (const [index, entry] of commits.entries()) {
+      const author = entry.commit.author.name.trim();
+      if (author) {
+        const parent = entry.commit.parent[0] ?? EMPTY_TREE_OID;
+        const changed = await walk({
+          fs: this.fs,
+          dir: "",
+          trees: [TREE({ ref: entry.oid }), TREE({ ref: parent })],
+          cache,
+          map: async (filepath, [current, previous]) => {
+            const entry = current ?? previous;
+            if (!entry) return undefined;
+            if (await entry.type() === "tree") {
+              return filepath === "assets" || filepath === configDirectory || filepath === "私人笔记" || filepath === ".trash" ? null : undefined;
+            }
+            if (!filepath.endsWith(".md") || filepath.startsWith(".team/")) return undefined;
+            const currentOid = current ? await current.oid() : undefined;
+            const previousOid = previous ? await previous.oid() : undefined;
+            return currentOid === previousOid ? undefined : filepath;
+          }
+        }) as string[];
+        for (const path of changed) {
+          const authors = authorsByPath.get(path) ?? new Set<string>();
+          authors.add(author);
+          authorsByPath.set(path, authors);
+        }
+      }
+      onProgress?.(index + 1, commits.length);
+    }
+    return new Map([...authorsByPath.entries()].map(([path, authors]) => [path, [...authors]]));
+  }
+
   async hasUncommittedChanges(): Promise<boolean> {
     const sharedPluginIds = await this.currentSharedPluginIds();
-    return (await git.statusMatrix({ fs: this.fs, dir: "" })).some(([filepath, head, workdir, stage]) => {
+    const trackedPrivatePaths = await this.trackedPrivatePaths();
+    return (await git.statusMatrix({
+      fs: this.fs,
+      dir: "",
+      filter: (filepath) => !isPrivatePath(filepath) || trackedPrivatePaths.has(normalizeVaultPath(filepath))
+    })).some(([filepath, head, workdir, stage]) => {
       if (isManagedPath(filepath, this.configDir, sharedPluginIds)) return head !== workdir || workdir !== stage;
       return head !== 0 || stage !== 0;
     });
+  }
+
+  private async trackedPrivatePaths(): Promise<Set<string>> {
+    const files = await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]);
+    return new Set(files.filter(isPrivatePath).map(normalizeVaultPath));
+  }
+
+  private async unstageLocalPrivateFiles(): Promise<void> {
+    const paths: string[] = [];
+    const walk = async (folder: string): Promise<void> => {
+      const entries = await this.vault.list(folder).catch(() => undefined);
+      if (!entries) return;
+      paths.push(...entries.files.map(normalizeVaultPath));
+      await Promise.all(entries.folders.map((path) => walk(normalizeVaultPath(path))));
+    };
+    await walk("私人笔记");
+    await Promise.all(paths.map((filepath) => git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined)));
   }
 }

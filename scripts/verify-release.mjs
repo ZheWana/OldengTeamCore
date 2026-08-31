@@ -19,4 +19,10 @@ for (const name of ["main.js", "manifest.json", "styles.css"]) {
   if (!info.isFile() || info.size === 0) throw new Error(`Missing release file: dist/${name}`);
 }
 
+if (expectedTag) {
+  const notesPath = `.github/release-notes/${expectedTag}.md`;
+  const notes = await readFile(notesPath, "utf8").catch(() => "");
+  if (!notes.trim()) throw new Error(`Missing release notes: ${notesPath}`);
+}
+
 console.log(`Release ${manifest.version} is internally consistent`);

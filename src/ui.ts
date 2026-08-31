@@ -10,24 +10,24 @@ import { requestConfirmation } from "./confirm";
 import { createEmptyFileAuthorRegistry, listAuthorableMarkdownFiles, type FileAuthorRegistry, type FileAuthorService } from "./file-authors";
 import { AuthorDisplayService, parseAuthorDisplayMappings, type AuthorDisplayMappings } from "./author-display";
 
-export const HISTORY_VIEW_TYPE = "team-core-history";
+export const DASHBOARD_VIEW_TYPE = "team-core-history";
+export const COMMIT_HISTORY_VIEW_TYPE = "team-core-commit-history";
 
-export class TeamCoreHistoryView extends ItemView {
+export class TeamCoreDashboardView extends ItemView {
   private renderRevision = 0;
 
   constructor(
     leaf: WorkspaceLeaf,
     private readonly getSettings: () => TeamCoreSettings,
-    private readonly getSync: () => SyncCoordinator,
     private readonly getAuthorService: () => FileAuthorService,
     private readonly getAuthorDisplay: () => AuthorDisplayService
   ) {
     super(leaf);
   }
 
-  getViewType(): string { return HISTORY_VIEW_TYPE; }
-  getDisplayText(): string { return "团队知识库历史"; }
-  getIcon(): string { return "git-commit-horizontal"; }
+  getViewType(): string { return DASHBOARD_VIEW_TYPE; }
+  getDisplayText(): string { return "团队看板"; }
+  getIcon(): string { return "layout-dashboard"; }
 
   async onOpen(): Promise<void> { await this.render(); }
 
@@ -37,10 +37,10 @@ export class TeamCoreHistoryView extends ItemView {
     viewport.empty();
     viewport.addClass("team-core-history-view");
     const container = viewport.createDiv("team-core-history-content");
-    container.createEl("h2", { text: "知识库历史" });
+    container.createEl("h2", { text: "团队看板" });
     const toolbar = container.createDiv("team-core-toolbar");
-    const syncButton = toolbar.createEl("button", { text: "立即同步" });
-    syncButton.addEventListener("click", () => void this.getSync().runManual().then(() => this.render()));
+    const historyButton = toolbar.createEl("button", { text: "提交历史" });
+    historyButton.addEventListener("click", () => void this.openCommitHistory());
     const auditButton = toolbar.createEl("button", { text: "附件审计" });
     auditButton.addEventListener("click", () => void this.renderAudit(container));
     const settings = this.getSettings();
@@ -50,9 +50,6 @@ export class TeamCoreHistoryView extends ItemView {
     }
     const repo = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, consoleLogger(), this.app.vault.configDir);
     const authorService = this.getAuthorService();
-    const authorDisplay = this.getAuthorDisplay();
-    let commits: CommitSummary[] = [];
-    try { commits = await repo.log(undefined, 200); } catch (error) { container.createEl("p", { text: `历史暂不可用：${String(error)}` }); return; }
     let authorRegistry = createEmptyFileAuthorRegistry();
     try {
       authorRegistry = await authorService.getRegistry();
@@ -60,63 +57,91 @@ export class TeamCoreHistoryView extends ItemView {
       container.createEl("p", { text: `文件作者归属表不可用：${error instanceof Error ? error.message : String(error)}`, cls: "team-core-history-error" });
     }
     const markdownFiles = listAuthorableMarkdownFiles(this.app.vault);
-    const counts = this.counts(commits);
     const summary = container.createDiv("team-core-summary-grid");
-    for (const [label, value] of [["近一周", counts.week], ["近一月", counts.month], ["近一年", counts.year]]) {
+    const summaryValues: HTMLElement[] = [];
+    for (const label of ["近一周", "近一月", "近一年"]) {
       const card = summary.createDiv("team-core-stat");
-      card.createEl("strong", { text: String(value) });
-      card.createSpan({ text: String(label) });
+      summaryValues.push(card.createEl("strong", { text: "…" }));
+      card.createSpan({ text: label });
     }
-    void this.renderContributionWall(container, repo, commits, renderRevision);
+    void this.renderContributionWall(container, repo, renderRevision, summaryValues);
     this.renderAuthorAssignments(container, authorRegistry, authorService);
     const authorSection = container.createDiv("team-core-section");
     authorSection.createEl("h3", { text: "文档作者分布" });
     void this.renderDocumentAuthorChart(authorSection, authorService, markdownFiles, renderRevision);
-    const timeline = container.createDiv("team-core-section");
-    const timelineHeader = timeline.createDiv("team-core-history-list-header");
-    timelineHeader.createEl("h3", { text: "提交历史" });
-    const filter = timeline.createDiv("team-core-history-filter");
-    const input = filter.createEl("input", { type: "search", placeholder: "按文件路径筛选，例如 notes/readme.md" });
-    input.setAttr("list", "team-core-history-file-list");
-    const datalist = filter.createEl("datalist", { attr: { id: "team-core-history-file-list" } });
-    for (const file of markdownFiles) datalist.createEl("option", { attr: { value: file.path } });
-    const searchButton = filter.createEl("button", { attr: { "aria-label": "搜索文件提交历史", title: "搜索文件提交历史" } });
-    setIcon(searchButton, "search");
-    const clearButton = filter.createEl("button", { attr: { "aria-label": "清除文件筛选", title: "清除文件筛选" } });
-    setIcon(clearButton, "x");
-    const results = timeline.createDiv("team-core-history-results");
-    let requestId = 0;
-    const renderResults = async (): Promise<void> => {
-      const query = input.value.trim();
-      const currentRequest = ++requestId;
-      results.empty();
-      results.createEl("p", { text: query ? "正在查询提交历史…" : "正在加载提交历史…", cls: "team-core-history-loading" });
-      try {
-        let filepath = query;
-        if (query && !query.includes("/")) {
-          const normalized = query.toLocaleLowerCase();
-          const matches = markdownFiles.filter((file) => file.basename.toLocaleLowerCase() === normalized || file.name.toLocaleLowerCase() === normalized);
-          if (matches.length > 1) throw new Error(`存在 ${matches.length} 个同名文件，请从候选项中选择完整路径`);
-          if (matches.length === 1) {
-            filepath = matches[0].path;
-            input.value = filepath;
+    this.renderWeeklyUpdates(container, markdownFiles);
+  }
+
+  private async openCommitHistory(): Promise<void> {
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: COMMIT_HISTORY_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
+  }
+
+  private renderWeeklyUpdates(container: HTMLElement, files: readonly TFile[]): void {
+    const section = container.createDiv("team-core-section team-core-weekly-updates");
+    const header = section.createDiv("team-core-history-list-header");
+    header.createEl("h3", { text: "本周最新更新" });
+    const headerActions = header.createDiv("team-core-weekly-header-actions");
+    const refresh = headerActions.createEl("button", { cls: "team-core-weekly-refresh", attr: { "aria-label": "刷新本周更新", title: "刷新本周更新" } });
+    setIcon(refresh, "refresh-cw");
+    refresh.addEventListener("click", () => void this.render());
+    const weekStart = Date.now() - 6 * 86_400_000;
+    const updated = [...files]
+      .filter((file) => file.stat.mtime >= weekStart || file.basename.includes("置顶-"))
+      .sort((left, right) => {
+        const leftPinned = left.basename.includes("置顶-");
+        const rightPinned = right.basename.includes("置顶-");
+        return Number(rightPinned) - Number(leftPinned) || right.stat.mtime - left.stat.mtime || left.path.localeCompare(right.path);
+      });
+    headerActions.createSpan({ text: updated.length ? `${updated.length} 篇` : "本周暂无更新", cls: "team-core-weekly-count" });
+    if (!updated.length) { section.createEl("p", { text: "本周还没有公共笔记更新。", cls: "team-core-history-empty" }); return; }
+    const pageSize = 10;
+    let page = 0;
+    const viewport = section.closest(".team-core-history-view");
+    const renderPage = (): void => {
+      const scrollTop = viewport?.scrollTop ?? 0;
+      const pageCount = Math.ceil(updated.length / pageSize);
+      const pageItems = updated.slice(page * pageSize, (page + 1) * pageSize);
+      section.querySelectorAll(".team-core-weekly-table-wrap, .team-core-pagination").forEach((element) => element.remove());
+      const wrapper = section.createDiv("team-core-weekly-table-wrap");
+      const table = wrapper.createEl("table", { cls: "team-core-weekly-table" });
+      const head = table.createEl("thead").createEl("tr");
+      for (const label of ["文章", "目录", "最近保存"]) head.createEl("th", { text: label });
+      const body = table.createEl("tbody");
+      for (const update of pageItems) {
+        const row = body.createEl("tr", { attr: { title: update.path, tabindex: "0" } });
+        row.addEventListener("click", () => void this.app.workspace.openLinkText(update.path, "", true));
+        row.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            void this.app.workspace.openLinkText(update.path, "", true);
           }
-        }
-        const filtered = filepath ? await repo.log(filepath, 200) : commits;
-        if (currentRequest !== requestId) return;
-        results.empty();
-        if (filepath) results.createEl("p", { text: filtered.length ? `${filepath} · ${filtered.length} 次提交` : `${filepath} · 暂无提交记录`, cls: "team-core-history-filter-result" });
-        this.renderCommitList(results, filtered, authorDisplay);
-      } catch (error) {
-        if (currentRequest !== requestId) return;
-        results.empty();
-        results.createEl("p", { text: `查询失败：${error instanceof Error ? error.message : String(error)}`, cls: "team-core-history-error" });
+        });
+        const title = row.createEl("td", { cls: "team-core-weekly-title" });
+        title.createSpan({ text: update.basename });
+        if (update.basename.includes("置顶-")) title.createSpan({ text: "置顶", cls: "team-core-weekly-pinned" });
+        row.createEl("td", { text: update.parent?.path || "根目录", cls: "team-core-weekly-path" });
+        row.createEl("td", { text: new Date(update.stat.mtime).toLocaleString(), cls: "team-core-weekly-date" });
       }
+      if (pageCount <= 1) return;
+      const pagination = section.createDiv("team-core-pagination");
+      const firstButton = pagination.createEl("button", { attr: { "aria-label": "跳转到首页", title: "跳转到首页" } });
+      setIcon(firstButton, "chevrons-left");
+      firstButton.disabled = page === 0;
+      firstButton.addEventListener("click", () => { page = 0; renderPage(); });
+      const previousButton = pagination.createEl("button", { attr: { "aria-label": "上一页", title: "上一页" } });
+      setIcon(previousButton, "chevron-left");
+      previousButton.disabled = page === 0;
+      previousButton.addEventListener("click", () => { page -= 1; renderPage(); });
+      pagination.createSpan({ text: `${page + 1} / ${pageCount}`, cls: "team-core-pagination-label" });
+      const nextButton = pagination.createEl("button", { attr: { "aria-label": "下一页", title: "下一页" } });
+      setIcon(nextButton, "chevron-right");
+      nextButton.disabled = page >= pageCount - 1;
+      nextButton.addEventListener("click", () => { page += 1; renderPage(); });
+      if (viewport) window.requestAnimationFrame(() => { viewport.scrollTop = scrollTop; });
     };
-    searchButton.addEventListener("click", () => void renderResults());
-    clearButton.addEventListener("click", () => { input.value = ""; void renderResults(); });
-    input.addEventListener("keydown", (event) => { if (event.key === "Enter") void renderResults(); });
-    this.renderCommitList(results, commits, authorDisplay);
+    renderPage();
   }
 
   private renderAuthorAssignments(container: HTMLElement, registry: FileAuthorRegistry, authorService: FileAuthorService): void {
@@ -143,9 +168,9 @@ export class TeamCoreHistoryView extends ItemView {
       cls: "team-core-history-loading"
     });
     try {
-      const authors = await authorService.getDocumentAuthorCounts(files.map((file) => file.path), ({ current, total }) => {
+      const authors = await authorService.getDocumentAuthorCounts(files.map((file) => file.path), ({ current, total, path }) => {
         if (this.renderRevision === renderRevision && (current === total || current % 10 === 0)) {
-          loading.setText(`正在统计文档作者 ${current}/${total}`);
+          loading.setText(path === "Git 历史" ? `正在扫描 Git 历史 ${current}/${total}` : `正在统计文档作者 ${current}/${total}`);
         }
       });
       if (this.renderRevision !== renderRevision) return;
@@ -172,26 +197,21 @@ export class TeamCoreHistoryView extends ItemView {
     }
   }
 
-  private counts(commits: CommitSummary[]): { week: number; month: number; year: number } {
-    const now = Date.now();
-    return {
-      week: commits.filter((commit) => now - commit.timestamp <= 7 * 86_400_000).length,
-      month: commits.filter((commit) => now - commit.timestamp <= 30 * 86_400_000).length,
-      year: commits.filter((commit) => now - commit.timestamp <= 365 * 86_400_000).length
-    };
-  }
-
-  private async renderContributionWall(container: HTMLElement, repo: GitRepository, recentCommits: CommitSummary[], renderRevision: number): Promise<void> {
+  private async renderContributionWall(container: HTMLElement, repo: GitRepository, renderRevision: number, summaryValues: readonly HTMLElement[]): Promise<void> {
     const weeks = 53;
     const end = new Date();
     const endKey = Date.UTC(end.getFullYear(), end.getMonth(), end.getDate());
-    const start = new Date(end);
-    start.setDate(start.getDate() - (weeks * 7 - 1));
-    start.setDate(start.getDate() - start.getDay());
+    // Anchor the grid to the current week's Sunday. The previous calculation
+    // started 370 days back, which left the final two days outside 53 columns.
+    const currentWeekStart = new Date(end);
+    currentWeekStart.setHours(0, 0, 0, 0);
+    currentWeekStart.setDate(currentWeekStart.getDate() - currentWeekStart.getDay());
+    const start = new Date(currentWeekStart);
+    start.setDate(start.getDate() - (weeks - 1) * 7);
     const startKey = Date.UTC(start.getFullYear(), start.getMonth(), start.getDate());
     const wall = container.createDiv("team-core-contribution-wall");
     wall.createEl("p", { text: "正在加载近一年提交活动…", cls: "team-core-history-loading" });
-    let commits = recentCommits;
+    let commits: CommitSummary[];
     try {
       commits = await repo.logSince(startKey, undefined);
     } catch (error) {
@@ -202,6 +222,13 @@ export class TeamCoreHistoryView extends ItemView {
       return;
     }
     if (this.renderRevision !== renderRevision) return;
+    const now = Date.now();
+    const values = [
+      commits.filter((commit) => now - commit.timestamp <= 7 * 86_400_000).length,
+      commits.filter((commit) => now - commit.timestamp <= 30 * 86_400_000).length,
+      commits.filter((commit) => now - commit.timestamp <= 365 * 86_400_000).length
+    ];
+    for (const [index, value] of values.entries()) summaryValues[index]?.setText(String(value));
     const counts = new Map<number, number>();
     for (const commit of commits) {
       const date = new Date(commit.timestamp);
@@ -247,74 +274,233 @@ export class TeamCoreHistoryView extends ItemView {
     }
   }
 
-  private renderCommitList(container: HTMLElement, commits: CommitSummary[], authorDisplay: AuthorDisplayService): void {
-    if (!commits.length) {
-      container.createEl("p", { text: "暂无提交历史", cls: "team-core-history-empty" });
-      return;
-    }
-    const wrapper = container.createDiv("team-core-commit-table-wrap");
-    const table = wrapper.createEl("table", { cls: "team-core-commit-table" });
-    const head = table.createEl("thead");
-    const headRow = head.createEl("tr");
-    for (const label of ["提交说明", "作者", "提交时间", "哈希", "类型"]) headRow.createEl("th", { text: label });
-    const body = table.createEl("tbody");
-    for (const [index, commit] of commits.entries()) {
-      const row = body.createEl("tr");
-      const message = row.createEl("td", { cls: "team-core-commit-message" });
-      message.createSpan({ text: commit.message || "无提交说明" });
-      if (index === 0) message.createSpan({ text: "最新", cls: "team-core-commit-latest" });
-      row.createEl("td", { text: authorDisplay.display(commit.author), cls: "team-core-commit-author" });
-      row.createEl("td", { text: new Date(commit.timestamp).toLocaleString(), cls: "team-core-commit-date" });
-      row.createEl("td", { text: commit.shortOid, cls: "team-core-commit-oid" });
-      const type = row.createEl("td");
-      if (commit.parents.length > 1) type.createSpan({ text: "合并", cls: "team-core-commit-merge" });
-      else type.createSpan({ text: "普通", cls: "team-core-commit-type" });
-    }
-  }
-
   private async renderAudit(container: HTMLElement): Promise<void> {
     container.empty();
-    container.createEl("h2", { text: "附件审计" });
-    const back = container.createEl("button", { text: "返回历史" });
+    const header = container.createDiv("team-core-audit-header");
+    const heading = header.createDiv("team-core-audit-heading");
+    heading.createEl("h2", { text: "附件审计" });
+    heading.createSpan({ text: "检查公共附件是否仍被笔记引用" });
+    const actions = header.createDiv("team-core-audit-actions");
+    const back = actions.createEl("button", { text: "返回历史" });
     back.addEventListener("click", () => void this.render());
     const audit = await buildReferenceAudit(this.app.vault);
     const orphan = audit.filter((item) => item.orphan);
-    const summary = container.createEl("p", { text: `共 ${audit.length} 个附件，${orphan.length} 个孤立附件。` });
-    summary.addClass("team-core-audit-summary");
-    const table = container.createEl("table");
-    const header = table.createEl("tr");
-    for (const label of ["附件", "引用次数", "引用笔记", "状态"]) header.createEl("th", { text: label });
-    for (const item of audit) {
-      const row = table.createEl("tr");
-      row.createEl("td", { text: item.path });
-      row.createEl("td", { text: String(item.count) });
-      row.createEl("td", { text: item.references.join(", ") || "-" });
-      row.createEl("td", { text: item.orphan ? "孤立" : "正常" });
-    }
     if (orphan.length) {
-      const clean = container.createEl("button", { text: "清理孤立附件" });
+      const clean = actions.createEl("button", { text: `清理 ${orphan.length} 个孤立附件`, cls: "team-core-audit-clean team-core-destructive-button" });
+      setIcon(clean, "trash-2");
       clean.addEventListener("click", () => void this.cleanupOrphans(orphan));
+    }
+    const summary = container.createDiv("team-core-audit-summary");
+    const total = summary.createDiv("team-core-audit-metric");
+    total.createEl("strong", { text: String(audit.length) });
+    total.createSpan({ text: "附件总数" });
+    const orphanMetric = summary.createDiv(`team-core-audit-metric${orphan.length ? " is-warning" : ""}`);
+    orphanMetric.createEl("strong", { text: String(orphan.length) });
+    orphanMetric.createSpan({ text: "孤立附件" });
+    summary.createSpan({ text: orphan.length ? "孤立附件已置顶，可确认后清理。" : "所有附件都至少被一篇笔记引用。", cls: "team-core-audit-summary-note" });
+
+    const wrapper = container.createDiv("team-core-audit-table-wrap");
+    const table = wrapper.createEl("table", { cls: "team-core-audit-table" });
+    const tableHead = table.createEl("thead").createEl("tr");
+    for (const label of ["状态", "引用笔记", "引用", "对象标识"]) tableHead.createEl("th", { text: label });
+    const body = table.createEl("tbody");
+    const ordered = [...audit].sort((left, right) => Number(right.orphan) - Number(left.orphan) || right.count - left.count || left.path.localeCompare(right.path));
+    for (const item of ordered) {
+      const row = body.createEl("tr");
+      const status = row.createEl("td", { cls: "team-core-audit-status-cell" });
+      status.createSpan({ text: item.orphan ? "孤立" : "已引用", cls: `team-core-audit-status${item.orphan ? " is-orphan" : ""}` });
+
+      const references = row.createEl("td", { cls: "team-core-audit-references" });
+      if (!item.references.length) {
+        references.createSpan({ text: "未被笔记引用", cls: "team-core-audit-no-reference" });
+      } else {
+        for (const path of item.references.slice(0, 2)) {
+          const note = references.createEl("button", { cls: "team-core-audit-note", attr: { title: path } });
+          const slash = path.lastIndexOf("/");
+          note.createSpan({ text: slash >= 0 ? path.slice(slash + 1) : path, cls: "team-core-audit-note-name" });
+          if (slash >= 0) note.createSpan({ text: path.slice(0, slash), cls: "team-core-audit-note-folder" });
+          note.addEventListener("click", () => void this.app.workspace.openLinkText(path, "", true));
+        }
+        if (item.references.length > 2) references.createSpan({ text: `另 ${item.references.length - 2} 篇`, cls: "team-core-audit-more-references" });
+      }
+
+      const count = row.createEl("td", { cls: "team-core-audit-count-cell" });
+      count.createSpan({ text: String(item.count), cls: "team-core-audit-count" });
+
+      const asset = row.createEl("td", { cls: "team-core-audit-asset" });
+      const filename = item.path.split("/").pop() ?? item.path;
+      const extension = filename.includes(".") ? filename.slice(filename.lastIndexOf(".") + 1).toUpperCase() : "文件";
+      const hash = filename.replace(/^tc-sha256-/, "").replace(/\.[^.]+$/, "");
+      const compactHash = hash.length > 14 ? `${hash.slice(0, 7)}…${hash.slice(-5)}` : hash;
+      const type = asset.createDiv("team-core-audit-asset-type");
+      const icon = type.createSpan("team-core-audit-asset-icon");
+      setIcon(icon, extension === "PDF" ? "file-text" : ["PNG", "JPG", "JPEG", "GIF", "WEBP", "SVG", "AVIF"].includes(extension) ? "image" : "paperclip");
+      type.createSpan({ text: extension });
+      asset.createSpan({ text: compactHash, cls: "team-core-audit-asset-hash", attr: { title: item.path } });
+      const copy = asset.createEl("button", { cls: "team-core-audit-copy", attr: { "aria-label": "复制完整附件路径", title: "复制完整附件路径" } });
+      setIcon(copy, "copy");
+      copy.addEventListener("click", () => void navigator.clipboard.writeText(item.path).then(() => new Notice("附件路径已复制")));
     }
   }
 
   private async cleanupOrphans(orphan: ReferenceInfo[]): Promise<void> {
     if (!await requestConfirmation(this.app, {
       title: "清理孤立附件",
-      message: `确定删除 ${orphan.length} 个本地孤立附件吗？S3 对象不会删除。`,
-      confirmText: "删除附件",
+      message: `确定将 ${orphan.length} 个本地孤立附件移入 Obsidian 回收站吗？它们的 S3 对象不会删除。`,
+      confirmText: "移入回收站",
       destructive: true
     })) return;
+    const removed: ReferenceInfo[] = [];
     for (const item of orphan) {
       const file = this.app.vault.getAbstractFileByPath(item.path);
-      if (file instanceof TFile) await this.app.fileManager.trashFile(file);
+      if (!(file instanceof TFile)) continue;
+      await this.app.fileManager.trashFile(file);
+      removed.push(item);
+    }
+    if (!removed.length) {
+      new Notice("没有可清理的孤立附件，审计结果将刷新");
+      await this.render();
+      return;
     }
     const manifest = await readManifest(createVaultAdapter(this.app.vault.adapter));
-    for (const item of orphan) delete manifest.files[item.path];
+    for (const item of removed) delete manifest.files[item.path];
     const adapter = createVaultAdapter(this.app.vault.adapter);
     const { writeManifest } = await import("./manifest");
     await writeManifest(adapter, manifest);
-    new Notice("孤立附件已清理（S3 对象保留）");
+    new Notice(`已将 ${removed.length} 个孤立附件移入回收站；S3 对象保留`);
     await this.render();
+  }
+}
+
+export class TeamCoreCommitHistoryView extends ItemView {
+  private renderRevision = 0;
+
+  constructor(
+    leaf: WorkspaceLeaf,
+    private readonly getSettings: () => TeamCoreSettings,
+    private readonly getAuthorDisplay: () => AuthorDisplayService
+  ) {
+    super(leaf);
+  }
+
+  getViewType(): string { return COMMIT_HISTORY_VIEW_TYPE; }
+  getDisplayText(): string { return "提交历史"; }
+  getIcon(): string { return "git-commit-horizontal"; }
+
+  async onOpen(): Promise<void> { await this.render(); }
+
+  async render(): Promise<void> {
+    const renderRevision = ++this.renderRevision;
+    const viewport = this.containerEl.children[1] as HTMLElement;
+    viewport.empty();
+    viewport.addClass("team-core-history-view");
+    const container = viewport.createDiv("team-core-history-content");
+    const header = container.createDiv("team-core-commit-history-header");
+    const title = header.createDiv();
+    title.createEl("h2", { text: "提交历史" });
+    title.createSpan({ text: "按文件筛选团队知识库的 Git 提交记录" });
+    const dashboard = header.createEl("button", { text: "返回团队看板" });
+    dashboard.addEventListener("click", () => void this.openDashboard());
+    const settings = this.getSettings();
+    if (!settings.gitUrl) {
+      container.createEl("p", { text: "请先在插件设置中配置 Git 和 S3。" });
+      return;
+    }
+    const repo = new GitRepository(createVaultAdapter(this.app.vault.adapter), settings, consoleLogger(), this.app.vault.configDir);
+    const markdownFiles = listAuthorableMarkdownFiles(this.app.vault);
+    const filter = container.createDiv("team-core-history-filter team-core-commit-history-filter");
+    const input = filter.createEl("input", { type: "search", placeholder: "按文件路径筛选，例如 notes/readme.md" });
+    input.setAttr("list", "team-core-commit-history-file-list");
+    const datalist = filter.createEl("datalist", { attr: { id: "team-core-commit-history-file-list" } });
+    for (const file of markdownFiles) datalist.createEl("option", { attr: { value: file.path } });
+    const searchButton = filter.createEl("button", { attr: { "aria-label": "搜索文件提交历史", title: "搜索文件提交历史" } });
+    setIcon(searchButton, "search");
+    const clearButton = filter.createEl("button", { attr: { "aria-label": "清除文件筛选", title: "清除文件筛选" } });
+    setIcon(clearButton, "x");
+    const results = container.createDiv("team-core-history-results");
+    const pageSize = 10;
+    let requestId = 0;
+    const renderResults = async (page = 0): Promise<void> => {
+      const scrollTop = viewport.scrollTop;
+      const query = input.value.trim();
+      const currentRequest = ++requestId;
+      results.empty();
+      results.createEl("p", { text: query ? `正在查询提交历史（第 ${page + 1} 页）…` : `正在加载提交历史（第 ${page + 1} 页）…`, cls: "team-core-history-loading" });
+      try {
+        let filepath = query;
+        if (query && !query.includes("/")) {
+          const normalized = query.toLocaleLowerCase();
+          const matches = markdownFiles.filter((file) => file.basename.toLocaleLowerCase() === normalized || file.name.toLocaleLowerCase() === normalized);
+          if (matches.length > 1) throw new Error(`存在 ${matches.length} 个同名文件，请从候选项中选择完整路径`);
+          if (matches.length === 1) {
+            filepath = matches[0].path;
+            input.value = filepath;
+          }
+        }
+        // isomorphic-git has no offset parameter. Read one extra item to determine
+        // whether a next page exists, while keeping the initial request bounded.
+        const loaded = await repo.log(filepath || undefined, (page + 1) * pageSize + 1);
+        const filtered = loaded.slice(page * pageSize, (page + 1) * pageSize);
+        const hasNext = loaded.length > (page + 1) * pageSize;
+        if (currentRequest !== requestId || this.renderRevision !== renderRevision) return;
+        results.empty();
+        if (filepath) results.createEl("p", { text: filtered.length ? `${filepath} · 第 ${page + 1} 页` : `${filepath} · 暂无提交记录`, cls: "team-core-history-filter-result" });
+        this.renderCommitList(results, filtered, page, hasNext, (nextPage) => void renderResults(nextPage));
+        window.requestAnimationFrame(() => { viewport.scrollTop = scrollTop; });
+      } catch (error) {
+        if (currentRequest !== requestId || this.renderRevision !== renderRevision) return;
+        results.empty();
+        results.createEl("p", { text: `查询失败：${error instanceof Error ? error.message : String(error)}`, cls: "team-core-history-error" });
+      }
+    };
+    searchButton.addEventListener("click", () => void renderResults());
+    clearButton.addEventListener("click", () => { input.value = ""; void renderResults(); });
+    input.addEventListener("keydown", (event) => { if (event.key === "Enter") void renderResults(); });
+    void renderResults();
+  }
+
+  private async openDashboard(): Promise<void> {
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: DASHBOARD_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
+  }
+
+  private renderCommitList(container: HTMLElement, commits: CommitSummary[], page: number, hasNext: boolean, onPage: (page: number) => void): void {
+    if (!commits.length) {
+      container.createEl("p", { text: "暂无提交历史", cls: "team-core-history-empty" });
+      return;
+    }
+    const wrapper = container.createDiv("team-core-commit-table-wrap");
+    const table = wrapper.createEl("table", { cls: "team-core-commit-table" });
+    const head = table.createEl("thead").createEl("tr");
+    for (const label of ["提交说明", "作者", "提交时间", "哈希", "类型"]) head.createEl("th", { text: label });
+    const body = table.createEl("tbody");
+    const authorDisplay = this.getAuthorDisplay();
+    for (const [index, commit] of commits.entries()) {
+      const row = body.createEl("tr");
+      const message = row.createEl("td", { cls: "team-core-commit-message" });
+      message.createSpan({ text: commit.message || "无提交说明" });
+      if (page === 0 && index === 0) message.createSpan({ text: "最新", cls: "team-core-commit-latest" });
+      row.createEl("td", { text: authorDisplay.display(commit.author), cls: "team-core-commit-author" });
+      row.createEl("td", { text: new Date(commit.timestamp).toLocaleString(), cls: "team-core-commit-date" });
+      row.createEl("td", { text: commit.shortOid, cls: "team-core-commit-oid" });
+      const type = row.createEl("td");
+      type.createSpan({ text: commit.parents.length > 1 ? "合并" : "普通", cls: commit.parents.length > 1 ? "team-core-commit-merge" : "team-core-commit-type" });
+    }
+    const pagination = container.createDiv("team-core-pagination");
+    const first = pagination.createEl("button", { attr: { "aria-label": "跳转到首页", title: "跳转到首页" } });
+    setIcon(first, "chevrons-left");
+    first.disabled = page === 0;
+    first.addEventListener("click", () => onPage(0));
+    const previous = pagination.createEl("button", { attr: { "aria-label": "上一页", title: "上一页" } });
+    setIcon(previous, "chevron-left");
+    previous.disabled = page === 0;
+    previous.addEventListener("click", () => onPage(page - 1));
+    pagination.createSpan({ text: `第 ${page + 1} 页`, cls: "team-core-pagination-label" });
+    const next = pagination.createEl("button", { attr: { "aria-label": "下一页", title: "下一页" } });
+    setIcon(next, "chevron-right");
+    next.disabled = !hasNext;
+    next.addEventListener("click", () => onPage(page + 1));
   }
 }
 

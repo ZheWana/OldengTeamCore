@@ -4,7 +4,7 @@ import { mergeSettings } from "./config";
 import { DiagnosticsModal } from "./diagnostics-ui";
 import { parseLogEntries, PluginLogger, type LogEntry } from "./logger";
 import { SyncCoordinator } from "./sync";
-import { HISTORY_VIEW_TYPE, TeamCoreHistoryView, TeamCoreSettingTab } from "./ui";
+import { COMMIT_HISTORY_VIEW_TYPE, DASHBOARD_VIEW_TYPE, TeamCoreCommitHistoryView, TeamCoreDashboardView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
 import { requestConfirmation } from "./confirm";
 import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
@@ -55,17 +55,22 @@ export default class TeamCorePlugin extends Plugin {
     }, this.logger);
     this.authorService = this.createFileAuthorService();
     this.addSettingTab(new TeamCoreSettingTab(this.app, this));
-    this.registerView(HISTORY_VIEW_TYPE, (leaf) => new TeamCoreHistoryView(
+    this.registerView(DASHBOARD_VIEW_TYPE, (leaf) => new TeamCoreDashboardView(
       leaf,
       () => this.teamCoreSettings,
-      () => this.coordinator,
       () => this.authorService,
       () => this.authorDisplayService()
     ));
     this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.handleSyncAction() });
     this.addCommand({ id: "resolve-conflicts", name: "解决同步冲突", callback: () => void this.openConflictEditor() });
     this.addCommand({ id: "normalize-attachments", name: "规范化全部附件", callback: () => void this.coordinator.normalizeAllAttachments() });
-    this.addCommand({ id: "open-history", name: "打开历史窗口", callback: () => void this.openHistory() });
+    this.registerView(COMMIT_HISTORY_VIEW_TYPE, (leaf) => new TeamCoreCommitHistoryView(
+      leaf,
+      () => this.teamCoreSettings,
+      () => this.authorDisplayService()
+    ));
+    this.addCommand({ id: "open-dashboard", name: "打开团队看板", callback: () => void this.openDashboard() });
+    this.addCommand({ id: "open-commit-history", name: "打开提交历史", callback: () => void this.openCommitHistory() });
     this.addCommand({ id: "initialize-remote", name: "初始化并同步当前知识库", callback: () => void this.confirmInitialize() });
     this.addCommand({ id: "clone-remote", name: "从远端知识库导入", callback: () => void this.confirmClone() });
     this.addCommand({ id: "overwrite-from-remote", name: "重置本地并重新同步", callback: () => void this.confirmRemoteOverwrite() });
@@ -133,9 +138,9 @@ export default class TeamCorePlugin extends Plugin {
 
   refreshAuthorDisplays(): void {
     void this.refreshNoteAuthors();
-    for (const leaf of this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)) {
+    for (const leaf of [...this.app.workspace.getLeavesOfType(DASHBOARD_VIEW_TYPE), ...this.app.workspace.getLeavesOfType(COMMIT_HISTORY_VIEW_TYPE)]) {
       const view = leaf.view;
-      if (view instanceof TeamCoreHistoryView) void view.render();
+      if (view instanceof TeamCoreDashboardView || view instanceof TeamCoreCommitHistoryView) void view.render();
     }
   }
 
@@ -289,9 +294,15 @@ export default class TeamCorePlugin extends Plugin {
     }
   }
 
-  private async openHistory(): Promise<void> {
+  private async openDashboard(): Promise<void> {
     const leaf = this.app.workspace.getLeaf(true);
-    await leaf.setViewState({ type: HISTORY_VIEW_TYPE, active: true });
+    await leaf.setViewState({ type: DASHBOARD_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
+  }
+
+  private async openCommitHistory(): Promise<void> {
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: COMMIT_HISTORY_VIEW_TYPE, active: true });
     await this.app.workspace.revealLeaf(leaf);
   }
 

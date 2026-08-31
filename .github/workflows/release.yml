@@ -24,6 +24,8 @@ jobs:
       - run: npm run check
       - name: Verify release metadata
         run: npm run verify-release -- "$GITHUB_REF_NAME"
+      - name: Verify release notes
+        run: test -s ".github/release-notes/$GITHUB_REF_NAME.md"
       - name: Attest release files
         uses: actions/attest@v4
         with:
@@ -38,5 +40,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
             --title "Oldeng Team Core $GITHUB_REF_NAME" \
-            --generate-notes \
+            --notes-file ".github/release-notes/$GITHUB_REF_NAME.md" \
             dist/main.js dist/manifest.json dist/styles.css

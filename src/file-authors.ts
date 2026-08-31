@@ -13,6 +13,7 @@ export interface FileAuthorRegistry {
 export interface FileAuthorHistory {
   exists(): Promise<boolean>;
   fileAuthors(filepath: string): Promise<string[]>;
+  fileAuthorsIndex?(onProgress?: (current: number, total: number) => void): Promise<Map<string, string[]>>;
 }
 
 export interface FileAuthorProgress {
@@ -124,6 +125,7 @@ export function countResolvedDocumentAuthors(authorsByPath: ReadonlyMap<string, 
 export class FileAuthorService {
   private registryPromise: Promise<FileAuthorRegistry> | undefined;
   private repositoryExistsPromise: Promise<boolean> | undefined;
+  private historyIndexPromise: Promise<Map<string, string[]>> | undefined;
   private readonly authorCache = new Map<string, Promise<string[]>>();
 
   constructor(
@@ -136,6 +138,7 @@ export class FileAuthorService {
   invalidate(): void {
     this.registryPromise = undefined;
     this.repositoryExistsPromise = undefined;
+    this.historyIndexPromise = undefined;
     this.authorCache.clear();
   }
 
@@ -169,6 +172,11 @@ export class FileAuthorService {
     concurrency = 6
   ): Promise<Map<string, number>> {
     const normalizedPaths = [...new Set(paths.map(normalizeVaultPath))];
+    const registry = await this.getRegistry();
+    const unresolvedPaths = normalizedPaths.filter((path) => !registry.files[path]);
+    const historyIndex = unresolvedPaths.length && await this.repositoryExists() && this.history.fileAuthorsIndex
+      ? await this.getHistoryIndex(onProgress)
+      : undefined;
     const authorsByPath = new Map<string, string[]>();
     let nextIndex = 0;
     let completed = 0;
@@ -177,7 +185,9 @@ export class FileAuthorService {
         const index = nextIndex++;
         const path = normalizedPaths[index];
         if (!path) return;
-        authorsByPath.set(path, await this.getAuthors(path));
+        const assigned = registry.files[path];
+        const historical = historyIndex?.get(path);
+        authorsByPath.set(path, assigned ? this.displayAuthors(assigned) : historical ? this.displayAuthors(historical) : await this.getAuthors(path));
         completed += 1;
         onProgress?.({ current: completed, total: normalizedPaths.length, path });
       }
@@ -214,6 +224,13 @@ export class FileAuthorService {
   private repositoryExists(): Promise<boolean> {
     this.repositoryExistsPromise ??= this.history.exists();
     return this.repositoryExistsPromise;
+  }
+
+  private getHistoryIndex(onProgress?: (progress: FileAuthorProgress) => void): Promise<Map<string, string[]>> {
+    if (!this.historyIndexPromise) {
+      this.historyIndexPromise = this.history.fileAuthorsIndex!((current, total) => onProgress?.({ current, total, path: "Git 历史" }));
+    }
+    return this.historyIndexPromise;
   }
 
   private async persistRegistry(registry: FileAuthorRegistry): Promise<void> {
