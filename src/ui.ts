@@ -3,7 +3,7 @@ import { exportSettings, importSettings } from "./config";
 import { readManifest } from "./manifest";
 import { GitRepository } from "./git";
 import type { CommitSummary, ReferenceInfo, TeamCoreSettings } from "./types";
-import { buildReferenceAudit, createVaultAdapter } from "./vault";
+import { buildReferenceAudit, createVaultAdapter, listAssets } from "./vault";
 import type { SyncCoordinator } from "./sync";
 import { listLocalCommunityPlugins, readSharedPluginIds } from "./shared-plugins";
 import { requestConfirmation } from "./confirm";
@@ -57,11 +57,13 @@ export class TeamCoreDashboardView extends ItemView {
       container.createEl("p", { text: `文件作者归属表不可用：${error instanceof Error ? error.message : String(error)}`, cls: "team-core-history-error" });
     }
     const markdownFiles = listAuthorableMarkdownFiles(this.app.vault);
+    const localAssets = await listAssets(this.app.vault);
     const summary = container.createDiv("team-core-summary-grid");
     const summaryValues: HTMLElement[] = [];
-    for (const label of ["近一周", "近一月", "近一年"]) {
+    for (const [label, value] of [["本地文章", String(markdownFiles.length)], ["本地附件", String(localAssets.length)], ["近一周", "…"], ["近一月", "…"], ["近一年", "…"]]) {
       const card = summary.createDiv("team-core-stat");
-      summaryValues.push(card.createEl("strong", { text: "…" }));
+      const valueElement = card.createEl("strong", { text: value });
+      if (value === "…") summaryValues.push(valueElement);
       card.createSpan({ text: label });
     }
     void this.renderContributionWall(container, repo, renderRevision, summaryValues);
@@ -327,7 +329,8 @@ export class TeamCoreDashboardView extends ItemView {
       const count = row.createEl("td", { cls: "team-core-audit-count-cell" });
       count.createSpan({ text: String(item.count), cls: "team-core-audit-count" });
 
-      const asset = row.createEl("td", { cls: "team-core-audit-asset" });
+      const assetCell = row.createEl("td", { cls: "team-core-audit-asset-cell" });
+      const asset = assetCell.createDiv("team-core-audit-asset");
       const filename = item.path.split("/").pop() ?? item.path;
       const extension = filename.includes(".") ? filename.slice(filename.lastIndexOf(".") + 1).toUpperCase() : "文件";
       const hash = filename.replace(/^tc-sha256-/, "").replace(/\.[^.]+$/, "");
