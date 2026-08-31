@@ -1,9 +1,11 @@
 import type { TeamCoreSettings } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
-import { base64UrlDecode, base64UrlEncode } from "./crypto";
+import { base64UrlDecodeBytes, base64UrlEncodeBytes } from "./crypto";
 import { normalizeAuthorDisplayMappings } from "./author-display";
+import { compressSync, decompressSync, strFromU8, strToU8 } from "fflate";
 
 const IMPORT_VERSION = 1;
+const COMPRESSED_PREFIX = "tc1.";
 
 interface ImportBundle {
   version: 1;
@@ -16,13 +18,18 @@ function sharedSettings(settings: TeamCoreSettings): ImportBundle {
 }
 
 export function exportSettings(settings: TeamCoreSettings): string {
-  return base64UrlEncode(JSON.stringify(sharedSettings(settings)));
+  const payload = compressSync(strToU8(JSON.stringify(sharedSettings(settings))));
+  return `${COMPRESSED_PREFIX}${base64UrlEncodeBytes(payload)}`;
 }
 
 export function importSettings(encoded: string, current: TeamCoreSettings): TeamCoreSettings {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(base64UrlDecode(encoded.trim()));
+    const value = encoded.trim();
+    if (!value.startsWith(COMPRESSED_PREFIX)) throw new Error("unsupported configuration format");
+    const compressed = value.slice(COMPRESSED_PREFIX.length);
+    if (!compressed) throw new Error("empty configuration payload");
+    parsed = JSON.parse(strFromU8(decompressSync(base64UrlDecodeBytes(compressed))));
   } catch {
     throw new Error("配置字符串无法解析");
   }

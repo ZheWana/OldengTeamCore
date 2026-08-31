@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { exportSettings, importSettings, mergeSettings } from "../src/config";
-import { base64UrlDecode, base64UrlEncode, sha256Hex } from "../src/crypto";
+import { base64UrlDecode, base64UrlEncode, base64UrlEncodeBytes, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
@@ -21,6 +21,7 @@ import { assignedOrHistoricalAuthors, clearFileAuthors, countResolvedDocumentAut
 import { Buffer as BrowserBuffer } from "../src/browser-shims";
 import { PluginLogger, parseLogEntries } from "../src/logger";
 import { AuthorDisplayService, parseAuthorDisplayMappings, serializeAuthorDisplayMappings } from "../src/author-display";
+import { compressSync, strToU8 } from "fflate";
 
 const execFileAsync = promisify(execFile);
 
@@ -222,6 +223,21 @@ describe("configuration bundles", () => {
     expect(() => importSettings(encoded, settings())).toThrow("同步时间");
   });
 
+  it("exports a compressed, self-identifying bundle", () => {
+    const source = settings({
+      gitUrl: "https://git.example.test/team-core/knowledge.git",
+      gitPassword: "shared-password",
+      s3Endpoint: "https://s3.example.test/bucket",
+      s3AccessKey: "access-key",
+      s3SecretKey: "secret-key",
+      authorDisplayMappings: { xuchenrui: "许宸瑞", gaochenrui: "高晨瑞" }
+    });
+    const exported = exportSettings(source);
+    expect(exported.startsWith("tc1.")).toBe(true);
+    expect(exported.length).toBeLessThan(JSON.stringify(source).length * 1.34);
+    expect(importSettings(exported, settings({ gitUsername: "local-user" })).gitPassword).toBe(source.gitPassword);
+  });
+
   it("preserves the automatic-sync choice and defaults legacy settings to enabled", () => {
     const source = settings({ autoSync: false });
     expect(importSettings(exportSettings(source), settings({ autoSync: true })).autoSync).toBe(true);
@@ -238,7 +254,7 @@ describe("configuration bundles", () => {
   });
 
   it("rejects a malformed Git author display mapping in a configuration bundle", () => {
-    const encoded = base64UrlEncode(JSON.stringify({ version: 1, settings: { authorDisplayMappings: "not-a-map" } }));
+    const encoded = `tc1.${base64UrlEncodeBytes(compressSync(strToU8(JSON.stringify({ version: 1, settings: { authorDisplayMappings: "not-a-map" } }))))}`;
     expect(() => importSettings(encoded, settings())).toThrow("映射无效");
   });
 });
