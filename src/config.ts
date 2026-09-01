@@ -12,8 +12,26 @@ interface ImportBundle {
   settings: Omit<TeamCoreSettings, "gitUsername" | "autoSync">;
 }
 
+function selectSettings(settings: TeamCoreSettings): TeamCoreSettings {
+  return {
+    gitUrl: settings.gitUrl,
+    gitUsername: settings.gitUsername,
+    gitPassword: settings.gitPassword,
+    s3Endpoint: settings.s3Endpoint,
+    s3Region: settings.s3Region,
+    s3Bucket: settings.s3Bucket,
+    s3Prefix: settings.s3Prefix,
+    s3AccessKey: settings.s3AccessKey,
+    s3SecretKey: settings.s3SecretKey,
+    autoSync: settings.autoSync,
+    debounceMs: settings.debounceMs,
+    syncIntervalMs: settings.syncIntervalMs,
+    authorDisplayMappings: settings.authorDisplayMappings
+  };
+}
+
 function sharedSettings(settings: TeamCoreSettings): ImportBundle {
-  const { gitUsername: _ignored, autoSync: _localAutoSync, ...general } = settings;
+  const { gitUsername: _ignored, autoSync: _localAutoSync, ...general } = selectSettings(settings);
   return { version: IMPORT_VERSION, settings: general };
 }
 
@@ -40,13 +58,13 @@ export function importSettings(encoded: string, current: TeamCoreSettings): Team
   if (input.authorDisplayMappings !== undefined && (!input.authorDisplayMappings || typeof input.authorDisplayMappings !== "object" || Array.isArray(input.authorDisplayMappings))) {
     throw new Error("Git 作者显示名称映射无效");
   }
-  const merged: TeamCoreSettings = {
+  const merged = selectSettings({
     ...DEFAULT_SETTINGS,
-    ...current,
+    ...selectSettings(current),
     ...input,
     autoSync: current.autoSync,
     gitUsername: current.gitUsername
-  };
+  });
   if (typeof merged.gitUrl !== "string" || typeof merged.gitPassword !== "string" || typeof merged.s3Endpoint !== "string" || typeof merged.s3Bucket !== "string") throw new Error("配置字段无效");
   if (typeof merged.autoSync !== "boolean") throw new Error("自动同步开关无效");
   merged.authorDisplayMappings = normalizeAuthorDisplayMappings(merged.authorDisplayMappings);
@@ -56,12 +74,12 @@ export function importSettings(encoded: string, current: TeamCoreSettings): Team
 
 export function mergeSettings(data: unknown): TeamCoreSettings {
   const input = data && typeof data === "object" ? data as Partial<TeamCoreSettings> : {};
-  const merged = {
+  const merged = selectSettings({
     ...DEFAULT_SETTINGS,
     ...input,
     autoSync: typeof input.autoSync === "boolean" ? input.autoSync : DEFAULT_SETTINGS.autoSync,
     gitUsername: typeof input.gitUsername === "string" ? input.gitUsername : DEFAULT_SETTINGS.gitUsername
-  };
+  });
   try {
     return { ...merged, authorDisplayMappings: normalizeAuthorDisplayMappings(input.authorDisplayMappings) };
   } catch {

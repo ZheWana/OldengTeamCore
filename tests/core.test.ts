@@ -238,6 +238,18 @@ describe("configuration bundles", () => {
     expect(importSettings(exported, settings({ gitUsername: "local-user" })).gitPassword).toBe(source.gitPassword);
   });
 
+  it("never exports diagnostic logs or other plugin-local runtime data", () => {
+    const source = settings({ authorDisplayMappings: { xuchenrui: "许宸瑞" } });
+    const polluted = {
+      ...source,
+      diagnosticLogs: Array.from({ length: 800 }, (_, index) => ({ index, message: "x".repeat(250) })),
+      futureRuntimeCache: "y".repeat(20_000)
+    } as TeamCoreSettings;
+    expect(exportSettings(polluted)).toBe(exportSettings(source));
+    expect("diagnosticLogs" in mergeSettings(polluted)).toBe(false);
+    expect("futureRuntimeCache" in mergeSettings(polluted)).toBe(false);
+  });
+
   it("preserves the automatic-sync choice and defaults legacy settings to enabled", () => {
     const source = settings({ autoSync: false });
     expect(importSettings(exportSettings(source), settings({ autoSync: true })).autoSync).toBe(true);
