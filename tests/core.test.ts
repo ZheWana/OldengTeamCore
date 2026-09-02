@@ -6,12 +6,13 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { exportSettings, importSettings, mergeSettings } from "../src/config";
+import { exportPrivateSettings, exportSettings, importPrivateSettings, importSettings, mergeSettings } from "../src/config";
 import { base64UrlDecode, base64UrlEncode, base64UrlEncodeBytes, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
-import { planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
+import { planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -40,6 +41,15 @@ const settings = (overrides: Partial<TeamCoreSettings> = {}): TeamCoreSettings =
 });
 
 const logger: Logger = { debug() {}, warn() {}, error() {} };
+
+class MemoryPrivateRemote implements PrivateSyncRemote {
+  readonly objects = new Map<string, ArrayBuffer>();
+
+  async initialize(): Promise<void> {}
+  async read(path: string): Promise<ArrayBuffer | undefined> { return this.objects.get(path)?.slice(0); }
+  async write(path: string, data: ArrayBuffer): Promise<void> { this.objects.set(path, data.slice(0)); }
+  async remove(path: string): Promise<void> { this.objects.delete(path); }
+}
 
 class NodeVault implements BinaryVault {
   constructor(private readonly root: string) {}
@@ -265,9 +275,136 @@ describe("configuration bundles", () => {
     expect(imported.authorDisplayMappings).toEqual({ xuchenrui: "许宸瑞" });
   });
 
+  it("keeps private-note credentials out of shared configuration bundles", () => {
+    const source = settings({
+      privateSyncEnabled: true,
+      privateWebdavUrl: "https://dav.example.test/private/",
+      privateWebdavUsername: "private-user",
+      privateWebdavPassword: "private-secret"
+    });
+    const current = settings({ privateWebdavPassword: "local-private-secret" });
+
+    expect(exportSettings(source)).toBe(exportSettings(settings()));
+    const imported = importSettings(exportSettings(source), current);
+    expect(imported.privateWebdavPassword).toBe("local-private-secret");
+    expect(imported.privateSyncEnabled).toBe(false);
+  });
+
+  it("round-trips the independent private-note configuration bundle", () => {
+    const source = settings({
+      privateSyncEnabled: true,
+      privateSyncProvider: "s3",
+      privateS3Endpoint: "https://private-s3.example.test",
+      privateS3Region: "us-east-1",
+      privateS3Bucket: "private-notes",
+      privateS3Prefix: "alice",
+      privateS3AccessKey: "private-access",
+      privateS3SecretKey: "private-secret",
+      privateSyncWithTeam: true
+    });
+    const imported = importPrivateSettings(exportPrivateSettings(source), settings({ gitUsername: "local-user" }));
+
+    expect(exportPrivateSettings(source).startsWith("tcp1.")).toBe(true);
+    expect(imported.privateSyncEnabled).toBe(true);
+    expect(imported.privateSyncWithTeam).toBe(true);
+    expect(imported.privateSyncProvider).toBe("s3");
+    expect(imported.privateS3SecretKey).toBe("private-secret");
+    expect(imported.gitUsername).toBe("local-user");
+    expect(imported.privateSyncState.entries).toEqual({});
+  });
+
   it("rejects a malformed Git author display mapping in a configuration bundle", () => {
     const encoded = `tc1.${base64UrlEncodeBytes(compressSync(strToU8(JSON.stringify({ version: 1, settings: { authorDisplayMappings: "not-a-map" } }))))}`;
     expect(() => importSettings(encoded, settings())).toThrow("映射无效");
+  });
+});
+
+describe("private-note synchronization", () => {
+  it("does not queue private Vault events while private synchronization is disabled", () => {
+    expect(shouldTrackPrivateSyncEvent(settings({ privateSyncEnabled: false }))).toBe(false);
+    expect(shouldTrackPrivateSyncEvent(settings({ privateSyncEnabled: true }))).toBe(true);
+  });
+
+  it("uploads incrementally, downloads to another vault, and propagates deletions", async () => {
+    const firstRoot = await mkdtemp(join(tmpdir(), "team-core-private-first-"));
+    const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-second-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const firstVault = new NodeVault(firstRoot);
+      const secondVault = new NodeVault(secondRoot);
+      const first = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
+      const second = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
+
+      await firstVault.write("私人笔记/drafts/idea.md", encode("first draft"));
+      const firstSync = await first.sync(firstVault, { version: 1, entries: {} });
+      expect(firstSync.uploaded).toBe(1);
+      expect(firstSync.downloaded).toBe(0);
+
+      const noChange = await first.sync(firstVault, firstSync.state);
+      expect(noChange.uploaded).toBe(0);
+      expect(noChange.downloaded).toBe(0);
+
+      const secondSync = await second.sync(secondVault, { version: 1, entries: {} });
+      expect(secondSync.downloaded).toBe(1);
+      expect(decode(await secondVault.read("私人笔记/drafts/idea.md"))).toBe("first draft");
+
+      await firstVault.remove("私人笔记/drafts/idea.md");
+      const deleteSync = await first.sync(firstVault, noChange.state);
+      expect(deleteSync.deletedRemote).toBe(1);
+
+      const receiveDelete = await second.sync(secondVault, secondSync.state);
+      expect(receiveDelete.deletedLocal).toBe(1);
+      expect(await secondVault.exists("私人笔记/drafts/idea.md")).toBe(false);
+    } finally {
+      await rm(firstRoot, { recursive: true, force: true });
+      await rm(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("pulls remote private notes without uploading local-only files", async () => {
+    const firstRoot = await mkdtemp(join(tmpdir(), "team-core-private-pull-first-"));
+    const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-pull-second-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const firstVault = new NodeVault(firstRoot);
+      await firstVault.write("私人笔记/remote.md", encode("remote note"));
+      await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(firstVault, { version: 1, entries: {} });
+
+      const secondVault = new NodeVault(secondRoot);
+      await secondVault.write("私人笔记/local-only.md", encode("local note"));
+      const result = await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).pull(secondVault, { version: 1, entries: {} });
+
+      expect(result.uploaded).toBe(0);
+      expect(decode(await secondVault.read("私人笔记/remote.md"))).toBe("remote note");
+      expect(await secondVault.exists("私人笔记/local-only.md")).toBe(true);
+      const index = JSON.parse(decode(remote.objects.get("oldeng-team-core-private/v1/index.json")!)) as { entries: Record<string, unknown> };
+      expect(index.entries).not.toHaveProperty("local-only.md");
+    } finally {
+      await rm(firstRoot, { recursive: true, force: true });
+      await rm(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("stops before writing a downloaded file whose bytes do not match the private manifest", async () => {
+    const firstRoot = await mkdtemp(join(tmpdir(), "team-core-private-hash-first-"));
+    const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-hash-second-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const firstVault = new NodeVault(firstRoot);
+      await firstVault.write("私人笔记/idea.md", encode("expected bytes"));
+      await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(firstVault, { version: 1, entries: {} });
+      const fileKey = [...remote.objects.keys()].find((key) => key.includes("/files/"));
+      if (!fileKey) throw new Error("Expected private remote file");
+      remote.objects.set(fileKey, encode("tampered bytes"));
+
+      const secondVault = new NodeVault(secondRoot);
+      await expect(new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(secondVault, { version: 1, entries: {} }))
+        .rejects.toThrow("校验失败");
+      expect(await secondVault.exists("私人笔记/idea.md")).toBe(false);
+    } finally {
+      await rm(firstRoot, { recursive: true, force: true });
+      await rm(secondRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -982,6 +1119,63 @@ describe("Git repository adapter", () => {
       expect((await secondAuthor.fileAuthorsIndex()).has("私人笔记/秘密.md")).toBe(false);
       expect(await secondAuthor.fileAuthors("notes/missing.md")).toEqual([]);
       expect(await secondAuthor.logSince(Date.now() - 60_000)).toHaveLength(3);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("summarizes document, shared-plugin, and attachment changes without exposing implementation paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-commit-changes-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian", ["calendar"]);
+      await repo.init();
+      await repo.ensureGitignore();
+      await vault.write("notes/readme.md", encode("base\n"));
+      await vault.write(".obsidian/plugins/calendar/manifest.json", encode(JSON.stringify({ id: "calendar", name: "Calendar" })));
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("base plugin\n"));
+      const first = await repo.commit("Initial shared content");
+      if (!first) throw new Error("Expected initial commit");
+      await expect(repo.commitChanges(first)).resolves.toMatchObject({
+        markdownPaths: ["notes/readme.md"],
+        pluginNames: ["Calendar"],
+        attachmentDocumentPaths: []
+      });
+
+      await vault.write("notes/readme.md", encode("![[assets/image.png]]\n"));
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("updated plugin\n"));
+      await vault.write(".team/assets-manifest.json", encode(serializeManifest(validateManifest({
+        version: 1,
+        files: {
+          "assets/image.png": {
+            sha256: "a".repeat(64),
+            size: 12,
+            mime: "image/png",
+            uploadedAt: "2026-09-02T00:00:00.000Z",
+            uploadedBy: "alice"
+          }
+        }
+      }))));
+      const second = await repo.commit("Update shared content");
+      if (!second) throw new Error("Expected update commit");
+
+      expect(await repo.commitChanges(second)).toMatchObject({
+        markdownPaths: ["notes/readme.md"],
+        documentChanges: [{
+          path: "notes/readme.md",
+          status: "modified",
+          previousLineCount: 1,
+          currentLineCount: 1
+        }],
+        pluginNames: ["Calendar"],
+        pluginChanges: [{ name: "Calendar", changedFileCount: 1 }],
+        attachmentDocumentPaths: ["notes/readme.md"],
+        hasUnassociatedAttachmentChanges: false,
+        sharedPluginStateChanged: false,
+        fileAuthorsChanged: false,
+        sharedPluginRulesChanged: false,
+        hasOtherChanges: false
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

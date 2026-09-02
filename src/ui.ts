@@ -1,8 +1,8 @@
 import { ButtonComponent, ItemView, Modal, Notice, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon, setTooltip, type App, type Plugin, type SettingDefinition, type SettingDefinitionItem } from "obsidian";
-import { exportSettings, importSettings } from "./config";
+import { exportPrivateSettings, exportSettings, importPrivateSettings, importSettings } from "./config";
 import { readManifest } from "./manifest";
 import { GitRepository } from "./git";
-import type { CommitSummary, ReferenceInfo, TeamCoreSettings } from "./types";
+import type { CommitChangeDetails, CommitDocumentChange, CommitSummary, ReferenceInfo, TeamCoreSettings } from "./types";
 import { buildReferenceAudit, createVaultAdapter, listAssets } from "./vault";
 import type { SyncCoordinator } from "./sync";
 import { listLocalCommunityPlugins, readSharedPluginIds } from "./shared-plugins";
@@ -12,6 +12,22 @@ import { AuthorDisplayService, parseAuthorDisplayMappings, type AuthorDisplayMap
 
 export const DASHBOARD_VIEW_TYPE = "team-core-history";
 export const COMMIT_HISTORY_VIEW_TYPE = "team-core-commit-history";
+
+type CommitChangeGroupId = "documents" | "attachments" | "settings" | "other";
+
+interface CommitChangeItem {
+  text: string;
+  summary: string;
+  location: string;
+  documentPath?: string;
+  muted?: boolean;
+}
+
+interface CommitChangeGroup {
+  id: CommitChangeGroupId;
+  label: string;
+  items: CommitChangeItem[];
+}
 
 export class TeamCoreDashboardView extends ItemView {
   private renderRevision = 0;
@@ -377,6 +393,7 @@ export class TeamCoreDashboardView extends ItemView {
 
 export class TeamCoreCommitHistoryView extends ItemView {
   private renderRevision = 0;
+  private changeDetailsPageSize = 10;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -448,7 +465,7 @@ export class TeamCoreCommitHistoryView extends ItemView {
         if (currentRequest !== requestId || this.renderRevision !== renderRevision) return;
         results.empty();
         if (filepath) results.createEl("p", { text: filtered.length ? `${filepath} · 第 ${page + 1} 页` : `${filepath} · 暂无提交记录`, cls: "team-core-history-filter-result" });
-        this.renderCommitList(results, filtered, page, hasNext, (nextPage) => void renderResults(nextPage));
+        this.renderCommitList(results, repo, filtered, page, hasNext, (nextPage) => void renderResults(nextPage));
         window.requestAnimationFrame(() => { viewport.scrollTop = scrollTop; });
       } catch (error) {
         if (currentRequest !== requestId || this.renderRevision !== renderRevision) return;
@@ -468,7 +485,7 @@ export class TeamCoreCommitHistoryView extends ItemView {
     await this.app.workspace.revealLeaf(leaf);
   }
 
-  private renderCommitList(container: HTMLElement, commits: CommitSummary[], page: number, hasNext: boolean, onPage: (page: number) => void): void {
+  private renderCommitList(container: HTMLElement, repo: GitRepository, commits: CommitSummary[], page: number, hasNext: boolean, onPage: (page: number) => void): void {
     if (!commits.length) {
       container.createEl("p", { text: "暂无提交历史", cls: "team-core-history-empty" });
       return;
@@ -476,7 +493,7 @@ export class TeamCoreCommitHistoryView extends ItemView {
     const wrapper = container.createDiv("team-core-commit-table-wrap");
     const table = wrapper.createEl("table", { cls: "team-core-commit-table" });
     const head = table.createEl("thead").createEl("tr");
-    for (const label of ["提交说明", "作者", "提交时间", "哈希", "类型"]) head.createEl("th", { text: label });
+    for (const label of ["提交说明", "更新内容", "作者", "提交时间", "哈希", "类型"]) head.createEl("th", { text: label });
     const body = table.createEl("tbody");
     const authorDisplay = this.getAuthorDisplay();
     for (const [index, commit] of commits.entries()) {
@@ -484,6 +501,10 @@ export class TeamCoreCommitHistoryView extends ItemView {
       const message = row.createEl("td", { cls: "team-core-commit-message" });
       message.createSpan({ text: commit.message || "无提交说明" });
       if (page === 0 && index === 0) message.createSpan({ text: "最新", cls: "team-core-commit-latest" });
+      const changes = row.createEl("td", { cls: "team-core-commit-changes" });
+      const expand = changes.createEl("button", { cls: "team-core-commit-changes-toggle", attr: { "aria-label": `查看 ${commit.shortOid} 的更新内容`, "aria-expanded": "false" } });
+      this.setCommitChangesButton(expand, "查看更新内容", "list-tree");
+      expand.addEventListener("click", () => void this.toggleCommitChanges(repo, commit, row, message, expand));
       row.createEl("td", { text: authorDisplay.display(commit.author), cls: "team-core-commit-author" });
       row.createEl("td", { text: new Date(commit.timestamp).toLocaleString(), cls: "team-core-commit-date" });
       row.createEl("td", { text: commit.shortOid, cls: "team-core-commit-oid" });
@@ -504,6 +525,208 @@ export class TeamCoreCommitHistoryView extends ItemView {
     setIcon(next, "chevron-right");
     next.disabled = !hasNext;
     next.addEventListener("click", () => onPage(page + 1));
+  }
+
+  private async toggleCommitChanges(repo: GitRepository, commit: CommitSummary, row: HTMLTableRowElement, message: HTMLElement, button: HTMLButtonElement): Promise<void> {
+    const existing = row.nextElementSibling;
+    if (existing?.classList.contains("team-core-commit-changes-row")) {
+      existing.remove();
+      this.setCommitChangesButton(button, "查看更新内容", "list-tree");
+      button.setAttr("aria-expanded", "false");
+      return;
+    }
+    const detailRow = row.parentElement?.createEl("tr");
+    if (!detailRow) return;
+    row.insertAdjacentElement("afterend", detailRow);
+    detailRow.addClass("team-core-commit-changes-row");
+    const detail = detailRow.createEl("td", { attr: { colspan: "6" } });
+    detail.createSpan({ text: "正在读取更新内容…", cls: "team-core-commit-changes-loading" });
+    button.disabled = true;
+    button.setAttr("aria-expanded", "true");
+    try {
+      const changes = await repo.commitChanges(commit.oid);
+      detail.empty();
+      this.renderCommitChanges(detail, changes);
+      this.renderCommitTypeIndicators(message, changes);
+      this.setCommitChangesButton(button, "收起更新内容", "chevron-up");
+    } catch (error) {
+      detail.empty();
+      detail.createSpan({ text: `无法读取更新内容：${error instanceof Error ? error.message : String(error)}`, cls: "team-core-commit-changes-error" });
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  private renderCommitChanges(container: HTMLElement, changes: CommitChangeDetails): void {
+    const groups = this.commitChangeGroups(changes);
+    const tabs = container.createDiv("team-core-commit-change-tabs");
+    const tableArea = container.createDiv("team-core-commit-change-table-area");
+    let active = groups.find((group) => group.items.length > 0) ?? groups[0];
+    let page = 0;
+    const tabButtons = new Map<CommitChangeGroupId, HTMLButtonElement>();
+
+    const renderTable = (): void => {
+      tableArea.empty();
+      for (const [id, button] of tabButtons) {
+        const selected = id === active.id;
+        button.classList.toggle("is-active", selected);
+        button.setAttr("aria-selected", String(selected));
+      }
+      if (!active.items.length) {
+        tableArea.createEl("p", { text: `本次提交没有${active.label}。`, cls: "team-core-commit-change-empty" });
+        return;
+      }
+      const pageCount = Math.ceil(active.items.length / this.changeDetailsPageSize);
+      page = Math.min(page, pageCount - 1);
+      const start = page * this.changeDetailsPageSize;
+      const visible = active.items.slice(start, start + this.changeDetailsPageSize);
+      const meta = tableArea.createDiv("team-core-commit-change-table-meta");
+      meta.createSpan({ text: `共 ${active.items.length} 项` });
+      const pageSize = meta.createEl("select", { attr: { "aria-label": "每页显示条数", title: "每页显示条数" } });
+      for (const size of [10, 25, 50]) pageSize.createEl("option", { text: `${size} 条/页`, value: String(size) });
+      pageSize.value = String(this.changeDetailsPageSize);
+      pageSize.addEventListener("change", () => {
+        this.changeDetailsPageSize = Number(pageSize.value);
+        page = 0;
+        renderTable();
+      });
+      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table" });
+      const head = table.createEl("thead").createEl("tr");
+      head.createEl("th", { text: "更新内容" });
+      head.createEl("th", { text: "变更概览" });
+      head.createEl("th", { text: "位置" });
+      const body = table.createEl("tbody");
+      for (const item of visible) {
+        const row = body.createEl("tr");
+        const content = row.createEl("td", { cls: "team-core-commit-change-content" });
+        if (item.documentPath) {
+          const link = content.createSpan({ text: item.text, cls: "team-core-commit-change-link", attr: { role: "link", tabindex: "0", title: item.documentPath } });
+          link.addEventListener("click", () => void this.openChangedDocument(item.documentPath!));
+          link.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            void this.openChangedDocument(item.documentPath!);
+          });
+        } else content.createSpan({ text: item.text, cls: item.muted ? "is-muted" : "" });
+        row.createEl("td", { text: item.summary, cls: item.muted ? "is-muted" : "" });
+        row.createEl("td", { text: item.location, cls: "team-core-commit-change-location" });
+      }
+      if (pageCount > 1) {
+        const pagination = tableArea.createDiv("team-core-commit-change-pagination");
+        this.createCommitChangePageButton(pagination, "跳转到第一页", "chevrons-left", page === 0, () => { page = 0; renderTable(); });
+        this.createCommitChangePageButton(pagination, "上一页", "chevron-left", page === 0, () => { page--; renderTable(); });
+        pagination.createSpan({ text: `${page + 1} / ${pageCount}`, cls: "team-core-commit-change-page-label" });
+        this.createCommitChangePageButton(pagination, "下一页", "chevron-right", page >= pageCount - 1, () => { page++; renderTable(); });
+        this.createCommitChangePageButton(pagination, "跳转到最后一页", "chevrons-right", page >= pageCount - 1, () => { page = pageCount - 1; renderTable(); });
+      }
+    };
+
+    for (const group of groups) {
+      const tab = tabs.createEl("button", { cls: "team-core-commit-change-tab", attr: { role: "tab", "aria-selected": "false" } });
+      const icon = tab.createSpan("team-core-commit-change-tab-icon");
+      setIcon(icon, group.id === "documents" ? "files" : group.id === "attachments" ? "paperclip" : group.id === "settings" ? "sliders-horizontal" : "ellipsis");
+      tab.createSpan({ text: group.label });
+      tab.createSpan({ text: String(group.items.length), cls: "team-core-commit-change-count" });
+      tab.disabled = group.items.length === 0;
+      tab.addEventListener("click", () => {
+        active = group;
+        page = 0;
+        renderTable();
+      });
+      tabButtons.set(group.id, tab);
+    }
+    renderTable();
+  }
+
+  private setCommitChangesButton(button: HTMLButtonElement, label: string, icon: string): void {
+    button.empty();
+    button.setAttr("aria-label", label);
+    button.setAttr("title", label);
+    setIcon(button, icon);
+  }
+
+  private createCommitChangePageButton(container: HTMLElement, label: string, icon: string, disabled: boolean, onClick: () => void): HTMLButtonElement {
+    const button = container.createEl("button", { attr: { "aria-label": label, title: label } });
+    setIcon(button, icon);
+    button.disabled = disabled;
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  private commitChangeGroups(changes: CommitChangeDetails): CommitChangeGroup[] {
+    const documents: CommitChangeItem[] = changes.documentChanges.map((change) => ({
+      text: `更改 ${this.documentLabel(change.path)}`,
+      summary: this.documentChangeSummary(change),
+      location: this.documentLocation(change.path),
+      documentPath: change.path
+    }));
+    const documentChangeByPath = new Map(changes.documentChanges.map((change) => [change.path, change]));
+    const attachments: CommitChangeItem[] = changes.attachmentDocumentPaths.map((path) => ({
+      text: `更改 ${this.documentLabel(path)} 附件`,
+      summary: "关联文档中的附件引用发生变化",
+      location: this.documentLocation(path),
+      documentPath: path,
+      muted: documentChangeByPath.get(path)?.status === "deleted"
+    }));
+    const settings: CommitChangeItem[] = [
+      ...changes.pluginChanges.map((plugin) => ({
+        text: `更改 ${plugin.name} 设置`,
+        summary: `${plugin.version ? `版本 ${plugin.version} · ` : ""}涉及 ${plugin.changedFileCount} 个文件`,
+        location: "公共插件"
+      })),
+      ...(changes.sharedPluginStateChanged ? [{ text: "更改公共插件启用状态", summary: "团队共享的启用状态已调整", location: "公共插件" }] : []),
+      ...(changes.sharedPluginRulesChanged ? [{ text: "更改公共插件同步规则", summary: "共享插件白名单规则已调整", location: "同步配置" }] : []),
+      ...(changes.fileAuthorsChanged ? [{ text: "更改文件作者归属", summary: "文档作者归属记录已调整", location: "同步配置" }] : [])
+    ];
+    const other: CommitChangeItem[] = [
+      ...(changes.hasUnassociatedAttachmentChanges ? [{ text: "更改附件（未关联文档）", summary: "未在本次变更的文档中找到引用", location: "附件区", muted: true }] : []),
+      ...(changes.hasOtherChanges ? [{ text: "更改团队同步元数据", summary: "不属于文档、附件或公共插件的同步变更", location: "同步配置", muted: true }] : [])
+    ];
+    return [
+      { id: "documents", label: "文档更改", items: documents },
+      { id: "attachments", label: "附件更改", items: attachments },
+      { id: "settings", label: "设置更改", items: settings },
+      { id: "other", label: "其他改动", items: other }
+    ];
+  }
+
+  private renderCommitTypeIndicators(container: HTMLElement, changes: CommitChangeDetails): void {
+    container.querySelector(".team-core-commit-type-indicators")?.remove();
+    const indicator = container.createSpan("team-core-commit-type-indicators");
+    for (const group of this.commitChangeGroups(changes)) {
+      if (!group.items.length) continue;
+      const item = indicator.createSpan({ cls: "team-core-commit-type-indicator", attr: { title: `${group.label}：${group.items.length} 项`, "aria-label": `${group.label}：${group.items.length} 项` } });
+      setIcon(item, group.id === "documents" ? "file-text" : group.id === "attachments" ? "paperclip" : group.id === "settings" ? "sliders-horizontal" : "ellipsis");
+      item.createSpan({ text: String(group.items.length) });
+    }
+  }
+
+  private documentChangeSummary(change: CommitDocumentChange): string {
+    if (change.status === "added") return `新增 · ${change.currentLineCount ?? 0} 行`;
+    if (change.status === "deleted") return `删除 · 原 ${change.previousLineCount ?? 0} 行`;
+    const previous = change.previousLineCount ?? 0;
+    const current = change.currentLineCount ?? 0;
+    const delta = current - previous;
+    return `修改 · ${previous} -> ${current} 行${delta === 0 ? "" : `（${delta > 0 ? "+" : ""}${delta}）`}`;
+  }
+
+  private documentLocation(path: string): string {
+    const parent = path.split("/").slice(0, -1).join("/");
+    return parent || "根目录";
+  }
+
+  private async openChangedDocument(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      new Notice("当前知识库中未找到该文档，可能已在后续提交中删除或移动");
+      return;
+    }
+    await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  private documentLabel(path: string): string {
+    const filename = path.split("/").pop() ?? path;
+    return filename.replace(/\.md$/i, "");
   }
 }
 
@@ -615,11 +838,15 @@ type TeamCorePluginHost = Plugin & {
   teamCoreSettings: TeamCoreSettings;
   coordinator: SyncCoordinator;
   saveSettings(): Promise<void>;
+  syncPrivateNotes(): Promise<void>;
+  pullPrivateNotes(): Promise<void>;
+  confirmPrivateRemoteOverwrite(): Promise<void>;
   refreshAuthorDisplays(): void;
   confirmRemoteOverwrite(): Promise<void>;
 };
 
 type TextSettingKey = "gitUrl" | "gitUsername" | "gitPassword" | "s3Endpoint" | "s3Region" | "s3Bucket" | "s3Prefix" | "s3AccessKey" | "s3SecretKey";
+type PrivateTextSettingKey = "privateWebdavUrl" | "privateWebdavUsername" | "privateWebdavPassword" | "privateS3Endpoint" | "privateS3Region" | "privateS3Bucket" | "privateS3Prefix" | "privateS3AccessKey" | "privateS3SecretKey";
 
 export class TeamCoreSettingTab extends PluginSettingTab {
   private readonly teamCorePlugin: TeamCorePluginHost;
@@ -652,6 +879,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
         this.numberDefinition("自动同步（分钟）", "syncIntervalMs", 300_000),
         this.remoteOverwriteDefinition()
       ]),
+      this.group("私人笔记多端同步", this.privateSyncDefinitions()),
       this.group("团队公共插件", [this.sharedPluginsDefinition()]),
       this.group("Git 作者显示", [this.authorDisplayMappingsDefinition()]),
       this.group("快速导入 / 导出", [this.transferDefinition()])
@@ -679,6 +907,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     this.addNumberControl(new Setting(containerEl).setName("保存消抖（分钟）"), "debounceMs", 60_000);
     this.addNumberControl(new Setting(containerEl).setName("自动同步（分钟）"), "syncIntervalMs", 300_000);
     this.addRemoteOverwriteEntry(new Setting(containerEl).setName("重置本地并重新同步"));
+    this.renderPrivateSyncSettings(containerEl);
     new Setting(containerEl).setName("团队公共插件").setHeading();
     this.addSharedPluginsEntry(new Setting(containerEl).setName("公共插件管理"));
     new Setting(containerEl).setName("Git 作者显示").setHeading();
@@ -753,6 +982,77 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     };
   }
 
+  private privateSyncDefinitions(): SettingDefinition[] {
+    const definitions: SettingDefinition[] = [{
+      name: "启用私人笔记多端同步",
+      desc: "默认关闭。开启后，“私人笔记/”会通过你自己的 WebDAV 或 S3 账号同步，不会进入团队 Git、团队 S3 或团队配置字符串。",
+      aliases: ["私人同步", "WebDAV", "私人 S3"],
+      render: (setting) => this.addPrivateToggle(setting)
+    }];
+    if (!this.teamPlugin.teamCoreSettings.privateSyncEnabled) return definitions;
+    definitions.push({
+      name: "随公共知识库一并同步",
+      desc: "默认关闭。开启后，普通同步、初始化、远端导入和重置本地公共知识库会执行对应的私人笔记同步操作。",
+      render: (setting) => this.addPrivateFollowToggle(setting)
+    });
+    definitions.push({ name: "同步方式", render: (setting) => this.addPrivateProviderControl(setting) });
+    if (this.teamPlugin.teamCoreSettings.privateSyncProvider === "webdav") {
+      definitions.push(
+        { name: "WebDAV 地址", render: (setting) => this.addPrivateTextControl(setting, "privateWebdavUrl", false) },
+        { name: "WebDAV 用户名", render: (setting) => this.addPrivateTextControl(setting, "privateWebdavUsername", false) },
+        { name: "WebDAV 密码", render: (setting) => this.addPrivateTextControl(setting, "privateWebdavPassword", true) }
+      );
+    } else {
+      for (const key of ["privateS3Endpoint", "privateS3Region", "privateS3Bucket", "privateS3Prefix", "privateS3AccessKey", "privateS3SecretKey"] as const) {
+        definitions.push({ name: this.privateS3Name(key), render: (setting) => this.addPrivateTextControl(setting, key, key === "privateS3AccessKey" || key === "privateS3SecretKey") });
+      }
+    }
+    definitions.push(this.privateTransferDefinition());
+    definitions.push({
+      name: "立即同步私人笔记",
+      desc: "仅同步“私人笔记/”，不会提交或拉取团队知识库。",
+      render: (setting) => this.addPrivateSyncAction(setting)
+    });
+    definitions.push({
+      name: "从远端导入私人笔记",
+      desc: "只下载远端新增或更新的私人笔记，不向远端上传或删除文件。",
+      render: (setting) => this.addPrivatePullAction(setting)
+    });
+    definitions.push({
+      name: "重置私人笔记并重新同步",
+      desc: "清空本地“私人笔记/”后从远端完整恢复，远端不会修改。",
+      render: (setting) => this.addPrivateOverwriteAction(setting)
+    });
+    return definitions;
+  }
+
+  private renderPrivateSyncSettings(container: HTMLElement): void {
+    new Setting(container).setName("私人笔记多端同步").setHeading();
+    const toggle = new Setting(container).setName("启用私人笔记多端同步").setDesc("默认关闭。开启后，“私人笔记/”会通过你自己的 WebDAV 或 S3 账号同步，不会进入团队 Git、团队 S3 或团队配置字符串。");
+    this.addPrivateToggle(toggle);
+    if (!this.teamPlugin.teamCoreSettings.privateSyncEnabled) return;
+    this.addPrivateFollowToggle(new Setting(container).setName("随公共知识库一并同步").setDesc("默认关闭。开启后，普通同步、初始化、远端导入和重置本地公共知识库会执行对应的私人笔记同步操作。"));
+    const provider = new Setting(container).setName("同步方式").setDesc("仅同步“私人笔记/”目录。切换方式会重置本机同步快照，不会删除任何文件。");
+    this.addPrivateProviderControl(provider);
+    if (this.teamPlugin.teamCoreSettings.privateSyncProvider === "webdav") {
+      this.addPrivateTextControl(new Setting(container).setName("WebDAV 地址").setDesc("填写 WebDAV collection 地址，例如 nextcloud 的 WebDAV 文件目录。插件会在其中自动创建私人同步目录。"), "privateWebdavUrl", false);
+      this.addPrivateTextControl(new Setting(container).setName("WebDAV 用户名"), "privateWebdavUsername", false);
+      this.addPrivateTextControl(new Setting(container).setName("WebDAV 密码"), "privateWebdavPassword", true);
+    } else {
+      for (const key of ["privateS3Endpoint", "privateS3Region", "privateS3Bucket", "privateS3Prefix", "privateS3AccessKey", "privateS3SecretKey"] as const) {
+        this.addPrivateTextControl(new Setting(container).setName(this.privateS3Name(key)), key, key === "privateS3AccessKey" || key === "privateS3SecretKey");
+      }
+    }
+    this.addPrivateTransferControl(new Setting(container).setName("私人笔记配置字符串"));
+    this.addPrivateSyncAction(new Setting(container).setName("立即同步私人笔记").setDesc("仅同步“私人笔记/”，不会提交或拉取团队知识库。"));
+    this.addPrivatePullAction(new Setting(container).setName("从远端导入私人笔记").setDesc("只下载远端新增或更新的私人笔记，不向远端上传或删除文件。"));
+    this.addPrivateOverwriteAction(new Setting(container).setName("重置私人笔记并重新同步").setDesc("清空本地“私人笔记/”后从远端完整恢复，远端不会修改。"));
+  }
+
+  private privateTransferDefinition(): SettingDefinition {
+    return { name: "私人笔记配置字符串", desc: "仅导入或导出你的私人 WebDAV/S3 设置，不包含团队配置或同步快照。", render: (setting) => this.addPrivateTransferControl(setting) };
+  }
+
   private addSharedPluginsEntry(setting: Setting): void {
     setting.setDesc("仅供负责维护团队插件配置的核心成员使用。");
     setting.addButton((button) => {
@@ -820,6 +1120,47 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     exportButton.addEventListener("click", () => void navigator.clipboard.writeText(exportSettings(this.teamPlugin.teamCoreSettings)).then(() => new Notice("配置字符串已复制")));
   }
 
+  private addPrivateTransferControl(transfer: Setting): void {
+    transfer.setDesc("仅包含你的私人 WebDAV/S3 凭据，不包含团队 Git/S3 配置或同步快照。字符串未加密，请只通过可信私密渠道保存和传递。");
+    transfer.setClass("team-core-config-transfer");
+    const input = transfer.controlEl.createEl("input", { type: "text", placeholder: "粘贴私人笔记配置字符串", cls: "team-core-config-input" });
+    input.setAttr("aria-label", "私人笔记配置字符串");
+    const importButton = transfer.controlEl.createEl("button", { text: "导入私人配置", cls: "team-core-config-action" });
+    importButton.type = "button";
+    importButton.addEventListener("click", () => {
+      try {
+        this.teamPlugin.teamCoreSettings = importPrivateSettings(input.value, this.teamPlugin.teamCoreSettings);
+        this.resetPrivateSyncState();
+        void this.teamPlugin.saveSettings().then(() => { new Notice("私人笔记配置已导入"); this.refreshSettings(); });
+      } catch (error) { new Notice(error instanceof Error ? error.message : "私人笔记配置导入失败"); }
+    });
+    const exportButton = transfer.controlEl.createEl("button", { text: "复制私人配置", cls: "team-core-config-action" });
+    exportButton.type = "button";
+    exportButton.addEventListener("click", () => void navigator.clipboard.writeText(exportPrivateSettings(this.teamPlugin.teamCoreSettings)).then(() => new Notice("私人笔记配置字符串已复制")));
+  }
+
+  private addPrivateSyncAction(setting: Setting): void {
+    setting.addButton((button) => {
+      button.setButtonText("同步私人笔记").setCta();
+      button.onClick(() => void this.teamPlugin.syncPrivateNotes());
+    });
+  }
+
+  private addPrivatePullAction(setting: Setting): void {
+    setting.addButton((button) => {
+      button.setButtonText("从远端导入");
+      button.onClick(() => void this.teamPlugin.pullPrivateNotes());
+    });
+  }
+
+  private addPrivateOverwriteAction(setting: Setting): void {
+    setting.addButton((button) => {
+      button.setButtonText("清空并从远端恢复");
+      button.buttonEl.addClass("team-core-destructive-button");
+      button.onClick(() => void this.teamPlugin.confirmPrivateRemoteOverwrite());
+    });
+  }
+
   private refreshSettings(): void {
     const update = (this as { update?: () => void }).update;
     if (typeof update === "function") update.call(this);
@@ -884,6 +1225,19 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     });
   }
 
+  private addPrivateTextControl(setting: Setting, key: PrivateTextSettingKey, secret: boolean): void {
+    setting.addText((component) => {
+      component.setValue(this.teamPlugin.teamCoreSettings[key]);
+      component.inputEl.type = secret ? "password" : "text";
+      component.onChange(async (value) => {
+        if (this.teamPlugin.teamCoreSettings[key] === value) return;
+        this.teamPlugin.teamCoreSettings[key] = value;
+        this.resetPrivateSyncState();
+        await this.teamPlugin.saveSettings();
+      });
+    });
+  }
+
   private addNumberControl(setting: Setting, key: "debounceMs" | "syncIntervalMs", defaultMs: number): void {
     setting.addText((component) => {
       component.setValue(String(Math.round(this.teamPlugin.teamCoreSettings[key] / 60_000) || defaultMs / 60_000));
@@ -906,6 +1260,59 @@ export class TeamCoreSettingTab extends PluginSettingTab {
         await this.teamPlugin.saveSettings();
       });
     });
+  }
+
+  private addPrivateToggle(setting: Setting): void {
+    setting.addToggle((component) => {
+      component.setValue(this.teamPlugin.teamCoreSettings.privateSyncEnabled);
+      component.onChange(async (enabled) => {
+        this.teamPlugin.teamCoreSettings.privateSyncEnabled = enabled;
+        this.resetPrivateSyncState();
+        await this.teamPlugin.saveSettings();
+        this.refreshSettings();
+      });
+    });
+  }
+
+  private addPrivateFollowToggle(setting: Setting): void {
+    setting.addToggle((component) => {
+      component.setValue(this.teamPlugin.teamCoreSettings.privateSyncWithTeam);
+      component.onChange(async (enabled) => {
+        this.teamPlugin.teamCoreSettings.privateSyncWithTeam = enabled;
+        await this.teamPlugin.saveSettings();
+      });
+    });
+  }
+
+  private addPrivateProviderControl(setting: Setting): void {
+    setting.addDropdown((dropdown) => {
+      dropdown.addOption("webdav", "WebDAV");
+      dropdown.addOption("s3", "S3 对象存储");
+      dropdown.setValue(this.teamPlugin.teamCoreSettings.privateSyncProvider);
+      dropdown.onChange(async (value) => {
+        const provider = value === "s3" ? "s3" : "webdav";
+        if (this.teamPlugin.teamCoreSettings.privateSyncProvider === provider) return;
+        this.teamPlugin.teamCoreSettings.privateSyncProvider = provider;
+        this.resetPrivateSyncState();
+        await this.teamPlugin.saveSettings();
+        this.refreshSettings();
+      });
+    });
+  }
+
+  private resetPrivateSyncState(): void {
+    this.teamPlugin.teamCoreSettings.privateSyncState = { version: 1, entries: {} };
+  }
+
+  private privateS3Name(key: PrivateTextSettingKey): string {
+    return ({
+      privateS3Endpoint: "S3 Endpoint",
+      privateS3Region: "S3 Region",
+      privateS3Bucket: "S3 Bucket / Space",
+      privateS3Prefix: "S3 Prefix",
+      privateS3AccessKey: "S3 Access Key",
+      privateS3SecretKey: "S3 Secret Key"
+    } as Partial<Record<PrivateTextSettingKey, string>>)[key] ?? key;
   }
 }
 

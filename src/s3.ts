@@ -182,6 +182,24 @@ export class S3Transport {
     }
   }
 
+  /** General object operations used only by the user-owned private-note store. */
+  async readObject(key: string): Promise<ArrayBuffer | undefined> {
+    const response = await this.request("GET", key);
+    if (response.status === 404) return undefined;
+    if (response.status < 200 || response.status >= 300) throw await this.httpError("GET", key, response);
+    return response.arrayBuffer;
+  }
+
+  async writeObject(key: string, data: ArrayBuffer, contentType = "application/octet-stream"): Promise<void> {
+    const response = await this.request("PUT", key, data, contentType);
+    if (response.status < 200 || response.status >= 300) throw await this.httpError("PUT", key, response);
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    const response = await this.request("DELETE", key);
+    if (response.status !== 404 && (response.status < 200 || response.status >= 300)) throw await this.httpError("DELETE", key, response);
+  }
+
   private async request(method: string, key: string, body?: ArrayBuffer, contentType?: string, query: Record<string, string> = {}, extraHeaders: Record<string, string> = {}): Promise<S3Response> {
     if (!this.enabled()) throw new Error("S3 settings are incomplete");
     const canonicalQuery = Object.entries(query)

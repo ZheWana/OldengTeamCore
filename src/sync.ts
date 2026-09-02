@@ -5,7 +5,8 @@ import { GitRepository, isPushReconciliationError, type ConflictEditorSession, t
 import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError, S3Transport } from "./s3";
-import type { AssetManifest, AssetManifestEntry, Logger, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
+import { PrivateNotesSynchronizer } from "./private-sync";
+import type { AssetManifest, AssetManifestEntry, Logger, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
@@ -14,6 +15,7 @@ export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
   onNotice(message: string): void;
   onRestartRequired(): void;
+  onPrivateSyncState(state: PrivateSyncState): void;
 }
 
 export interface ConnectionInfo {
@@ -198,6 +200,11 @@ export function shouldTrackVaultEvent(path: string, configDir: string, sharedPlu
     && (isAssetPath(normalized) || isManagedPath(normalized, configDir, sharedPluginIds));
 }
 
+/** Private Vault events are local-only unless the optional private sync is enabled. */
+export function shouldTrackPrivateSyncEvent(settings: Pick<TeamCoreSettings, "privateSyncEnabled">): boolean {
+  return settings.privateSyncEnabled;
+}
+
 export function shouldPublishPrivateDraftRename(
   previousPath: string,
   currentPath: string,
@@ -228,6 +235,7 @@ export class SyncCoordinator {
   private state: SyncState = "uninitialized";
   private pendingFiles = new Set<string>();
   private pendingAssets = new Set<string>();
+  private privateSyncDirty = false;
   private internalMarkdownWrites = new Set<string>();
   private internalAssetWrites = new Set<string>();
   private internalDraftNoteMoves = new Set<string>();
@@ -237,6 +245,8 @@ export class SyncCoordinator {
   private internalCommunityPluginWriteDepth = 0;
   private debounceTimer: number | undefined;
   private periodicTimer: number | undefined;
+  private privateDebounceTimer: number | undefined;
+  private privatePeriodicTimer: number | undefined;
   private running: Promise<void> | undefined;
   private lastError = "";
   private lastSyncAt: number | undefined;
@@ -261,22 +271,39 @@ export class SyncCoordinator {
 
   start(): void {
     this.stop();
-    if (!this.settings().autoSync) return;
-    if (this.pendingFiles.size || this.pendingAssets.size) {
+    const settings = this.settings();
+    if (!settings.autoSync) return;
+    if (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam)) {
       this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
     }
-    this.periodicTimer = window.setInterval(() => void this.runCycle(false), this.settings().syncIntervalMs);
+    if (this.privateSyncDirty && settings.privateSyncEnabled && !settings.privateSyncWithTeam) {
+      this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.debounceMs);
+    }
+    this.periodicTimer = window.setInterval(() => void this.runCycle(false), settings.syncIntervalMs);
+    if (settings.privateSyncEnabled && !settings.privateSyncWithTeam) {
+      this.privatePeriodicTimer = window.setInterval(() => void this.syncPrivateNotes().catch(() => undefined), settings.syncIntervalMs);
+    }
   }
 
   stop(): void {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     if (this.periodicTimer !== undefined) window.clearInterval(this.periodicTimer);
+    if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
+    if (this.privatePeriodicTimer !== undefined) window.clearInterval(this.privatePeriodicTimer);
     this.debounceTimer = undefined;
     this.periodicTimer = undefined;
+    this.privateDebounceTimer = undefined;
+    this.privatePeriodicTimer = undefined;
   }
 
   markFileChanged(file: TFile): void {
     const path = normalizeVaultPath(file.path);
+    if (isPrivatePath(path)) {
+      if (!shouldTrackPrivateSyncEvent(this.settings())) return;
+      this.privateSyncDirty = true;
+      this.schedulePrivateSync();
+      return;
+    }
     if (isCommunityPluginStatePath(path, this.app.vault.configDir)) {
       if (this.internalCommunityPluginWriteDepth > 0) return;
       this.pendingFiles.add(SHARED_PLUGIN_STATE_PATH);
@@ -323,6 +350,12 @@ export class SyncCoordinator {
     if (this.internalDraftNoteMoves.has(previous) || this.internalDraftNoteMoves.has(current)) {
       this.internalDraftNoteMoves.delete(previous);
       this.internalDraftNoteMoves.delete(current);
+      return;
+    }
+    if (isPrivatePath(previous) && isPrivatePath(current)) {
+      if (!shouldTrackPrivateSyncEvent(this.settings())) return;
+      this.privateSyncDirty = true;
+      this.schedulePrivateSync();
       return;
     }
     if (this.internalAssetWrites.has(previous) || this.internalAssetWrites.has(current)) {
@@ -397,6 +430,12 @@ export class SyncCoordinator {
 
   markFolderDeleted(path: string): void {
     const normalized = normalizeVaultPath(path);
+    if (isPrivatePath(normalized)) {
+      if (!shouldTrackPrivateSyncEvent(this.settings())) return;
+      this.privateSyncDirty = true;
+      this.schedulePrivateSync();
+      return;
+    }
     if (!isAssetPath(normalized) && !isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds)) return;
     this.pendingFiles.add(normalized);
     this.fullAttachmentScanPending = true;
@@ -442,18 +481,86 @@ export class SyncCoordinator {
     this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
   }
 
+  private schedulePrivateSync(): void {
+    const settings = this.settings();
+    if (!shouldTrackPrivateSyncEvent(settings)) {
+      this.privateSyncDirty = false;
+      return;
+    }
+    if (settings.privateSyncWithTeam) {
+      this.scheduleSync();
+      return;
+    }
+    if (this.state !== "conflict") this.setState("local-changes");
+    if (!settings.autoSync) return;
+    if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
+    this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.debounceMs);
+  }
+
   async flushDebounce(): Promise<void> {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = undefined;
-    if (this.pendingFiles.size || this.pendingAssets.size) await this.runCycle(true);
+    if (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam)) await this.runCycle(true);
+  }
+
+  private async flushPrivateDebounce(): Promise<void> {
+    if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
+    this.privateDebounceTimer = undefined;
+    if (this.privateSyncDirty && this.settings().privateSyncEnabled && !this.settings().privateSyncWithTeam) {
+      await this.syncPrivateNotes();
+    }
   }
 
   async runManual(): Promise<void> {
-    if (this.debounceTimer !== undefined && (this.pendingFiles.size || this.pendingAssets.size)) {
+    if (this.debounceTimer !== undefined && (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam))) {
       await this.flushDebounce();
       return;
     }
     await this.runCycle(true);
+  }
+
+  async syncPrivateNotes(): Promise<void> {
+    if (!this.settings().privateSyncEnabled) throw new Error("请先在设置中启用“私人笔记多端同步”");
+    await this.runExclusive(async () => {
+      this.progress = undefined;
+      this.setState("syncing");
+      try {
+        await this.executePrivateNotesSync(this.createVault());
+        this.privateSyncDirty = false;
+        this.lastError = "";
+        this.progress = undefined;
+        await this.refreshState();
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+        this.progress = undefined;
+        this.setState(this.isOffline(error) ? "offline" : "error");
+        this.logger.error("Private note synchronization failed", { error: this.lastError });
+        throw error;
+      }
+    });
+  }
+
+  async pullPrivateNotes(overwrite = false): Promise<void> {
+    if (!this.settings().privateSyncEnabled) throw new Error("请先在设置中启用“私人笔记多端同步”");
+    await this.runExclusive(async () => {
+      this.progress = undefined;
+      this.setState("syncing");
+      try {
+        const vault = this.createVault();
+        if (overwrite) await this.clearPrivateNotesForRemotePull(vault);
+        await this.executePrivateNotesPull(vault);
+        this.privateSyncDirty = false;
+        this.lastError = "";
+        this.progress = undefined;
+        await this.refreshState();
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+        this.progress = undefined;
+        this.setState(this.isOffline(error) ? "offline" : "error");
+        this.logger.error("Private note remote pull failed", { error: this.lastError, overwrite });
+        throw error;
+      }
+    });
   }
 
   async normalizeAllAttachments(): Promise<void> {
@@ -567,6 +674,10 @@ export class SyncCoordinator {
       this.startProgress("推送到远端", 1);
       await git.push();
       this.advanceProgress();
+      if (settings.privateSyncEnabled && settings.privateSyncWithTeam) {
+        await this.executePrivateNotesSync(vault);
+        this.privateSyncDirty = false;
+      }
       this.progress = undefined;
       this.setState("synced");
     } catch (error) {
@@ -639,6 +750,11 @@ export class SyncCoordinator {
       this.startProgress("整理本地目录", 1);
       await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
       this.advanceProgress();
+      if (this.settings().privateSyncEnabled && this.settings().privateSyncWithTeam) {
+        if (force) await this.clearPrivateNotesForRemotePull(vault);
+        await this.executePrivateNotesPull(vault);
+        this.privateSyncDirty = false;
+      }
       this.lastSyncAt = Date.now();
       this.lastError = "";
       this.progress = undefined;
@@ -745,6 +861,10 @@ export class SyncCoordinator {
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const git = this.createRepository(vault, settings);
       if (!(await git.exists())) {
+        if (settings.privateSyncEnabled && settings.privateSyncWithTeam) {
+          await this.executePrivateNotesSync(vault);
+          this.privateSyncDirty = false;
+        }
         this.progress = undefined;
         this.setState("uninitialized");
         return;
@@ -812,11 +932,15 @@ export class SyncCoordinator {
       }
       const active = this.app.workspace.getActiveFile();
       if (active) this.currentAuthor = (await git.log(active.path, 1))[0]?.author;
+      if (settings.privateSyncEnabled && settings.privateSyncWithTeam) {
+        await this.executePrivateNotesSync(vault);
+        this.privateSyncDirty = false;
+      }
       this.lastSyncAt = Date.now();
       this.lastError = "";
       this.progress = undefined;
       const remainingChanges = await git.hasUncommittedChanges();
-      const queuedChanges = this.pendingFiles.size > 0 || this.pendingAssets.size > 0 || this.fullAttachmentScanPending;
+      const queuedChanges = this.pendingFiles.size > 0 || this.pendingAssets.size > 0 || this.fullAttachmentScanPending || (this.privateSyncDirty && settings.privateSyncWithTeam);
       this.setState(remainingChanges || queuedChanges ? "local-changes" : "synced");
       if (!remainingChanges && !queuedChanges) this.notifyRestartRequired();
     } catch (error) {
@@ -848,6 +972,42 @@ export class SyncCoordinator {
     await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
     await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
     return { conflicts: [], deferred: false };
+  }
+
+  private async executePrivateNotesSync(vault: BinaryVault): Promise<void> {
+    const settings = this.settings();
+    if (!settings.privateSyncEnabled) return;
+    this.startProgress("同步私人笔记", 1);
+    const result = await new PrivateNotesSynchronizer(settings, this.logger).sync(vault, settings.privateSyncState, (current, total, path) => {
+      this.updateProgress("同步私人笔记", current, total, path);
+    });
+    this.callbacks.onPrivateSyncState(result.state);
+    this.logger.debug("Private note synchronization completed", {
+      uploaded: result.uploaded,
+      downloaded: result.downloaded,
+      deletedRemote: result.deletedRemote,
+      deletedLocal: result.deletedLocal,
+      conflictsResolved: result.conflictsResolved
+    });
+  }
+
+  private async executePrivateNotesPull(vault: BinaryVault): Promise<void> {
+    const settings = this.settings();
+    if (!settings.privateSyncEnabled) return;
+    this.startProgress("从远端导入私人笔记", 1);
+    const result = await new PrivateNotesSynchronizer(settings, this.logger).pull(vault, settings.privateSyncState, (current, total, path) => {
+      this.updateProgress("从远端导入私人笔记", current, total, path);
+    });
+    this.callbacks.onPrivateSyncState(result.state);
+    this.logger.debug("Private note remote pull completed", { downloaded: result.downloaded, deletedLocal: result.deletedLocal });
+  }
+
+  private async clearPrivateNotesForRemotePull(vault: BinaryVault): Promise<void> {
+    const existing = await vault.stat(PRIVATE_FOLDER);
+    this.startProgress("清理本地私人笔记", 1);
+    if (existing) await vault.rmdir(PRIVATE_FOLDER, true);
+    await vault.mkdir(PRIVATE_FOLDER);
+    this.advanceProgress(existing ? PRIVATE_FOLDER : "无需清理私人笔记");
   }
 
   private async ensureSharedPluginState(vault: BinaryVault): Promise<void> {

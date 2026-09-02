@@ -51,7 +51,11 @@ export default class TeamCorePlugin extends Plugin {
     this.coordinator = new SyncCoordinator(this.app, () => this.teamCoreSettings, {
       onSnapshot: (snapshot) => this.updateSnapshot(snapshot),
       onNotice: (message) => new Notice(message),
-      onRestartRequired: () => this.openRestartRequiredModal()
+      onRestartRequired: () => this.openRestartRequiredModal(),
+      onPrivateSyncState: (state) => {
+        this.teamCoreSettings.privateSyncState = state;
+        void this.saveSettings();
+      }
     }, this.logger);
     this.authorService = this.createFileAuthorService();
     this.addSettingTab(new TeamCoreSettingTab(this.app, this));
@@ -62,6 +66,9 @@ export default class TeamCorePlugin extends Plugin {
       () => this.authorDisplayService()
     ));
     this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.handleSyncAction() });
+    this.addCommand({ id: "sync-private-notes", name: "仅同步私人笔记", callback: () => void this.syncPrivateNotes() });
+    this.addCommand({ id: "pull-private-notes", name: "从远端导入私人笔记", callback: () => void this.pullPrivateNotes() });
+    this.addCommand({ id: "overwrite-private-notes", name: "重置私人笔记并重新同步", callback: () => void this.confirmPrivateRemoteOverwrite() });
     this.addCommand({ id: "resolve-conflicts", name: "解决同步冲突", callback: () => void this.openConflictEditor() });
     this.addCommand({ id: "normalize-attachments", name: "规范化全部附件", callback: () => void this.coordinator.normalizeAllAttachments() });
     this.registerView(COMMIT_HISTORY_VIEW_TYPE, (leaf) => new TeamCoreCommitHistoryView(
@@ -267,6 +274,40 @@ export default class TeamCorePlugin extends Plugin {
     await this.coordinator.runManual();
   }
 
+  async syncPrivateNotes(): Promise<void> {
+    try {
+      await this.coordinator.syncPrivateNotes();
+      new Notice("私人笔记同步完成");
+    } catch (error) {
+      new Notice(`私人笔记同步失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
+    }
+  }
+
+  async pullPrivateNotes(): Promise<void> {
+    try {
+      await this.coordinator.pullPrivateNotes();
+      new Notice("已从远端导入私人笔记");
+    } catch (error) {
+      new Notice(`导入私人笔记失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
+    }
+  }
+
+  async confirmPrivateRemoteOverwrite(): Promise<void> {
+    if (!this.teamCoreSettings.privateSyncEnabled) { new Notice("请先在设置中启用“私人笔记多端同步”"); return; }
+    if (!await requestConfirmation(this.app, {
+      title: "重置本地私人笔记",
+      message: "远端私人笔记不会修改。本机“私人笔记/”中的内容将被清空，再从你配置的 WebDAV 或 S3 完整下载。请先确认本地未同步内容不需要保留。",
+      confirmText: "清空并从远端恢复",
+      destructive: true
+    })) return;
+    try {
+      await this.coordinator.pullPrivateNotes(true);
+      new Notice("本地私人笔记已从远端恢复");
+    } catch (error) {
+      new Notice(`重置私人笔记失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
+    }
+  }
+
   private async openConflictEditor(): Promise<void> {
     if (this.conflictEditor || this.openingConflictEditor) return;
     this.openingConflictEditor = true;
@@ -352,18 +393,24 @@ export default class TeamCorePlugin extends Plugin {
         return;
       }
       if (!info.localHasManagedFiles) {
+        const privateImport = this.teamCoreSettings.privateSyncEnabled && this.teamCoreSettings.privateSyncWithTeam
+          ? "同时会从远端导入私人笔记，不会向私人远端上传或删除文件。"
+          : "私人笔记保持独立，不会处理。";
         if (!await requestConfirmation(this.app, {
           title: "导入远端知识库",
-          message: "本地知识库为空，将从远端导入，是否继续？",
+          message: `本地知识库为空，将从远端导入。${privateImport}是否继续？`,
           confirmText: "开始导入"
         })) return;
         await this.coordinator.cloneRemote();
       } else {
         const path = this.coordinator.getVaultBasePath();
         const location = path ? `\n\n备份目录：${path}` : "";
+        const privateReset = this.teamCoreSettings.privateSyncEnabled && this.teamCoreSettings.privateSyncWithTeam
+          ? "本地私人笔记也会清空并从其私人远端恢复。"
+          : "私人笔记和私人远端均会保留。";
         if (!await requestConfirmation(this.app, {
           title: "确认重置本地知识库",
-          message: `远端 Git 与 S3 不会修改。本地已有内容，请先备份。${location}\n\n确定后将清空本地公共知识库和 Git 元数据，保留 Obsidian 配置、私人笔记和本地回收站，再从远端完整下载。`,
+          message: `远端 Git 与 S3 不会修改。本地已有内容，请先备份。${location}\n\n确定后将清空本地公共知识库和 Git 元数据，再从远端完整下载。${privateReset}`,
           confirmText: "清空并重新同步",
           destructive: true
         })) return;
@@ -384,9 +431,12 @@ export default class TeamCorePlugin extends Plugin {
       }
       const path = this.coordinator.getVaultBasePath();
       const location = path ? `\n\n备份目录：${path}` : "";
+      const privateReset = this.teamCoreSettings.privateSyncEnabled && this.teamCoreSettings.privateSyncWithTeam
+        ? "本地私人笔记也会清空并从其私人远端恢复。"
+        : "私人笔记和私人远端均会保留。";
       if (!await requestConfirmation(this.app, {
         title: "重置本地知识库并重新同步",
-        message: `远端 Git 与 S3 不会修改。将清空本地公共知识库和 Git 元数据，保留 Obsidian 配置、私人笔记和本地回收站，再从远端完整下载。请确认已备份本地知识库。${location}`,
+        message: `远端 Git 与 S3 不会修改。将清空本地公共知识库和 Git 元数据，再从远端完整下载。${privateReset}请确认已备份本地知识库。${location}`,
         confirmText: "清空并重新同步",
         destructive: true
       })) return;

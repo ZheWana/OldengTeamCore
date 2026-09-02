@@ -1,8 +1,8 @@
 import git, { TREE, walk, type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
 import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
-import type { AssetManifest, Logger, CommitSummary, TeamCoreSettings } from "./types";
-import { isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
+import type { AssetManifest, CommitChangeDetails, CommitDocumentChange, CommitPluginChange, Logger, CommitSummary, TeamCoreSettings } from "./types";
+import { collectMarkdownReferences, isAssetPath, isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
 import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
 import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
@@ -137,6 +137,13 @@ function parseManifestContent(value: string): AssetManifest | undefined {
   } catch {
     return undefined;
   }
+}
+
+function countTextLines(text: string): number {
+  if (!text.length) return 0;
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines.length;
 }
 
 function teamCoreMergeDriver(params: MergeDriverParams, configDir: string): { cleanMerge: boolean; mergedText: string } {
@@ -867,6 +874,132 @@ export class GitRepository {
 
   async logSince(since: number, filepath?: string): Promise<CommitSummary[]> {
     return this.log(filepath, undefined, since);
+  }
+
+  /**
+   * Computes the visible change categories only when a history row is opened.
+   * This keeps the initial history page bounded even for a long-lived vault.
+   */
+  async commitChanges(oid: string): Promise<CommitChangeDetails> {
+    const commit = await git.readCommit({ fs: this.fs, dir: "", oid });
+    const parent = commit.commit.parent[0] ?? EMPTY_TREE_OID;
+    const changedPaths = (await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [TREE({ ref: oid }), TREE({ ref: parent })],
+      cache: {},
+      map: async (filepath, [current, previous]) => {
+        const entry = current ?? previous;
+        if (!entry || await entry.type() === "tree") return undefined;
+        const currentOid = current ? await current.oid() : undefined;
+        const previousOid = previous ? await previous.oid() : undefined;
+        return currentOid === previousOid ? undefined : normalizeVaultPath(filepath);
+      }
+    }) as string[]).sort();
+
+    const configPrefix = `${normalizeVaultPath(this.configDir)}/`;
+    const markdownPaths = changedPaths.filter((path) => path.endsWith(".md")
+      && !path.startsWith(configPrefix)
+      && !path.startsWith(".team/")
+      && !isPrivatePath(path));
+    const documentTexts = new Map<string, string>();
+    const documentChanges = await Promise.all(markdownPaths.map(async (path): Promise<CommitDocumentChange> => {
+      const current = await this.readBlobText(oid, path);
+      const previous = await this.readBlobText(parent, path);
+      const text = current ?? previous;
+      if (text !== undefined) documentTexts.set(path, text);
+      return {
+        path,
+        status: current === undefined ? "deleted" : previous === undefined ? "added" : "modified",
+        ...(previous === undefined ? {} : { previousLineCount: countTextLines(previous) }),
+        ...(current === undefined ? {} : { currentLineCount: countTextLines(current) })
+      };
+    }));
+    const pluginIds = [...new Set(changedPaths.map((path) => pluginIdFromPath(path, this.configDir)).filter((id): id is string => Boolean(id)))].sort();
+    const pluginChanges = await Promise.all(pluginIds.map((id) => this.pluginChangeAtCommit(id, oid, parent, changedPaths)));
+    const pluginNames = pluginChanges.map((change) => change.name);
+    const changedAssetPaths = new Set<string>(changedPaths.filter(isAssetPath));
+    if (changedPaths.includes(MANIFEST_PATH)) {
+      for (const path of await this.changedManifestAssetPaths(oid, parent)) changedAssetPaths.add(path);
+    }
+
+    const attachmentDocumentPaths: string[] = [];
+    if (changedAssetPaths.size) {
+      for (const path of markdownPaths) {
+        const text = documentTexts.get(path);
+        if (text !== undefined && collectMarkdownReferences(text, path).some((reference) => changedAssetPaths.has(reference))) {
+          attachmentDocumentPaths.push(path);
+        }
+      }
+    }
+
+    const pluginPaths = new Set(changedPaths.filter((path) => pluginIdFromPath(path, this.configDir) !== undefined));
+    const knownPaths = new Set([
+      ...markdownPaths,
+      ...pluginPaths,
+      ...changedAssetPaths,
+      MANIFEST_PATH,
+      SHARED_PLUGIN_STATE_PATH,
+      FILE_AUTHORS_PATH,
+      ".gitignore"
+    ]);
+    return {
+      markdownPaths,
+      documentChanges,
+      pluginNames,
+      pluginChanges,
+      attachmentDocumentPaths,
+      hasUnassociatedAttachmentChanges: changedAssetPaths.size > 0 && attachmentDocumentPaths.length === 0,
+      sharedPluginStateChanged: changedPaths.includes(SHARED_PLUGIN_STATE_PATH),
+      fileAuthorsChanged: changedPaths.includes(FILE_AUTHORS_PATH),
+      sharedPluginRulesChanged: changedPaths.includes(".gitignore"),
+      hasOtherChanges: changedPaths.some((path) => !knownPaths.has(path))
+    };
+  }
+
+  private async readBlobText(oid: string, filepath: string): Promise<string | undefined> {
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid, filepath });
+      return new TextDecoder("utf-8", { fatal: true }).decode(blob);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async changedManifestAssetPaths(oid: string, parent: string): Promise<string[]> {
+    const current = await this.readBlobText(oid, MANIFEST_PATH);
+    const previous = await this.readBlobText(parent, MANIFEST_PATH);
+    const currentManifest = current ? parseManifestContent(current) : undefined;
+    const previousManifest = previous ? parseManifestContent(previous) : undefined;
+    if (!currentManifest && !previousManifest) return [];
+    const currentFiles = currentManifest?.files ?? {};
+    const previousFiles = previousManifest?.files ?? {};
+    return [...new Set([...Object.keys(currentFiles), ...Object.keys(previousFiles)])]
+      .filter((path) => JSON.stringify(currentFiles[path]) !== JSON.stringify(previousFiles[path]))
+      .sort();
+  }
+
+  private async pluginChangeAtCommit(id: string, oid: string, parent: string, changedPaths: readonly string[]): Promise<CommitPluginChange> {
+    const manifestPath = `${normalizeVaultPath(this.configDir)}/plugins/${id}/manifest.json`;
+    let name = id;
+    let version: string | undefined;
+    for (const ref of [oid, parent]) {
+      const text = await this.readBlobText(ref, manifestPath);
+      if (!text) continue;
+      try {
+        const manifest = JSON.parse(text) as { name?: unknown; version?: unknown };
+        if (typeof manifest.name === "string" && manifest.name.trim()) name = manifest.name.trim();
+        if (typeof manifest.version === "string" && manifest.version.trim()) version = manifest.version.trim();
+        break;
+      } catch {
+        // Deleted or malformed plugin metadata falls back to its stable ID.
+      }
+    }
+    return {
+      name,
+      ...(version ? { version } : {}),
+      changedFileCount: changedPaths.filter((path) => pluginIdFromPath(path, this.configDir) === id).length
+    };
   }
 
   async fileAuthors(filepath: string): Promise<string[]> {
