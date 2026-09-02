@@ -1,109 +1,144 @@
-# Oldeng Team Core
+<h1 align="center">Oldeng Team Core</h1>
 
-Oldeng Team Core is a cross-platform Obsidian plugin for synchronizing a small team's Markdown knowledge base through Git while storing attachments in S3-compatible object storage.
+<div align="center">
 
-Oldeng Team Core 是一个跨平台 Obsidian 团队知识库插件。Markdown 笔记使用 Git 保留历史，附件使用兼容 S3 的对象存储，并在桌面端和移动端使用同一套插件代码。
+面向小型团队的 Obsidian 知识库同步插件
+
+[![Obsidian 下载量](https://img.shields.io/badge/dynamic/json?logo=obsidian&color=%23483699&label=Obsidian%20下载量&query=%24%5B%22team-core%22%5D.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json)](https://obsidian.md/plugins?id=team-core)
+[![最新版本](https://img.shields.io/github/v/release/ZheWana/OldengTeamCore?label=最新版本)](https://github.com/ZheWana/OldengTeamCore/releases/latest)
+[![CI](https://github.com/ZheWana/OldengTeamCore/actions/workflows/ci.yml/badge.svg)](https://github.com/ZheWana/OldengTeamCore/actions/workflows/ci.yml)
+[![MIT License](https://img.shields.io/github/license/ZheWana/OldengTeamCore)](./LICENSE)
+
+中文 | [English](./README_EN.md)
+
+</div>
+
+Oldeng Team Core 使用 Git 同步 Markdown 笔记与团队插件配置，使用兼容 S3 的对象存储同步附件，并在桌面端和移动端提供一致的同步、历史、冲突处理和恢复体验。
 
 > [!IMPORTANT]
-> **AI development disclosure / AI 开发声明**
+> **AI 开发声明**
 >
-> This plugin was developed entirely by AI, including its source code, tests, documentation, and automation workflows. Human participation is limited to requirements, product decisions, deployment authorization, and acceptance testing.
->
-> 本插件完全由 AI 开发，包括源代码、测试、文档和自动化工作流。人类仅负责提出需求、产品决策、部署授权和验收测试。
+> 本插件完全由 AI 开发，包括源代码、测试、文档和自动化工作流。人类负责提出需求、产品决策、部署授权和验收测试。
 
-## Features
+## 快速开始
 
-- Automatically batches local changes, fetches remote commits, merges, and pushes through Git Smart HTTP.
-- Records each member's Git author identity and provides file-level history inside Obsidian.
-- Provides a searchable commit history page with merge-commit markers, a full-year contribution wall, and document-ownership author statistics.
-- Supports Git-tracked file author assignments in `.team/file-authors.json`, with automatic fallback to each file's complete Git author history when no assignment exists.
-- Stores `assets/` outside Git with immutable SHA-256 object IDs and a Git-tracked attachment manifest.
-- Hides the `assets/` folder from Obsidian's file explorer and search while keeping attachment synchronization unchanged.
-- Renames managed attachments to `assets/tc-sha256-<sha256>.<extension>` and updates Markdown and Wiki links.
-- Shows phase and numeric progress during synchronization.
-- Downloads attachments larger than 8 MiB in 8 MiB ranged chunks on supported Obsidian versions, writing each chunk to a temporary Vault file before atomic replacement and final SHA-256 verification.
-- Creates `私人笔记/` as a local-only folder that is excluded from synchronization.
-- Provides explicit initialization, remote import, attachment normalization, diagnostics export, and an in-app conflict editor.
-- Provides a destructive **重置本地并重新同步** command that leaves remote Git and S3 unchanged, clears local shared content, and downloads the complete remote Vault again without publishing local deletions.
-- Retries a racing non-fast-forward push with a bounded fetch/merge cycle and never force-pushes.
-- Lets the team choose trusted community plugin folders to share through a managed `.gitignore` whitelist. Obsidian remains responsible for installing and updating plugins.
-- Synchronizes the enabled state of whitelisted community plugins while preserving each member's personal plugin choices.
-- Maps Git author names to local display names without rewriting Git history.
+### 安装
 
-## Requirements
+1. 打开 Obsidian 的 **设置 → 第三方插件 → 浏览**。
+2. 搜索 **Oldeng Team Core**，安装并启用。
+3. 打开 **设置 → Oldeng Team Core → 快速导入 / 导出**，粘贴管理员提供的配置字符串。
+4. 填写自己的 Git `username`。团队约定使用姓名的全小写拼音，例如 `wangxiaoming`。
+5. 对已有远端知识库，执行命令 **Oldeng Team Core：从远端知识库导入**。
 
-- Obsidian 1.12.3 or later.
-- A standard Git Smart HTTP repository with Basic authentication.
-- An S3-compatible private bucket. The current implementation has been tested with Qiniu Kodo's S3-compatible endpoint.
-- Team members who are authorized to access the same Git repository and S3 prefix.
+日常使用不需要反复打开命令面板。点击 Obsidian 右下角的 Team Core 状态栏即可执行双向同步；自动同步默认关闭，可以在设置中自行启用。
 
-## Installation
+> [!WARNING]
+> **立即同步是双向同步。** 本地删除会作为有效修改推送到远端。误删文件且尚未同步时，不要点击立即同步，请使用 **重置本地并重新同步** 从远端恢复。
 
-### Community plugins
-
-After Oldeng Team Core is accepted into the Obsidian Community directory, install and update it from **Settings → Community plugins**.
-
-### Manual installation
-
-Download `main.js`, `manifest.json`, and `styles.css` from the matching [GitHub release](https://github.com/ZheWana/OldengTeamCore/releases), place them in:
+无法通过社区插件安装时，也可以从 [GitHub Releases](https://github.com/ZheWana/OldengTeamCore/releases) 下载同一版本的 `main.js`、`manifest.json` 和 `styles.css`，放入：
 
 ```text
 <Vault>/.obsidian/plugins/team-core/
 ```
 
-Restart Obsidian, then enable **Oldeng Team Core** under Community plugins.
+## 核心能力
 
-## Configuration
+### 笔记同步
 
-Open **Settings → Oldeng Team Core** and configure:
+- 通过标准 Git Smart HTTP 批量提交、拉取、合并和推送 Markdown 文件。
+- 遇到非快进推送时执行有限次数的重新拉取与合并，绝不自动强制推送。
+- 桌面端状态栏和移动端弹窗显示同步阶段、当前项和数值进度。
+- 提供明确的初始化、远端导入、本地重置和远端测试清理入口。
 
-- the Git repository URL, member username, and shared Git password;
-- S3 endpoint, region, bucket, prefix, Access Key, and Secret Key;
-- save debounce and automatic synchronization intervals.
+### 附件同步
 
-In **团队公共插件**, enable only trusted plugin folders. The selected folder is synchronized in full, including `main.js`, `manifest.json`, `styles.css`, `data.json`, and other files. The selection is stored in the managed block of `.gitignore`, so it travels with the repository. The enabled state of selected plugins is stored in `.team/shared-plugins.json` and applied to each member's local `community-plugins.json`. Unselected plugins and their enabled states remain local and are never removed, disabled, or overwritten. `team-core` itself and the local `community-plugins.json` file are never committed.
+- `assets/` 不进入 Git，附件以 `tc-sha256-<sha256>.<扩展名>` 保存到兼容 S3 的对象存储。
+- Git 只追踪 `.team/assets-manifest.json`，并且仅在对象上传成功后提交清单。
+- 大于 8 MiB 的附件使用 8 MiB Range 分片下载，写入临时文件并在 SHA-256 校验通过后原子替换。
+- 提供附件审计、孤立附件清理和既有附件规范化工具。
+- `assets/` 和 `私人笔记/assets/` 会从 Obsidian 文件列表与搜索中隐藏。
 
-In **Git 作者显示**, choose **管理显示名称** and confirm access to add mappings from an original Git author name to a display name. Matching is case-insensitive. The mapping is applied consistently to note-title authors, commit history, document-author statistics, manual author assignments, and the status bar. It only affects local rendering and never changes a Git commit, repository account, or note content. It is included in the quick configuration export/import string so teammates can share the same display rules; the importing member's own Git username and automatic-sync choice remain local.
+### 团队看板与历史
 
-When investigating a sync problem, run **导出诊断日志** from the command palette. It writes a JSON file under `私人笔记/`, which is excluded from synchronization and can be shared as a normal file. The export contains recent sync phases and attachment transfer metadata, keeps the latest 800 entries locally, and redacts credential-like fields. It does not include note contents or attachment bytes. **复制诊断信息** remains available as a clipboard fallback.
+- 团队看板展示本地文章数、本地附件数、年度提交墙和文档作者分布。
+- “本周最新更新”按本地 Markdown 保存时间展示，支持 `置顶-` 文章、分页和刷新。
+- 独立提交历史页支持按文件路径搜索和分页加载。
+- 打开笔记时，可在标题旁显示该文件的作者；手动作者归属优先，无记录时回退到完整 Git 历史。
+- Git 作者显示名称可以映射为团队常用名称，不会改写 Git 历史。
 
-The quick export string contains shared Git and S3 secrets, plus non-secret author display mappings. It is compressed to keep the string short enough for common chat tools, but it is not encrypted: treat it as a password and distribute it only through a secure private channel. The member username is intentionally kept local and is not replaced during import. Strings generated by older plugin versions are not accepted; export a new string after updating.
+### 公共插件
 
-## Private notes
+- 通过插件内的白名单界面选择需要共享的社区插件目录。
+- 同步所选插件的 `main.js`、`manifest.json`、`styles.css`、`data.json` 和其他目录内容。
+- 同步公共插件的启用状态，同时保留每位成员自己的插件与启用状态。
+- 公共插件发生变化后显示必须确认的重启弹窗，桌面端可直接重启 Obsidian。
 
-Oldeng Team Core automatically creates `私人笔记/`. That exact folder and all of its descendants remain local. A similarly named folder such as `私人笔记备份/` is not private and will be synchronized normally.
+### 冲突与诊断
 
-## Attachment model
+- 内置三方冲突编辑器，可选择本地版本、远端版本、自定义结果或删除文件。
+- 冲突解决后生成标准双父提交，再继续正常同步。
+- 诊断系统保留最近 800 条脱敏日志，记录同步阶段和附件传输边界。
+- 诊断报告以 JSON 文件导出到本地 `私人笔记/`，不会进入 Git 或 S3。
 
-Files under `assets/` are not committed to Git. Oldeng Team Core hashes changed or explicitly normalized attachments, uploads immutable objects to the configured S3 prefix, and commits `.team/assets-manifest.json` only after each required object is available. Ordinary synchronization is incremental; use **规范化全部附件** only for initial migration or recovery after external file changes.
+## 工作原理
 
-Pasting an image into a shared note writes it directly to its canonical `assets/tc-sha256-...` path and inserts that link into the editor. Images pasted into `私人笔记/` stay under `私人笔记/assets/` and are not uploaded. Git versions files rather than directories; after a remote merge or overwrite, Team Core removes ordinary directories that became empty. To preserve an intentionally empty shared directory, add a tracked placeholder such as `.gitkeep`.
+```text
+Obsidian Vault
+  └─ Oldeng Team Core
+      ├─ Markdown / 团队配置 ── Git Smart HTTP ── Git 仓库
+      ├─ assets/ ───────────── S3 API ────────── 对象存储
+      └─ 私人笔记/ ─────────── 仅保留在本机
+```
 
-Use **重置本地并重新同步** when the remote revision must be authoritative or the complete repository should be downloaded again. This destructive recovery action leaves remote Git and S3 unchanged, clears queued local deletions, preserves `私人笔记/`, `.obsidian/`, and local trash, removes all other local content and Git metadata, and clones the remote repository again. Ordinary **立即同步** remains bidirectional and will publish intentional local file deletions.
+附件变更遵循固定顺序：
 
-Concurrent changes to different attachment paths are merged semantically in the manifest rather than treated as a JSON text conflict. Competing content for the same logical path remains a real conflict.
+```text
+扫描并计算 SHA-256
+  → 确认附件对象已上传
+  → 更新附件清单
+  → 提交 Markdown 与清单
+  → 推送 Git
+```
 
-## Conflict behavior
+这样可以避免 Git 提交引用尚未上传的附件对象。普通同步是增量同步，已存在且哈希一致的附件不会重复上传。
 
-Oldeng Team Core automatically merges independent changes and retries a push race at most twice through fetch and merge. It never force-pushes. A true content conflict stops before push, keeps the pre-merge note content unchanged, records the conflicting paths under local `.git` metadata, and remains visible after plugin reload.
+## 私人笔记
 
-Select the conflict status or run **解决同步冲突** to open the built-in editor. Desktop layouts show the local version, editable result, and remote version side by side; narrow layouts provide the same views as tabs. Every file must be explicitly resolved by choosing a side, editing a custom result, or deleting the file. Saving creates a standard two-parent merge commit and resumes the normal synchronization flow.
+插件会创建精确路径 `私人笔记/`。该目录及其子目录不进入 Git，内部附件也不会上传 S3。名称相似但路径不同的目录，例如 `私人笔记备份/`，仍属于公共同步范围。
 
-## Network and privacy disclosure
+在公共区域与私人笔记之间移动 Markdown 时，插件会迁移该笔记独占引用的附件并重写链接。如果附件仍被其他笔记引用，则保留共享副本，避免破坏其他文档。
 
-Oldeng Team Core makes network requests only for its stated synchronization features:
+> [!NOTE]
+> `.gitignore` 只能阻止未来追踪，不能清除历史提交。如果旧仓库曾提交私人内容，需要由管理员重写或重建仓库历史。
 
-- the user-configured Git Smart HTTP server receives Git authentication and Markdown repository traffic;
-- the user-configured S3-compatible service receives attachment requests signed with the configured S3 credentials;
-- GitHub Releases are used by Obsidian's own community-plugin update flow, outside the plugin runtime.
+## 同步与恢复边界
 
-Oldeng Team Core does not include client-side telemetry or advertising. Credentials are stored in Obsidian's local plugin data under `.obsidian/plugins/team-core/data.json` and are never committed by Oldeng Team Core. Server operators remain responsible for their Git and S3 privacy, retention, access-control, and logging policies.
+| 场景 | 应使用的操作 | 对远端的影响 |
+|---|---|---|
+| 正常新增、编辑或主动删除文章 | 点击右下角状态栏立即同步 | 推送本地修改与删除 |
+| 误删文件且尚未同步 | 重置本地并重新同步 | 无，远端覆盖本地公共内容 |
+| 希望完整重新下载知识库 | 重置本地并重新同步 | 无，保留远端 Git 与 S3 |
+| 普通内容冲突 | 使用内置冲突编辑器 | 解决后新增合并提交 |
+| 测试环境需要清空远端 | 测试：清空远端 Git 与 S3 | 删除远端 Git `main` 和托管 S3 对象 |
 
-## Destructive test command
+**重置本地并重新同步** 会保留 `私人笔记/`、`.obsidian/` 和本地回收站，清除其余本地公共内容与 Git 元数据后重新导入远端。
 
-During the current testing phase, **测试：清空远端 Git 与 S3** can delete the configured remote Git `main` ref and all Oldeng Team Core-managed objects under the configured S3 `prefix/sha256/`. It requires an explicit destructive confirmation. Git and S3 deletion cannot be atomic. Use it only against test data with a verified backup.
+远端清理属于测试期破坏性功能，需要显式确认。Git 与 S3 删除无法组成原子事务，只应在已验证备份的测试环境中使用。
 
-## Development
+## 配置与安全
+
+运行插件需要：
+
+- Obsidian `1.12.3` 或更高版本；
+- 支持 Basic Auth 的标准 Git Smart HTTP 仓库；
+- 私有的 S3 兼容 Bucket；
+- 对同一 Git 仓库和 S3 前缀具有权限的团队成员。
+
+快速配置字符串包含共享 Git 和 S3 凭据以及作者显示映射。它使用 `tc1.` 压缩格式，但**不是加密数据**，应当像密码一样通过可信私密渠道发送。本机用户名和自动同步选择不会被配置导入覆盖。
+
+插件仅为同步功能访问用户配置的 Git 与 S3 服务，不包含遥测或广告。凭据保存在本机 `.obsidian/plugins/team-core/data.json`，不会被 Team Core 提交到 Git。
+
+## 开发
 
 ```bash
 npm install
@@ -111,17 +146,12 @@ npm run dev
 npm run check
 ```
 
-Production output is written to `dist/`. Unit tests cover configuration, hashing, path boundaries, shared-plugin ignore rules, manifest behavior, Git adapter behavior, attachment names, links, and conflict handling.
+生产构建位于 `dist/`。`npm run check` 包含构建、TypeScript 类型检查、Vitest、ESLint、Stylelint 和 Obsidian 插件校验。
 
-## Releasing
+发布版本必须提供 `.github/release-notes/<版本>.md`。推送与 `manifest.json` 完全一致且不带 `v` 前缀的标签后，GitHub Actions 会验证并发布 `main.js`、`manifest.json` 和 `styles.css`。
 
-1. Update the version with `npm version patch`, `npm version minor`, or `npm version major`.
-2. Run `npm run check`.
-3. Push the commit and a tag whose name exactly matches `manifest.json`, without a `v` prefix.
-4. GitHub Actions verifies and publishes `main.js`, `manifest.json`, and `styles.css` as release assets.
+完整更新记录见 [CHANGELOG.md](./CHANGELOG.md)。参与开发前请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)，安全问题请参阅 [SECURITY.md](./SECURITY.md)。
 
-The separate Oldeng Team Core server publisher retains only the latest and immediately previous static packages for manual recovery. The plugin never installs or overwrites itself.
+## 许可证
 
-## License
-
-[MIT](LICENSE) © 2026 ZheWana.
+[MIT](./LICENSE) © 2026 ZheWana
