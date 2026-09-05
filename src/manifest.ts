@@ -21,12 +21,16 @@ export function validateManifest(value: unknown): AssetManifest {
     if (typeof entry.mime !== "string" || !entry.mime) throw new Error(`Invalid MIME for ${rawPath}`);
     if (typeof entry.uploadedAt !== "string" || Number.isNaN(Date.parse(entry.uploadedAt))) throw new Error(`Invalid upload time for ${rawPath}`);
     if (typeof entry.uploadedBy !== "string" || !entry.uploadedBy.trim()) throw new Error(`Invalid uploader for ${rawPath}`);
+    if (entry.uploadedFrom !== undefined && (typeof entry.uploadedFrom !== "string" || !/^[a-z0-9]{24,128}$/i.test(entry.uploadedFrom))) {
+      throw new Error(`Invalid uploader installation for ${rawPath}`);
+    }
     files[path] = {
       sha256: entry.sha256,
       size: entry.size,
       mime: entry.mime,
       uploadedAt: new Date(entry.uploadedAt).toISOString(),
-      uploadedBy: entry.uploadedBy
+      uploadedBy: entry.uploadedBy,
+      ...(entry.uploadedFrom ? { uploadedFrom: entry.uploadedFrom } : {})
     };
   }
   return { version: MANIFEST_VERSION, files };
@@ -68,7 +72,8 @@ function entriesEqual(left: AssetManifestEntry | undefined, right: AssetManifest
     && left.size === right.size
     && left.mime === right.mime
     && left.uploadedAt === right.uploadedAt
-    && left.uploadedBy === right.uploadedBy;
+    && left.uploadedBy === right.uploadedBy
+    && left.uploadedFrom === right.uploadedFrom;
 }
 
 function equivalentAsset(left: AssetManifestEntry | undefined, right: AssetManifestEntry | undefined): boolean {

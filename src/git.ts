@@ -1,9 +1,9 @@
-import git, { TREE, walk, type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
+import git, { STAGE, TREE, walk, type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
 import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
 import type { AssetManifest, CommitChangeDetails, CommitDocumentChange, CommitPluginChange, Logger, CommitSummary, TeamCoreSettings } from "./types";
 import { collectMarkdownReferences, isAssetPath, isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
-import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH } from "./constants";
+import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH, PRIVATE_FOLDER } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
 import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
 import { mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry } from "./file-authors";
@@ -45,6 +45,19 @@ export interface GitRemoteInfo {
   heads: Record<string, string>;
   tags: Record<string, string>;
   defaultBranch?: string;
+}
+
+/** Authoritative, startup/recovery view of worktree changes. */
+export interface ManagedWorktreeRecovery {
+  changedManagedPaths: string[];
+  hasBoundaryRepair: boolean;
+  hasChanges: boolean;
+}
+
+/** A public, managed path whose worktree or index differs from HEAD. */
+export interface PublicWorktreeChange {
+  path: string;
+  status: "added" | "modified" | "deleted";
 }
 
 export interface ConflictFileVersion {
@@ -344,11 +357,18 @@ export class GitRepository {
   }
 
   async init(): Promise<void> {
-    if (await this.exists()) return;
-    await git.init({ fs: this.fs, dir: "", defaultBranch: DEFAULT_BRANCH });
+    if (!(await this.exists())) await git.init({ fs: this.fs, dir: "", defaultBranch: DEFAULT_BRANCH });
+    await this.configureWorktreeMode();
+  }
+
+  /** Standardize knowledge-base repositories on content-only file tracking. */
+  async configureWorktreeMode(): Promise<void> {
+    await git.setConfig({ fs: this.fs, dir: "", path: "core.filemode", value: "false" });
+    await this.clearIgnoredModeOnlyIndexChanges();
   }
 
   async ensureRemote(): Promise<void> {
+    await this.configureWorktreeMode();
     const gitUrl = normalizeGitUrl(this.settings.gitUrl);
     if (!gitUrl) throw new Error("Git URL is not configured");
     const remotes = await git.listRemotes({ fs: this.fs, dir: "" });
@@ -381,6 +401,7 @@ export class GitRepository {
     const personalPluginFiles = await this.snapshotPersonalPluginFiles();
     try {
       await git.clone({ ...(await this.gitOptions()), url: gitUrl, ref: DEFAULT_BRANCH, singleBranch: true, noCheckout: true, onProgress });
+      await this.configureWorktreeMode();
       const remoteTree = await this.validateManagedTree("HEAD");
       for (const path of remoteTree.files) {
         if (isSharedPluginPath(path, this.configDir, remoteTree.sharedPluginIds) && await this.vault.exists(path)) {
@@ -657,8 +678,8 @@ export class GitRepository {
     return [...state.files];
   }
 
-  async ensureGitignore(): Promise<void> {
-    await writeSharedPluginIds(this.vault, this.configDir, this.sharedPluginIds);
+  async ensureGitignore(): Promise<boolean> {
+    return writeSharedPluginIds(this.vault, this.configDir, this.sharedPluginIds);
   }
 
   private async currentSharedPluginIds(): Promise<readonly string[]> {
@@ -671,22 +692,13 @@ export class GitRepository {
 
   async stageManagedChanges(excludedPaths: readonly string[] | (() => readonly string[]) = []): Promise<string[]> {
     const sharedPluginIds = await this.currentSharedPluginIds();
-    await this.unstageLocalPrivateFiles();
-    const trackedPrivatePaths = await this.trackedPrivatePaths();
+    await this.repairPrivateIndexBoundary();
     const currentExcluded = (): Set<string> => new Set(
       (typeof excludedPaths === "function" ? excludedPaths() : excludedPaths).map(normalizeVaultPath)
     );
-    const matrix = await git.statusMatrix({
-      fs: this.fs,
-      dir: "",
-      filepaths: undefined,
-      // Filter before isomorphic-git resolves staged blobs. A private path
-      // from an older, interrupted client can point at a pruned blob; it is
-      // outside Team Core's boundary and must never block public syncing.
-      filter: (filepath) => !isPrivatePath(filepath) || trackedPrivatePaths.has(normalizeVaultPath(filepath))
-    });
+    const matrix = await this.publicStatusMatrix();
     const changed: string[] = [];
-    for (const [filepath, head, workdir, stage] of matrix as Array<[string, number, number, number]>) {
+    for (const [filepath, head, workdir, stage] of matrix) {
       if (currentExcluded().has(normalizeVaultPath(filepath))) {
         if (head !== stage) await git.resetIndex({ fs: this.fs, dir: "", filepath });
         continue;
@@ -694,7 +706,10 @@ export class GitRepository {
       if (isManagedPath(filepath, this.configDir, sharedPluginIds) && (head !== workdir || workdir !== stage)) {
         changed.push(filepath);
         if (workdir === 0) await git.remove({ fs: this.fs, dir: "", filepath });
-        else await git.add({ fs: this.fs, dir: "", filepath });
+        // An index-only change is already Git's authoritative desired state.
+        // In particular, this preserves a staged executable-bit change instead
+        // of replacing it with whatever mode the current mount exposes.
+        else if (head !== workdir) await git.add({ fs: this.fs, dir: "", filepath });
       } else if (!isManagedPath(filepath, this.configDir, sharedPluginIds) && (head !== 0 || stage !== 0)) {
         // Any path outside the synchronization boundary is removed from the
         // index without deleting its local bytes. This also repairs histories
@@ -710,11 +725,38 @@ export class GitRepository {
         await git.resetIndex({ fs: this.fs, dir: "", filepath });
       }
     }
-    return included;
+    return this.changedIndexPaths(included);
   }
 
-  async commit(message: string, excludedPaths: readonly string[] | (() => readonly string[]) = []): Promise<string | undefined> {
-    const changed = await this.stageManagedChanges(excludedPaths);
+  /**
+   * Stages an event-derived batch without asking isomorphic-git to walk the
+   * entire worktree. This is the normal synchronization path; the full public
+   * recovery scan above is retained only for explicit recovery boundaries.
+   */
+  async stageManagedPaths(paths: readonly string[], excludedPaths: readonly string[] | (() => readonly string[]) = []): Promise<string[]> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    await this.repairPrivateIndexBoundary();
+    const excluded = new Set((typeof excludedPaths === "function" ? excludedPaths() : excludedPaths).map(normalizeVaultPath));
+    const candidates = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].filter((path) => !isPrivatePath(path));
+    const statusByPath = new Map((await this.publicStatusMatrix(candidates))
+      .map((entry) => [normalizeVaultPath(entry[0]), entry]));
+    for (const path of candidates) {
+      if (excluded.has(path)) {
+        await git.resetIndex({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+      } else if (isManagedPath(path, this.configDir, sharedPluginIds)) {
+        const status = statusByPath.get(path);
+        if (status && status[1] === status[2]) continue;
+        if (await this.vault.exists(path)) await git.add({ fs: this.fs, dir: "", filepath: path });
+        else await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+      } else {
+        await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+      }
+    }
+    return this.changedIndexPaths(candidates.filter((path) => !excluded.has(path)));
+  }
+
+  async commit(message: string, excludedPaths: readonly string[] | (() => readonly string[]) = [], paths?: readonly string[]): Promise<string | undefined> {
+    const changed = paths ? await this.stageManagedPaths(paths, excludedPaths) : await this.stageManagedChanges(excludedPaths);
     if (!changed.length) return undefined;
     const username = this.settings.gitUsername.trim() || "unknown";
     const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
@@ -734,8 +776,7 @@ export class GitRepository {
     const remote = await git.resolveRef({ fs: this.fs, dir: "", ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }).catch(() => undefined);
     const local = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
     if (!remote || !local || remote === local) return { merged: false, conflicts: [] };
-    await this.validateManagedTree(remote);
-    const personalPluginFiles = await this.snapshotPersonalPluginFiles();
+    await this.validateRemoteMergeBoundary(local, remote);
     const currentBranch = await git.currentBranch({ fs: this.fs, dir: "", fullname: false }).catch(() => undefined);
     try {
       const username = this.settings.gitUsername.trim() || "unknown";
@@ -756,11 +797,11 @@ export class GitRepository {
       const conflicts = (result as { conflictedFiles?: string[] }).conflictedFiles ?? [];
       if (!conflicts.length && !result.alreadyMerged) {
         // merge() updates the index/tree but does not materialize a clean
-        // merge into the working tree. Checkout makes remote notes available
-        // in the Vault before attachment materialization and the next commit.
-        await git.checkout({ fs: this.fs, dir: "", ref: currentBranch ?? DEFAULT_BRANCH });
-        await this.materializeSharedPluginFiles();
-        await this.restorePersonalPluginFiles(personalPluginFiles);
+        // merge into the working tree. Do not use checkout: even a path-
+        // limited checkout analyzes the root worktree and visits ignored
+        // private notes. Materialize changed Git-tree files directly.
+        const merged = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" });
+        await this.materializeMergedWorktree(local, merged);
       }
       await this.clearConflictState();
       return { merged: true, conflicts };
@@ -773,6 +814,72 @@ export class GitRepository {
       }
       throw error;
     }
+  }
+
+  private async materializeMergedWorktree(before: string, after: string): Promise<void> {
+    const changed = await this.changedTreePaths(before, after);
+    // The whitelist is itself shared. Apply it before materializing changed
+    // plugin paths so a newly shared plugin is recognized in this same merge.
+    if (changed.includes(".gitignore")) {
+      await this.writeTreeFile(after, ".gitignore");
+      await git.add({ fs: this.fs, dir: "", filepath: ".gitignore" });
+    }
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    for (const path of changed) {
+      if (path === ".gitignore" || !isManagedPath(path, this.configDir, sharedPluginIds)) continue;
+      const existsAfterMerge = await git.readBlob({ fs: this.fs, dir: "", oid: after, filepath: path }).then(() => true).catch(() => false);
+      if (existsAfterMerge) {
+        await this.writeTreeFile(after, path);
+        await git.add({ fs: this.fs, dir: "", filepath: path });
+      } else if (await this.vault.exists(path)) {
+        await this.vault.remove(path);
+        await git.remove({ fs: this.fs, dir: "", filepath: path });
+      }
+    }
+  }
+
+  /** Walk only differing Git trees; equal directory OIDs prune whole subtrees. */
+  private async changedTreePaths(before: string, after: string): Promise<string[]> {
+    const changed = (await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [TREE({ ref: before }), TREE({ ref: after })],
+      map: async (path, [previous, current]) => {
+        const entry = previous ?? current;
+        if (!entry) return undefined;
+        if (await entry.type() === "tree") {
+          if (previous && current && await previous.oid() === await current.oid()) return null;
+          return undefined;
+        }
+        return await previous?.oid() === await current?.oid() ? undefined : normalizeVaultPath(path);
+      }
+    }) as string[] | undefined) ?? [];
+    return changed.map(normalizeVaultPath).sort();
+  }
+
+  /**
+   * A normal remote merge validates only the changed tree paths. Changing the
+   * shared-plugin whitelist changes the path policy itself, so it deliberately
+   * falls back to the full remote-tree validation boundary.
+   */
+  private async validateRemoteMergeBoundary(local: string, remote: string): Promise<void> {
+    const changed = await this.changedTreePaths(local, remote);
+    if (changed.includes(".gitignore")) {
+      await this.validateManagedTree(remote);
+      return;
+    }
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const forbidden = changed.filter((path) => !isManagedPath(path, this.configDir, sharedPluginIds));
+    if (!forbidden.length) return;
+    const preview = forbidden.slice(0, 5).join(", ");
+    const remaining = forbidden.length > 5 ? ` 等 ${forbidden.length} 个文件` : "";
+    throw new Error(`远端仓库包含禁止同步路径，已拒绝写入本地：${preview}${remaining}`);
+  }
+
+  private async writeTreeFile(oid: string, path: string): Promise<void> {
+    const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid, filepath: path });
+    const data = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+    await this.vault.write(path, data);
   }
 
   private async snapshotPersonalPluginFiles(): Promise<Map<string, ArrayBuffer>> {
@@ -1016,6 +1123,24 @@ export class GitRepository {
     return [...authors];
   }
 
+  /** Expensive maintenance query: collect every attachment object referenced by Git history. */
+  async historicalAttachmentObjects(): Promise<Set<string>> {
+    const referenced = new Set<string>();
+    const commits = await git.log({ fs: this.fs, dir: "" });
+    for (const commit of commits) {
+      const text = await this.readBlobText(commit.oid, MANIFEST_PATH);
+      if (!text) continue;
+      try {
+        const manifest = validateManifest(JSON.parse(text));
+        for (const entry of Object.values(manifest.files)) referenced.add(`${entry.sha256}:${entry.size}`);
+      } catch {
+        // Invalid historical manifests are not a reason to delete an object.
+        return new Set([...referenced, "*"]);
+      }
+    }
+    return referenced;
+  }
+
   async fileAuthorsIndex(onProgress?: (current: number, total: number) => void): Promise<Map<string, string[]>> {
     const commits = await git.log({ fs: this.fs, dir: "" });
     const authorsByPath = new Map<string, Set<string>>();
@@ -1055,31 +1180,164 @@ export class GitRepository {
 
   async hasUncommittedChanges(): Promise<boolean> {
     const sharedPluginIds = await this.currentSharedPluginIds();
-    const trackedPrivatePaths = await this.trackedPrivatePaths();
-    return (await git.statusMatrix({
-      fs: this.fs,
-      dir: "",
-      filter: (filepath) => !isPrivatePath(filepath) || trackedPrivatePaths.has(normalizeVaultPath(filepath))
-    })).some(([filepath, head, workdir, stage]) => {
+    const matrix = await this.publicStatusMatrix();
+    return matrix.some(([filepath, head, workdir, stage]) => {
       if (isManagedPath(filepath, this.configDir, sharedPluginIds)) return head !== workdir || workdir !== stage;
       return head !== 0 || stage !== 0;
     });
   }
 
-  private async trackedPrivatePaths(): Promise<Set<string>> {
-    const files = await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]);
-    return new Set(files.filter(isPrivatePath).map(normalizeVaultPath));
+  /**
+   * Fast, event-scoped Git check for the status bar. This reads only the
+   * supplied paths and never stages, rewrites the index, or contacts remote.
+   */
+  async hasManagedPathChanges(paths: readonly string[]): Promise<boolean> {
+    const candidates = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].filter((path) => !isPrivatePath(path));
+    if (!candidates.length) return false;
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const matrix = await this.publicStatusMatrix(candidates);
+    return matrix.some(([filepath, head, workdir, stage]) => (
+      isManagedPath(filepath, this.configDir, sharedPluginIds) && (head !== workdir || workdir !== stage)
+    ));
   }
 
-  private async unstageLocalPrivateFiles(): Promise<void> {
-    const paths: string[] = [];
-    const walk = async (folder: string): Promise<void> => {
-      const entries = await this.vault.list(folder).catch(() => undefined);
-      if (!entries) return;
-      paths.push(...entries.files.map(normalizeVaultPath));
-      await Promise.all(entries.folders.map((path) => walk(normalizeVaultPath(path))));
+  /**
+   * Rebuilds the coordinator's event-derived queue after a reload, crash, or
+   * external filesystem edit. Ordinary sync cycles stay incremental; this is
+   * deliberately an explicit recovery boundary backed by Git's full matrix.
+   */
+  async recoverManagedWorktree(): Promise<ManagedWorktreeRecovery> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const matrix = await this.publicStatusMatrix();
+    const changedManagedPaths: string[] = [];
+    let hasBoundaryRepair = false;
+    for (const [path, head, workdir, stage] of matrix) {
+      if (head === workdir && workdir === stage) continue;
+      if (isManagedPath(path, this.configDir, sharedPluginIds)) changedManagedPaths.push(normalizeVaultPath(path));
+      else hasBoundaryRepair = true;
+    }
+    return {
+      changedManagedPaths: [...new Set(changedManagedPaths)].sort(),
+      hasBoundaryRepair,
+      hasChanges: changedManagedPaths.length > 0 || hasBoundaryRepair
     };
-    await walk("私人笔记");
-    await Promise.all(paths.map((filepath) => git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined)));
+  }
+
+  /**
+   * Lists actual public worktree/index changes without staging, committing, or
+   * reading remote state. Private and otherwise unmanaged paths stay outside
+   * this boundary by design.
+   */
+  async listPublicWorktreeChanges(): Promise<PublicWorktreeChange[]> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const matrix = await this.publicStatusMatrix();
+    const changes: PublicWorktreeChange[] = [];
+    for (const [path, head, workdir, stage] of matrix) {
+      if (!isManagedPath(path, this.configDir, sharedPluginIds)) continue;
+      if (head === workdir && workdir === stage) continue;
+      changes.push({
+        path: normalizeVaultPath(path),
+        status: workdir === 0 ? "deleted" : head === 0 ? "added" : "modified"
+      });
+    }
+    return changes.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  private async publicStatusMatrix(paths?: readonly string[]): Promise<Array<[string, number, number, number]>> {
+    if (paths) {
+      const filepaths = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))];
+      return git.statusMatrix({ fs: this.fs, dir: "", filepaths, filter: (filepath) => !isPrivatePath(normalizeVaultPath(filepath)) });
+    }
+    const root = await this.vault.list("").catch(() => ({ files: [], folders: [] }));
+    const indexed = await git.listFiles({ fs: this.fs, dir: "" }).catch(() => [] as string[]);
+    const headed = await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]);
+    const roots = [...root.files, ...root.folders, ...indexed, ...headed]
+      .map(normalizeVaultPath)
+      .map((path) => path.split("/", 1)[0])
+      .filter((path) => path && !isPrivatePath(path) && path !== ".git");
+    const filepaths = [...new Set(roots)].sort();
+    return git.statusMatrix({
+      fs: this.fs,
+      dir: "",
+      filepaths: filepaths.length ? filepaths : [".team"],
+      filter: (filepath) => !isPrivatePath(normalizeVaultPath(filepath))
+    });
+  }
+
+  /** Clear pre-existing staged executable-bit noise after opting out of file modes. */
+  private async clearIgnoredModeOnlyIndexChanges(): Promise<void> {
+    if (!(await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined))) return;
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const paths = await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [TREE({ ref: "HEAD" }), STAGE()],
+      map: async (path, [head, stage]) => {
+        if (path === ".") return undefined;
+        const entry = head ?? stage;
+        if (!entry) return undefined;
+        if (await entry.type() === "tree") return undefined;
+        if (!head || !stage || !isManagedPath(path, this.configDir, sharedPluginIds)) return undefined;
+        return await head.oid() === await stage.oid() && await head.mode() !== await stage.mode() ? normalizeVaultPath(path) : undefined;
+      }
+    }) as string[];
+    await Promise.all(paths.map((filepath) => git.resetIndex({ fs: this.fs, dir: "", filepath })));
+  }
+
+  /** Compare HEAD and the index only. Neither walker touches Vault files. */
+  private async changedIndexPaths(candidates: readonly string[]): Promise<string[]> {
+    if (!candidates.length) return [];
+    const wanted = new Set(candidates.map(normalizeVaultPath));
+    const ancestors = new Set<string>();
+    for (const path of wanted) {
+      const parts = path.split("/");
+      for (let index = 1; index < parts.length; index += 1) ancestors.add(parts.slice(0, index).join("/"));
+    }
+    const changed = await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [TREE({ ref: "HEAD" }), STAGE()],
+      map: async (path, [head, stage]) => {
+        if (path === ".") return undefined;
+        const entry = head ?? stage;
+        if (!entry) return undefined;
+        if (await entry.type() === "tree") return ancestors.has(path) ? undefined : null;
+        if (!wanted.has(path)) return undefined;
+        return await head?.oid() === await stage?.oid() ? undefined : path;
+      }
+    }) as string[];
+    return changed.map(normalizeVaultPath).sort();
+  }
+
+  private async repairPrivateIndexBoundary(): Promise<void> {
+    let hasPrivateTree = false;
+    await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [STAGE()],
+      map: async (path, [stage]) => {
+        if (path === PRIVATE_FOLDER) {
+          hasPrivateTree = Boolean(stage);
+          return null;
+        }
+        // Normal incremental commits inspect only root index entries. This is
+        // deliberately not a statusMatrix/listFiles traversal of the vault.
+        return path === "." ? undefined : null;
+      }
+    });
+    if (!hasPrivateTree) return;
+    const privatePaths = await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [STAGE()],
+      map: async (path, [stage]) => {
+        if (path === ".") return undefined;
+        if (path === PRIVATE_FOLDER || path.startsWith(`${PRIVATE_FOLDER}/`)) {
+          return await stage?.type() === "tree" ? undefined : normalizeVaultPath(path);
+        }
+        return null;
+      }
+    }) as string[];
+    await Promise.all(privatePaths.map((filepath) => git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined)));
   }
 }

@@ -1,13 +1,16 @@
 import { FileSystemAdapter, Platform, TFile, TFolder, type App, type Editor } from "obsidian";
-import { MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
+import { createSHA256 } from "hash-wasm";
+import { FILE_AUTHORS_PATH, MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
 import { sha256Hex } from "./crypto";
 import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
 import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
-import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError, S3Transport } from "./s3";
-import { PrivateNotesSynchronizer } from "./private-sync";
-import type { AssetManifest, AssetManifestEntry, Logger, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences, type BinaryVault } from "./vault";
+import { createAttachmentStore } from "./attachment-store";
+import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
+import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
+import { mimeFromPath } from "./mime";
+import type { AssetManifest, AssetManifestEntry, AssetRetentionRecord, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
+import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, readVaultInChunks, rewriteAssetReferences, VAULT_TRANSFER_CHUNK_SIZE, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
@@ -15,7 +18,10 @@ export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
   onNotice(message: string): void;
   onRestartRequired(): void;
-  onPrivateSyncState(state: PrivateSyncState): void;
+  onPrivateSyncState(state: PrivateSyncState): void | Promise<void>;
+  onPendingDeletionPaths?(paths: string[]): void | Promise<void>;
+  confirmRemoteDeletions?(paths: string[]): Promise<boolean>;
+  onAssetRetention?(records: AssetRetentionRecord[]): void | Promise<void>;
 }
 
 export interface ConnectionInfo {
@@ -58,7 +64,32 @@ export interface PrivateDraftPublicationPlan {
   attachments: PrivateDraftAttachmentPlan[];
 }
 
+export function classifyPublicLocalChange(path: string, configDir: string): LocalChangeCategory {
+  const normalized = normalizeVaultPath(path);
+  if (normalized === MANIFEST_PATH) return "attachments";
+  if (normalized === ".gitignore" || normalized === FILE_AUTHORS_PATH || normalized === SHARED_PLUGIN_STATE_PATH
+    || isConfigPath(normalized, configDir)) return "settings";
+  if (normalized.endsWith(".md")) return "documents";
+  return "other";
+}
+
+export function classifyPrivateLocalChange(relativePath: string): LocalChangeCategory {
+  const normalized = normalizeVaultPath(relativePath);
+  if (isPrivateAssetPath(`${PRIVATE_FOLDER}/${normalized}`)) return "attachments";
+  if (normalized.endsWith(".md")) return "documents";
+  return "other";
+}
+
 type AttachmentReferenceCollector = (markdown: string, sourcePath: string) => string[];
+
+async function sha256VaultFile(vault: BinaryVault, path: string, size: number): Promise<string> {
+  const hasher = await createSHA256();
+  hasher.init();
+  await readVaultInChunks(vault, path, size, async (chunk) => {
+    hasher.update(new Uint8Array(chunk));
+  });
+  return hasher.digest();
+}
 
 async function planAttachmentTransfer(
   vault: BinaryVault,
@@ -189,8 +220,17 @@ export function shouldMaterializeRemoteAttachment(previous: AssetManifestEntry |
   return !localFileExists || !previous || previous.sha256 !== current.sha256 || previous.size !== current.size;
 }
 
-export function shouldProtectMismatchedLocalAttachment(localFileExists: boolean, uploadedBy: string, username: string): boolean {
-  return localFileExists && uploadedBy === username;
+export function shouldProtectMismatchedLocalAttachment(
+  localFileExists: boolean,
+  uploadedBy: string,
+  uploadedFrom: string | undefined,
+  installationId: string,
+  username: string
+): boolean {
+  if (!localFileExists) return false;
+  // New manifest entries carry a durable installation identity. Only legacy
+  // entries without that field fall back to the mutable Git display name.
+  return uploadedFrom ? uploadedFrom === installationId : uploadedBy === username;
 }
 
 export function shouldTrackVaultEvent(path: string, configDir: string, sharedPluginIds: readonly string[]): boolean {
@@ -203,6 +243,26 @@ export function shouldTrackVaultEvent(path: string, configDir: string, sharedPlu
 /** Private Vault events are local-only unless the optional private sync is enabled. */
 export function shouldTrackPrivateSyncEvent(settings: Pick<TeamCoreSettings, "privateSyncEnabled">): boolean {
   return settings.privateSyncEnabled;
+}
+
+/**
+ * Vault events and internal writers already identify every managed change in
+ * a normal cycle. Use those signals to avoid a redundant whole-vault status
+ * scan before staging; the staging operation itself still performs the one
+ * authoritative scan when a commit is actually required.
+ */
+export function shouldCommitManagedChanges(signals: {
+  pendingNotes: number;
+  attachmentsChanged: boolean;
+  gitignoreChanged: boolean;
+  sharedPluginStateChanged: boolean;
+  recoveryCommitPending?: boolean;
+}): boolean {
+  return signals.pendingNotes > 0
+    || signals.attachmentsChanged
+    || signals.gitignoreChanged
+    || signals.sharedPluginStateChanged
+    || Boolean(signals.recoveryCommitPending);
 }
 
 export function shouldPublishPrivateDraftRename(
@@ -235,7 +295,14 @@ export class SyncCoordinator {
   private state: SyncState = "uninitialized";
   private pendingFiles = new Set<string>();
   private pendingAssets = new Set<string>();
+  private publicStateCheckGeneration = 0;
   private privateSyncDirty = false;
+  /** Persisted, generation-aware private-note event journal. */
+  private privatePendingPaths = new Set<string>();
+  /** A recovery/import boundary may deliberately request one complete scan. */
+  private privateFullScanPending = false;
+  /** Serializes durable private event-journal updates. */
+  private privateStatePersistence: Promise<void> = Promise.resolve();
   private internalMarkdownWrites = new Set<string>();
   private internalAssetWrites = new Set<string>();
   private internalDraftNoteMoves = new Set<string>();
@@ -255,10 +322,21 @@ export class SyncCoordinator {
   private fullAttachmentScanPending = false;
   private sharedPluginIds: string[] = [];
   private restartRequiredAfterSync = false;
+  /** A full attachment reconciliation is scheduled only at recovery boundaries. */
+  private recoveryAttachmentCheckComplete = false;
+  /** Forces one authoritative stage/commit after Git restores lost event state. */
+  private recoveryCommitPending = false;
+  private syncRunSequence = 0;
+  private activeSyncRunId: number | undefined;
+  /** Paths whose remote bytes could not be materialized in the current session. */
+  private remoteAttachmentIssues = new Map<string, string>();
   readonly logger: Logger;
 
   constructor(private readonly app: App, private readonly settings: () => TeamCoreSettings, private readonly callbacks: SyncCallbacks, logger?: Logger) {
     this.logger = logger ?? new PluginLogger();
+    for (const path of settings().privateSyncState.pendingPaths ?? []) this.privatePendingPaths.add(path);
+    this.privateFullScanPending = settings().privateSyncState.baselineEstablished !== true;
+    this.privateSyncDirty = this.privatePendingPaths.size > 0 || this.privateFullScanPending;
   }
 
   private createVault(): BinaryVault {
@@ -298,9 +376,10 @@ export class SyncCoordinator {
 
   markFileChanged(file: TFile): void {
     const path = normalizeVaultPath(file.path);
+    if (this.internalAssetWrites.delete(path)) return;
     if (isPrivatePath(path)) {
       if (!shouldTrackPrivateSyncEvent(this.settings())) return;
-      this.privateSyncDirty = true;
+      this.queuePrivatePaths([this.privateRelativePath(path)]);
       this.schedulePrivateSync();
       return;
     }
@@ -314,7 +393,6 @@ export class SyncCoordinator {
     // events still need to enter the attachment preparation queue.
     if (!shouldTrackVaultEvent(path, this.app.vault.configDir, this.sharedPluginIds)) return;
     if (isAssetPath(path)) {
-      if (this.internalAssetWrites.delete(path)) return;
       this.pendingAssets.add(path);
       this.scheduleSync();
       return;
@@ -339,7 +417,15 @@ export class SyncCoordinator {
       this.scheduleSync();
       return;
     }
+    this.rememberPendingDeletion(path);
     this.markFileChanged(file);
+  }
+
+  private rememberPendingDeletion(path: string): void {
+    if (isPrivatePath(path)) return;
+    const next = [...new Set([...(this.settings().pendingDeletionPaths ?? []), path])].sort();
+    this.settings().pendingDeletionPaths = next;
+    void this.callbacks.onPendingDeletionPaths?.(next);
   }
 
   markFileRenamed(file: TFile, oldPath: string): void {
@@ -352,15 +438,15 @@ export class SyncCoordinator {
       this.internalDraftNoteMoves.delete(current);
       return;
     }
-    if (isPrivatePath(previous) && isPrivatePath(current)) {
-      if (!shouldTrackPrivateSyncEvent(this.settings())) return;
-      this.privateSyncDirty = true;
-      this.schedulePrivateSync();
-      return;
-    }
     if (this.internalAssetWrites.has(previous) || this.internalAssetWrites.has(current)) {
       this.internalAssetWrites.delete(previous);
       this.internalAssetWrites.delete(current);
+      return;
+    }
+    if (isPrivatePath(previous) && isPrivatePath(current)) {
+      if (!shouldTrackPrivateSyncEvent(this.settings())) return;
+      this.queuePrivatePaths([this.privateRelativePath(previous), this.privateRelativePath(current)]);
+      this.schedulePrivateSync();
       return;
     }
     if (previous === MANIFEST_PATH) {
@@ -432,11 +518,15 @@ export class SyncCoordinator {
     const normalized = normalizeVaultPath(path);
     if (isPrivatePath(normalized)) {
       if (!shouldTrackPrivateSyncEvent(this.settings())) return;
-      this.privateSyncDirty = true;
+      const relative = this.privateRelativePath(normalized);
+      const known = Object.keys(this.settings().privateSyncState.entries)
+        .filter((path) => !relative || path === relative || path.startsWith(`${relative}/`));
+      this.queuePrivatePaths(known, !known.length);
       this.schedulePrivateSync();
       return;
     }
     if (!isAssetPath(normalized) && !isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds)) return;
+    this.rememberPendingDeletion(normalized);
     this.pendingFiles.add(normalized);
     this.fullAttachmentScanPending = true;
     this.scheduleSync();
@@ -475,10 +565,33 @@ export class SyncCoordinator {
   }
 
   private scheduleSync(): void {
-    if (this.state !== "conflict") this.setState("local-changes");
+    const generation = ++this.publicStateCheckGeneration;
+    void this.refreshPublicEventState(generation);
     if (!this.settings().autoSync) return;
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
+  }
+
+  /** Keep the public status bar strictly aligned with an event-scoped Git read. */
+  private async refreshPublicEventState(generation: number): Promise<void> {
+    const paths = [...this.pendingFiles];
+    if (!paths.length || this.state === "uninitialized") return;
+    try {
+      const vault = this.createVault();
+      const git = this.createRepository(vault);
+      if (!(await git.exists()) || generation !== this.publicStateCheckGeneration) return;
+      const hasGitChanges = await git.hasManagedPathChanges(paths);
+      if (generation !== this.publicStateCheckGeneration || this.state === "conflict" || this.state === "syncing" || this.state === "error" || this.state === "offline") return;
+      if (hasGitChanges) {
+        this.setState("local-changes");
+      } else if (!this.recoveryCommitPending && !(this.privateSyncDirty && this.settings().privateSyncEnabled)) {
+        this.setState("synced");
+      }
+    } catch (error) {
+      // A background state probe must not turn a save event into a visible
+      // synchronization failure. The explicit sync path will report errors.
+      this.logger.debug("Unable to refresh event-scoped Git state", { error: String(error) });
+    }
   }
 
   private schedulePrivateSync(): void {
@@ -488,6 +601,7 @@ export class SyncCoordinator {
       return;
     }
     if (settings.privateSyncWithTeam) {
+      if (this.state !== "conflict") this.setState("local-changes");
       this.scheduleSync();
       return;
     }
@@ -495,6 +609,48 @@ export class SyncCoordinator {
     if (!settings.autoSync) return;
     if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
     this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.debounceMs);
+  }
+
+  private privateRelativePath(path: string): string {
+    const normalized = normalizeVaultPath(path);
+    return normalized === PRIVATE_FOLDER ? "" : normalized.slice(`${PRIVATE_FOLDER}/`.length);
+  }
+
+  /**
+   * Record the exact private paths before scheduling. The callback persists the
+   * journal immediately; a crash or plugin reload therefore falls back to a
+   * bounded per-path reconciliation instead of a full private-tree hash.
+   */
+  private queuePrivatePaths(paths: readonly string[], requireFullScan = false): void {
+    for (const path of paths) {
+      const normalized = normalizeVaultPath(path);
+      if (normalized) this.privatePendingPaths.add(normalized);
+    }
+    this.privateFullScanPending ||= requireFullScan;
+    this.privateSyncDirty = this.privatePendingPaths.size > 0 || this.privateFullScanPending;
+    const current = this.settings().privateSyncState;
+    void this.persistPrivateSyncState({
+      version: 1,
+      entries: current.entries,
+      baselineEstablished: current.baselineEstablished,
+      pendingPaths: [...this.privatePendingPaths].sort()
+    });
+  }
+
+  private persistPrivateSyncState(state: PrivateSyncState): Promise<void> {
+    this.privateStatePersistence = this.privateStatePersistence
+      .catch(() => undefined)
+      .then(() => Promise.resolve(this.callbacks.onPrivateSyncState(state)));
+    return this.privateStatePersistence;
+  }
+
+  /** Wait until no event has appended a newer private-path journal batch. */
+  private async flushPrivateStatePersistence(): Promise<void> {
+    while (true) {
+      const pending = this.privateStatePersistence;
+      await pending;
+      if (pending === this.privateStatePersistence) return;
+    }
   }
 
   async flushDebounce(): Promise<void> {
@@ -512,6 +668,13 @@ export class SyncCoordinator {
   }
 
   async runManual(): Promise<void> {
+    this.logger.debug("Manual synchronization requested", {
+      state: this.state,
+      pendingFiles: this.pendingFiles.size,
+      pendingAssets: this.pendingAssets.size,
+      privateSyncEnabled: this.settings().privateSyncEnabled,
+      privateSyncDirty: this.privateSyncDirty
+    });
     if (this.debounceTimer !== undefined && (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam))) {
       await this.flushDebounce();
       return;
@@ -526,7 +689,6 @@ export class SyncCoordinator {
       this.setState("syncing");
       try {
         await this.executePrivateNotesSync(this.createVault());
-        this.privateSyncDirty = false;
         this.lastError = "";
         this.progress = undefined;
         await this.refreshState();
@@ -547,9 +709,8 @@ export class SyncCoordinator {
       this.setState("syncing");
       try {
         const vault = this.createVault();
-        if (overwrite) await this.clearPrivateNotesForRemotePull(vault);
-        await this.executePrivateNotesPull(vault);
-        this.privateSyncDirty = false;
+        const result = await this.executePrivateNotesPull(vault, overwrite);
+        this.recordPrivatePullResult(result);
         this.lastError = "";
         this.progress = undefined;
         await this.refreshState();
@@ -571,6 +732,51 @@ export class SyncCoordinator {
     if (this.fullAttachmentScanPending) await this.runCycle(true);
   }
 
+  /**
+   * Copies the complete verified public attachment set to the currently
+   * selected provider. Provider changes are intentionally explicit: a Git
+   * manifest names bytes by hash but cannot move those bytes between stores.
+   */
+  async migratePublicAttachmentsToConfiguredStore(): Promise<number> {
+    return this.runExclusive(async () => {
+      const previousState = this.state;
+      this.setState("syncing");
+      try {
+        const vault = this.createVault();
+        const store = createAttachmentStore(this.settings(), this.logger);
+        if (!store.enabled()) throw new Error("公共附件对象存储配置不完整");
+        const manifest = await readManifest(vault);
+        const entries = Object.entries(manifest.files).sort(([left], [right]) => left.localeCompare(right));
+        this.startProgress("迁移公共附件", Math.max(entries.length, 1));
+        for (const [path, entry] of entries) {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (!(file instanceof TFile) || file.stat.size !== entry.size || hashFromAssetPath(path) !== entry.sha256) {
+            throw new Error(`无法迁移附件，本地文件缺失或与清单不一致：${path}`);
+          }
+          const actualHash = await sha256VaultFile(vault, path, file.stat.size);
+          if (actualHash !== entry.sha256) throw new Error(`无法迁移附件，本地文件哈希不一致：${path}`);
+          if (entry.size > VAULT_TRANSFER_CHUNK_SIZE) {
+            await store.ensureUploadedFromChunks(entry.sha256, entry.size, entry.mime, (onChunk) => readVaultInChunks(vault, path, entry.size, onChunk));
+          } else {
+            const data = await vault.read(path);
+            await store.ensureUploaded(entry.sha256, data, entry.mime);
+          }
+          this.advanceProgress(path);
+        }
+        if (!entries.length) this.advanceProgress("没有需要迁移的公共附件");
+        this.progress = undefined;
+        this.lastError = "";
+        this.setState(previousState === "syncing" ? "synced" : previousState);
+        return entries.length;
+      } catch (error) {
+        this.progress = undefined;
+        this.lastError = error instanceof Error ? error.message : String(error);
+        this.setState(this.isOffline(error) ? "offline" : "error");
+        throw error;
+      }
+    });
+  }
+
   async refreshState(): Promise<void> {
     const vault = this.createVault();
     try {
@@ -580,13 +786,42 @@ export class SyncCoordinator {
         this.setState("uninitialized");
         return;
       }
+      await git.configureWorktreeMode();
       const conflicts = await git.conflictedFiles();
       if (conflicts.length) {
         this.lastError = `待解决的 Git 冲突：${conflicts.join(", ")}`;
         this.setState("conflict");
         return;
       }
-      this.setState(await git.hasUncommittedChanges() ? "local-changes" : "synced");
+      await this.recoverLocalWorktree(git, vault);
+      this.pruneRemoteAttachmentIssues(await readManifest(vault));
+      if (!this.finishRemoteAttachmentState()) return;
+      // Git is the authority for public changes. Event queues are only an
+      // optimization and may outlive the change they described after a
+      // reload, external repair, or a mode-only normalization. Once the
+      // complete Git status is clean, discard those stale signals so the
+      // status bar cannot report a phantom local change.
+      const hasGitChanges = await git.hasUncommittedChanges();
+      if (!hasGitChanges) {
+        this.pendingFiles.clear();
+        this.pendingAssets.clear();
+        this.fullAttachmentScanPending = false;
+        this.recoveryCommitPending = false;
+      }
+      const hasPrivateLocalChanges = this.privateSyncDirty && this.settings().privateSyncEnabled;
+      this.logger.debug("Authoritative synchronization state evaluated", {
+        syncRunId: this.activeSyncRunId,
+        gitChanges: hasGitChanges,
+        privateChanges: hasPrivateLocalChanges,
+        pendingFiles: this.pendingFiles.size,
+        pendingAssets: this.pendingAssets.size,
+        fullAttachmentScanPending: this.fullAttachmentScanPending,
+        recoveryCommitPending: this.recoveryCommitPending,
+        privatePendingPaths: this.privatePendingPaths.size,
+        privateFullScanPending: this.privateFullScanPending,
+        finalState: hasGitChanges || hasPrivateLocalChanges ? "local-changes" : "synced"
+      });
+      this.setState(hasGitChanges || hasPrivateLocalChanges ? "local-changes" : "synced");
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
       this.setState(this.isOffline(error) ? "offline" : "error");
@@ -636,7 +871,85 @@ export class SyncCoordinator {
   }
 
   snapshot(): SyncSnapshot {
-    return { state: this.state, lastError: this.lastError || undefined, lastSyncAt: this.lastSyncAt, currentAuthor: this.currentAuthor, pendingFiles: [...this.pendingFiles].sort(), pendingAssets: [...this.pendingAssets].sort(), progress: this.progress ? { ...this.progress } : undefined };
+    const settings = this.settings();
+    const localChangeAreas: Array<"public" | "private"> = [];
+    if (this.pendingFiles.size || this.pendingAssets.size || this.recoveryCommitPending || this.fullAttachmentScanPending) localChangeAreas.push("public");
+    if (this.privateSyncDirty && settings.privateSyncEnabled) localChangeAreas.push("private");
+    return { state: this.state, lastError: this.lastError || undefined, lastSyncAt: this.lastSyncAt, currentAuthor: this.currentAuthor, pendingFiles: [...this.pendingFiles].sort(), pendingAssets: [...this.pendingAssets].sort(), localChangeAreas, progress: this.progress ? { ...this.progress } : undefined };
+  }
+
+  /**
+   * Produces the local-changes view model without mutating the Vault, staging
+   * Git paths, or making a network request. Public changes come from Git's
+   * authoritative worktree matrix; private changes come from the durable
+   * incremental journal so opening the view never hashes the whole directory.
+   */
+  async getLocalChangeSnapshot(): Promise<LocalChangeSnapshot> {
+    const settings = this.settings();
+    const vault = this.createVault();
+    const repository = this.createRepository(vault, settings);
+    const publicChanges = new Map<string, LocalChangeItem>();
+    const addPublic = (path: string, status: LocalChangeStatus): void => {
+      const normalized = normalizeVaultPath(path);
+      if (!normalized) return;
+      const existing = publicChanges.get(normalized);
+      if (existing && existing.status !== "pending") return;
+      publicChanges.set(normalized, {
+        path: normalized,
+        area: "public",
+        category: classifyPublicLocalChange(normalized, this.app.vault.configDir),
+        status
+      });
+    };
+    if (await repository.exists()) {
+      for (const change of await repository.listPublicWorktreeChanges()) addPublic(change.path, change.status);
+    } else {
+      // Until a repository exists there is no Git fact to show. The captured
+      // event queue is the only useful initialization preview.
+      for (const path of this.pendingFiles) addPublic(path, "pending");
+      for (const path of this.pendingAssets) {
+        const normalized = normalizeVaultPath(path);
+        if (!normalized) continue;
+        publicChanges.set(normalized, { path: normalized, area: "public", category: "attachments", status: "pending" });
+      }
+    }
+
+    const privateChanges = new Map<string, LocalChangeItem>();
+    if (settings.privateSyncEnabled) {
+      const pendingPaths = new Set([
+        ...(settings.privateSyncState.pendingPaths ?? []),
+        ...this.privatePendingPaths
+      ].map(normalizeVaultPath).filter(Boolean));
+      for (const relativePath of pendingPaths) {
+        const previous = settings.privateSyncState.entries[relativePath];
+        const fullPath = `${PRIVATE_FOLDER}/${relativePath}`;
+        const exists = await vault.exists(fullPath);
+        const status: LocalChangeStatus = exists
+          ? (previous?.sha256 ? "modified" : "added")
+          : (previous?.sha256 ? "deleted" : "pending");
+        privateChanges.set(fullPath, {
+          path: fullPath,
+          area: "private",
+          category: classifyPrivateLocalChange(relativePath),
+          status
+        });
+      }
+      if (settings.privateSyncState.baselineEstablished !== true) {
+        privateChanges.set(PRIVATE_FOLDER, {
+          path: PRIVATE_FOLDER,
+          area: "private",
+          category: "other",
+          status: "pending"
+        });
+      }
+    }
+    const sort = (left: LocalChangeItem, right: LocalChangeItem): number => left.path.localeCompare(right.path);
+    const snapshot: LocalChangeSnapshot = {
+      publicChanges: [...publicChanges.values()].sort(sort),
+      privateChanges: [...privateChanges.values()].sort(sort),
+      privateSyncEnabled: settings.privateSyncEnabled
+    };
+    return snapshot;
   }
 
   async runCycle(force: boolean): Promise<void> {
@@ -676,10 +989,9 @@ export class SyncCoordinator {
       this.advanceProgress();
       if (settings.privateSyncEnabled && settings.privateSyncWithTeam) {
         await this.executePrivateNotesSync(vault);
-        this.privateSyncDirty = false;
       }
       this.progress = undefined;
-      this.setState("synced");
+      if (this.finishRemoteAttachmentState()) this.setState("synced");
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
       this.setState(this.isOffline(error) ? "offline" : "error");
@@ -751,16 +1063,13 @@ export class SyncCoordinator {
       await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
       this.advanceProgress();
       if (this.settings().privateSyncEnabled && this.settings().privateSyncWithTeam) {
-        if (force) await this.clearPrivateNotesForRemotePull(vault);
-        await this.executePrivateNotesPull(vault);
-        this.privateSyncDirty = false;
+        this.recordPrivatePullResult(await this.executePrivateNotesPull(vault, force));
       }
       this.lastSyncAt = Date.now();
-      this.lastError = "";
       this.progress = undefined;
       this.pendingFiles.clear();
       this.pendingAssets.clear();
-      this.setState("synced");
+      if (this.finishRemoteAttachmentState()) this.setState(this.privateSyncDirty ? "local-changes" : "synced");
       if (sharedPluginChanged) this.notifyRestartRequired();
       return sharedPluginChanged;
     } catch (error) {
@@ -803,19 +1112,18 @@ export class SyncCoordinator {
       const vault = this.createVault();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const git = this.createRepository(vault);
-      const s3 = new S3Transport(this.settings(), this.logger);
-      if (!s3.enabled()) throw new Error("S3 配置不完整，未执行任何删除");
+      const attachmentStore = createAttachmentStore(this.settings(), this.logger);
+      if (!attachmentStore.enabled()) throw new Error("公共附件对象存储配置不完整，未执行任何删除");
 
       this.startProgress("检查远端清空范围", 2);
       const remote = await git.remoteInfo();
       this.advanceProgress("Git main");
-      const objectKeys = await s3.listManagedObjects();
-      this.advanceProgress(s3.managedObjectPrefix());
+      this.advanceProgress(attachmentStore.managedObjectLocation());
       const remoteMainOid = remote.heads[DEFAULT_BRANCH];
       const remoteBranchExists = Boolean(remoteMainOid);
 
-      this.startProgress("删除远端附件", objectKeys.length);
-      await s3.deleteManagedObjects(objectKeys, (key) => this.advanceProgress(key));
+      this.startProgress("删除远端附件", 1);
+      const deletedObjects = await attachmentStore.clearManagedObjects((key) => this.advanceProgress(key));
       if (remoteMainOid) {
         this.startProgress("清空远端 Git", 1);
         await git.deleteRemoteBranch(remoteMainOid);
@@ -836,7 +1144,7 @@ export class SyncCoordinator {
       this.currentAuthor = undefined;
       this.progress = undefined;
       this.setState("uninitialized");
-      return { deletedS3Objects: objectKeys.length, deletedGitBranch: remoteBranchExists };
+      return { deletedS3Objects: deletedObjects, deletedGitBranch: remoteBranchExists };
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
       this.progress = undefined;
@@ -847,6 +1155,18 @@ export class SyncCoordinator {
   }
 
   private async executeCycle(): Promise<void> {
+    const syncRunId = ++this.syncRunSequence;
+    const previousSyncRunId = this.activeSyncRunId;
+    this.activeSyncRunId = syncRunId;
+    this.logger.debug("Synchronization cycle started", {
+      syncRunId,
+      previousSyncRunId,
+      state: this.state,
+      pendingFiles: this.pendingFiles.size,
+      pendingAssets: this.pendingAssets.size,
+      privateSyncDirty: this.privateSyncDirty,
+      privatePendingPaths: this.privatePendingPaths.size
+    });
     this.progress = undefined;
     this.setState("syncing");
     // Consume only the captured generation. Events arriving after this point,
@@ -855,15 +1175,18 @@ export class SyncCoordinator {
     const pendingAssets = takePendingPaths(this.pendingAssets);
     const forceFullAttachmentScan = this.fullAttachmentScanPending;
     if (forceFullAttachmentScan) this.fullAttachmentScanPending = false;
+    const recoveryCommitPending = this.recoveryCommitPending;
+    this.recoveryCommitPending = false;
     try {
       const settings = this.settings();
       const vault = this.createVault();
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const git = this.createRepository(vault, settings);
       if (!(await git.exists())) {
+        this.logger.debug("Synchronization cycle stopped: Git is uninitialized", { syncRunId });
+        this.recoveryCommitPending ||= recoveryCommitPending;
         if (settings.privateSyncEnabled && settings.privateSyncWithTeam) {
           await this.executePrivateNotesSync(vault);
-          this.privateSyncDirty = false;
         }
         this.progress = undefined;
         this.setState("uninitialized");
@@ -875,23 +1198,53 @@ export class SyncCoordinator {
         return;
       }
       await git.ensureRemote();
-      await git.ensureGitignore();
-      await this.syncSharedPluginStateBeforeCommit(vault);
+      const gitignoreChanged = await git.ensureGitignore();
+      const sharedPluginStateChanged = await this.syncSharedPluginStateBeforeCommit(vault);
       const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
-      const hasGitChanges = await git.hasUncommittedChanges();
+      this.logger.debug("Synchronization inputs prepared", { syncRunId, capturedPendingNotes: pendingNotes.size, capturedPendingAssets: pendingAssets.size, attachmentsChanged: changed, forceFullAttachmentScan, recoveryCommitPending });
       if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
         for (const path of pendingNotes) this.pendingFiles.add(path);
         for (const path of pendingAssets) this.pendingAssets.add(path);
         if (forceFullAttachmentScan) this.fullAttachmentScanPending = true;
+        this.logger.debug("Synchronization deferred: pending note transition", { syncRunId, pendingDraftPublications: this.pendingDraftPublications.size, pendingNotePrivatizations: this.pendingNotePrivatizations.size });
         this.deferForLocalChanges();
         return;
       }
-      if (changed || pendingNotes.size || hasGitChanges) {
+      const deletionCandidates = [...new Set([
+        ...(this.settings().pendingDeletionPaths ?? []),
+        ...[...pendingNotes].filter((path) => !this.app.vault.getAbstractFileByPath(path)),
+        ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
+      ].map(normalizeVaultPath).filter(Boolean))].sort();
+      if (deletionCandidates.length) {
+        this.logger.warn("Synchronization requires deletion confirmation", { syncRunId, paths: deletionCandidates });
+        const confirmed = this.callbacks.confirmRemoteDeletions ? await this.callbacks.confirmRemoteDeletions(deletionCandidates) : false;
+        if (!confirmed) {
+          for (const path of pendingNotes) this.pendingFiles.add(path);
+          for (const path of pendingAssets) this.pendingAssets.add(path);
+          this.setState("local-changes");
+          return;
+        }
+        const remaining = (this.settings().pendingDeletionPaths ?? []).filter((path) => !deletionCandidates.includes(normalizeVaultPath(path)));
+        this.settings().pendingDeletionPaths = remaining;
+        await this.callbacks.onPendingDeletionPaths?.(remaining);
+      }
+      if (shouldCommitManagedChanges({
+        pendingNotes: pendingNotes.size,
+        attachmentsChanged: changed,
+        gitignoreChanged,
+        sharedPluginStateChanged,
+        recoveryCommitPending
+      })) {
         this.startProgress("提交本地更改", 1);
+        const commitPaths = new Set<string>(pendingNotes);
+        if (changed) commitPaths.add(MANIFEST_PATH);
+        if (gitignoreChanged) commitPaths.add(".gitignore");
+        if (sharedPluginStateChanged) commitPaths.add(SHARED_PLUGIN_STATE_PATH);
         await git.commit(
           `Update vault: ${pendingNotes.size || 1} files`,
           () => [...this.pendingDraftPublications.values(), ...this.pendingNotePrivatizations.values()]
-            .flatMap(({ file, originalPath }) => [normalizeVaultPath(file.path), normalizeVaultPath(originalPath)])
+            .flatMap(({ file, originalPath }) => [normalizeVaultPath(file.path), normalizeVaultPath(originalPath)]),
+          [...commitPaths]
         );
         this.advanceProgress();
       }
@@ -901,6 +1254,7 @@ export class SyncCoordinator {
       this.advanceProgress();
       const initialReconciliation = await this.mergeFetchedRemote(git, vault, manifestBeforeRemote);
       if (initialReconciliation.deferred) {
+        this.logger.debug("Synchronization deferred: local work appeared before merge", { syncRunId, pendingFiles: this.pendingFiles.size, pendingAssets: this.pendingAssets.size, fullAttachmentScanPending: this.fullAttachmentScanPending, recoveryCommitPending: this.recoveryCommitPending });
         this.deferForLocalChanges();
         return;
       }
@@ -923,6 +1277,7 @@ export class SyncCoordinator {
         }
       );
       if (pushResult.deferred) {
+        this.logger.debug("Synchronization deferred during push reconciliation", { syncRunId });
         this.deferForLocalChanges();
         return;
       }
@@ -930,23 +1285,30 @@ export class SyncCoordinator {
         this.enterConflict(pushResult.conflicts);
         return;
       }
+      await this.collectExpiredAttachmentRetention(vault);
+      this.startProgress("更新本地同步状态", 1);
       const active = this.app.workspace.getActiveFile();
       if (active) this.currentAuthor = (await git.log(active.path, 1))[0]?.author;
+      this.advanceProgress("作者信息");
       if (settings.privateSyncEnabled && settings.privateSyncWithTeam) {
         await this.executePrivateNotesSync(vault);
-        this.privateSyncDirty = false;
       }
       this.lastSyncAt = Date.now();
-      this.lastError = "";
       this.progress = undefined;
-      const remainingChanges = await git.hasUncommittedChanges();
-      const queuedChanges = this.pendingFiles.size > 0 || this.pendingAssets.size > 0 || this.fullAttachmentScanPending || (this.privateSyncDirty && settings.privateSyncWithTeam);
-      this.setState(remainingChanges || queuedChanges ? "local-changes" : "synced");
-      if (!remainingChanges && !queuedChanges) this.notifyRestartRequired();
+      const queuedChanges = this.pendingFiles.size > 0
+        || this.pendingAssets.size > 0
+        || this.fullAttachmentScanPending
+        || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam);
+      this.logger.debug("Synchronization cycle completed", { syncRunId, queuedChanges, pendingFiles: this.pendingFiles.size, pendingAssets: this.pendingAssets.size, fullAttachmentScanPending: this.fullAttachmentScanPending, privateSyncDirty: this.privateSyncDirty, finalState: queuedChanges ? "local-changes" : "synced" });
+      if (this.finishRemoteAttachmentState()) {
+        this.setState(queuedChanges ? "local-changes" : "synced");
+        if (!queuedChanges) this.notifyRestartRequired();
+      }
     } catch (error) {
       for (const path of pendingNotes) this.pendingFiles.add(path);
       for (const path of pendingAssets) this.pendingAssets.add(path);
       if (forceFullAttachmentScan) this.fullAttachmentScanPending = true;
+      this.recoveryCommitPending ||= recoveryCommitPending;
       this.lastError = error instanceof Error ? error.message : String(error);
       if (this.isOffline(error)) this.setState("offline");
       else {
@@ -954,13 +1316,19 @@ export class SyncCoordinator {
         this.callbacks.onNotice(`Oldeng Team Core 同步失败：${this.lastError}`);
       }
       this.logger.error("Synchronization failed", { error: this.lastError });
+    } finally {
+      if (this.activeSyncRunId === syncRunId) this.activeSyncRunId = previousSyncRunId;
     }
   }
 
   private async mergeFetchedRemote(git: GitRepository, vault: BinaryVault, manifestBeforeRemote: AssetManifest): Promise<RemoteReconciliationResult> {
     // A note may be edited while fetch is in flight. Defer the merge so the
-    // next cycle commits that edit before checkout can materialize remote data.
-    if (await git.hasUncommittedChanges()) return { conflicts: [], deferred: true };
+    // next cycle commits that event-derived edit before checkout can
+    // materialize remote data. Full worktree recovery is an explicit startup
+    // boundary, not part of every incremental merge.
+    if (this.pendingFiles.size || this.pendingAssets.size || this.fullAttachmentScanPending || this.recoveryCommitPending) {
+      return { conflicts: [], deferred: true };
+    }
     this.startProgress("合并远端更改", 1);
     const previousSharedPluginIds = [...this.sharedPluginIds];
     const merge = await git.mergeRemote();
@@ -978,10 +1346,25 @@ export class SyncCoordinator {
     const settings = this.settings();
     if (!settings.privateSyncEnabled) return;
     this.startProgress("同步私人笔记", 1);
-    const result = await new PrivateNotesSynchronizer(settings, this.logger).sync(vault, settings.privateSyncState, (current, total, path) => {
-      this.updateProgress("同步私人笔记", current, total, path);
-    });
-    this.callbacks.onPrivateSyncState(result.state);
+    await this.flushPrivateStatePersistence();
+    const pendingForRun = takePendingPaths(this.privatePendingPaths);
+    const fullScanForRun = this.privateFullScanPending;
+    this.privateFullScanPending = false;
+    const runState = { ...settings.privateSyncState, pendingPaths: [...pendingForRun].sort() };
+    let result: PrivateSyncResult;
+    try {
+      result = await new PrivateNotesSynchronizer(settings, this.logger, undefined, this.privateTransactionPath()).sync(vault, runState, (current, total, path) => {
+        this.updateProgress("同步私人笔记", current, total, path);
+      }, fullScanForRun);
+    } catch (error) {
+      for (const path of pendingForRun) this.privatePendingPaths.add(path);
+      this.privateFullScanPending ||= fullScanForRun;
+      this.privateSyncDirty = this.privatePendingPaths.size > 0 || this.privateFullScanPending;
+      await this.persistPrivateSyncState({ ...settings.privateSyncState, pendingPaths: [...this.privatePendingPaths].sort() });
+      throw error;
+    }
+    this.privateSyncDirty = this.privatePendingPaths.size > 0 || this.privateFullScanPending;
+    await this.persistPrivateSyncState({ ...result.state, pendingPaths: [...this.privatePendingPaths].sort() });
     this.logger.debug("Private note synchronization completed", {
       uploaded: result.uploaded,
       downloaded: result.downloaded,
@@ -991,23 +1374,47 @@ export class SyncCoordinator {
     });
   }
 
-  private async executePrivateNotesPull(vault: BinaryVault): Promise<void> {
+  private async executePrivateNotesPull(vault: BinaryVault, overwriteLocal = false): Promise<PrivateSyncResult> {
     const settings = this.settings();
-    if (!settings.privateSyncEnabled) return;
+    if (!settings.privateSyncEnabled) throw new Error("请先在设置中启用“私人笔记多端同步”");
     this.startProgress("从远端导入私人笔记", 1);
-    const result = await new PrivateNotesSynchronizer(settings, this.logger).pull(vault, settings.privateSyncState, (current, total, path) => {
-      this.updateProgress("从远端导入私人笔记", current, total, path);
-    });
-    this.callbacks.onPrivateSyncState(result.state);
-    this.logger.debug("Private note remote pull completed", { downloaded: result.downloaded, deletedLocal: result.deletedLocal });
+    await this.flushPrivateStatePersistence();
+    const pendingBeforePull = takePendingPaths(this.privatePendingPaths);
+    let result: PrivateSyncResult;
+    try {
+      result = await new PrivateNotesSynchronizer(settings, this.logger, undefined, this.privateTransactionPath()).pull(
+        vault,
+        settings.privateSyncState,
+        (current, total, path) => this.updateProgress("从远端导入私人笔记", current, total, path),
+        overwriteLocal
+      );
+    } catch (error) {
+      for (const path of pendingBeforePull) this.privatePendingPaths.add(path);
+      await this.persistPrivateSyncState({ ...settings.privateSyncState, pendingPaths: [...this.privatePendingPaths].sort() });
+      throw error;
+    }
+    this.privateFullScanPending = false;
+    // A confirmed destructive reset intentionally drops the event generation
+    // it replaced. Safe import retains it, alongside changes that arrived
+    // while the import was running.
+    if (!overwriteLocal) for (const path of pendingBeforePull) this.privatePendingPaths.add(path);
+    for (const path of result.state.pendingPaths ?? []) this.privatePendingPaths.add(path);
+    this.privateSyncDirty = this.privatePendingPaths.size > 0;
+    await this.persistPrivateSyncState({ ...result.state, pendingPaths: [...this.privatePendingPaths].sort() });
+    this.logger.debug("Private note remote pull completed", { downloaded: result.downloaded, deletedLocal: result.deletedLocal, preservedLocal: result.preservedLocal, overwriteLocal });
+    return result;
   }
 
-  private async clearPrivateNotesForRemotePull(vault: BinaryVault): Promise<void> {
-    const existing = await vault.stat(PRIVATE_FOLDER);
-    this.startProgress("清理本地私人笔记", 1);
-    if (existing) await vault.rmdir(PRIVATE_FOLDER, true);
-    await vault.mkdir(PRIVATE_FOLDER);
-    this.advanceProgress(existing ? PRIVATE_FOLDER : "无需清理私人笔记");
+  /** A safe import must keep retained local data visible until the user syncs or resets it. */
+  private recordPrivatePullResult(result: PrivateSyncResult): void {
+    this.privateSyncDirty = this.privatePendingPaths.size > 0 || result.preservedLocal > 0;
+    if (result.preservedLocal) {
+      this.callbacks.onNotice(`已保留 ${result.preservedLocal} 个本地私人笔记改动；使用“重置私人笔记并重新同步”才会以远端覆盖本地。`);
+    }
+  }
+
+  private privateTransactionPath(): string {
+    return `${normalizeVaultPath(this.app.vault.configDir)}/plugins/team-core/private-sync-transaction.json`;
   }
 
   private async ensureSharedPluginState(vault: BinaryVault): Promise<void> {
@@ -1017,9 +1424,15 @@ export class SyncCoordinator {
     await writeSharedPluginState(vault, enabled);
   }
 
-  private async syncSharedPluginStateBeforeCommit(vault: BinaryVault): Promise<void> {
+  private async syncSharedPluginStateBeforeCommit(vault: BinaryVault): Promise<boolean> {
     const enabled = (await readCommunityPluginIds(vault, this.app.vault.configDir)).filter((id) => this.sharedPluginIds.includes(id));
+    const before = await vault.read(SHARED_PLUGIN_STATE_PATH).catch(() => undefined);
     await writeSharedPluginState(vault, enabled);
+    const after = await vault.read(SHARED_PLUGIN_STATE_PATH).catch(() => undefined);
+    if (!before || !after || before.byteLength !== after.byteLength) return before !== after;
+    const left = new Uint8Array(before);
+    const right = new Uint8Array(after);
+    return !left.every((value, index) => value === right[index]);
   }
 
   private async applySharedPluginState(vault: BinaryVault): Promise<boolean> {
@@ -1051,7 +1464,50 @@ export class SyncCoordinator {
   private deferForLocalChanges(): void {
     this.progress = undefined;
     this.lastError = "";
-    this.setState("local-changes");
+    this.logger.debug("Synchronization deferred; refreshing authoritative state", { syncRunId: this.activeSyncRunId, pendingFiles: this.pendingFiles.size, pendingAssets: this.pendingAssets.size, privateSyncDirty: this.privateSyncDirty });
+    // Do not publish the intermediate state before the authoritative Git read.
+    // A no-op/deferred cycle must settle directly on "synced"; otherwise the
+    // status bar can remain stuck at "待同步" until the next plugin reload.
+    void this.refreshState();
+  }
+
+  /**
+   * Establishes a single authoritative recovery boundary after startup or an
+   * unexpected dirty-worktree guard. Vault events are fast but ephemeral; Git
+   * status is the source of truth when those events may have been missed.
+   */
+  private async recoverLocalWorktree(git: GitRepository, vault: BinaryVault): Promise<boolean> {
+    const recovery = await git.recoverManagedWorktree();
+    for (const path of recovery.changedManagedPaths) this.pendingFiles.add(path);
+    this.recoveryCommitPending ||= recovery.hasChanges;
+
+    if (!this.recoveryAttachmentCheckComplete) {
+      this.recoveryAttachmentCheckComplete = true;
+      if (await this.requiresAttachmentReconciliation(vault)) this.fullAttachmentScanPending = true;
+    }
+    return recovery.hasChanges || this.fullAttachmentScanPending;
+  }
+
+  /**
+   * Authoritative recovery validation. It intentionally hashes every public
+   * attachment once: a same-sized external overwrite can otherwise retain a
+   * valid-looking content-addressed filename and evade event recovery.
+   */
+  private async requiresAttachmentReconciliation(vault: BinaryVault): Promise<boolean> {
+    const manifest = await readManifest(vault);
+    for (const [path, entry] of Object.entries(manifest.files)) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile) || hashFromAssetPath(path) !== entry.sha256 || file.stat.size !== entry.size) return true;
+    }
+    for (const file of this.app.vault.getFiles()) {
+      const path = normalizeVaultPath(file.path);
+      if (!isAssetPath(path)) continue;
+      const expectedHash = hashFromAssetPath(path);
+      const entry = manifest.files[path];
+      if (!expectedHash || !entry || entry.sha256 !== expectedHash || entry.size !== file.stat.size) return true;
+      if (await sha256VaultFile(vault, path, file.stat.size) !== entry.sha256) return true;
+    }
+    return false;
   }
 
   private enterConflict(conflicts: string[], notify = true): void {
@@ -1077,24 +1533,14 @@ export class SyncCoordinator {
       }
     }
     const discovered = await this.collectAttachmentCandidates(pendingNotes, pendingAssets, forceFullScan);
-    const candidates = forceFullScan
-      ? new Set([...discovered].filter((path) => {
-        const file = this.app.vault.getAbstractFileByPath(path);
-        if (!(file instanceof TFile)) return false;
-        const normalizedPath = normalizeVaultPath(file.path);
-        if (!isAssetPath(file.path) && !pendingAssets.has(normalizedPath)) return false;
-        const namedHash = hashFromAssetPath(normalizedPath);
-        const entry = manifest.files[normalizedPath];
-        return pendingAssets.has(normalizedPath)
-          || !namedHash
-          || !entry
-          || entry.sha256 !== namedHash
-          || entry.size !== file.stat.size;
-      }))
-      : discovered;
+    // Full scans are explicit normalization/recovery boundaries. Re-hash all
+    // assets there, including valid-looking hash-named files, so a same-sized
+    // external overwrite cannot escape content verification.
+    const candidates = discovered;
     this.logger.debug("Attachment candidates selected", { count: candidates.size, fullScan: forceFullScan, pendingAssets: pendingAssets.size, pendingNotes: pendingNotes.size });
     if (!candidates.size) {
       const manifestMissing = !(await vault.exists(MANIFEST_PATH));
+      await this.recordRetiredAttachments(manifest, next);
       if (next !== manifest || manifestMissing) await writeManifest(vault, next);
       return next !== manifest || manifestMissing;
     }
@@ -1121,33 +1567,43 @@ export class SyncCoordinator {
       let data: ArrayBuffer | undefined;
       if (!hash || size === undefined) {
         const readStartedAt = Date.now();
-        this.logger.debug("Attachment read started", { path: normalizedSource, expectedSize: size });
-        data = await vault.read(normalizedSource);
-        hash = await sha256Hex(data);
-        size = data.byteLength;
-        this.logger.debug("Attachment read completed", { path: normalizedSource, size, durationMs: Date.now() - readStartedAt, hash });
+        size = file.stat.size;
+        this.logger.debug("Attachment hash started", { path: normalizedSource, expectedSize: size, chunked: size > VAULT_TRANSFER_CHUNK_SIZE });
+        if (size > VAULT_TRANSFER_CHUNK_SIZE) {
+          hash = await sha256VaultFile(vault, normalizedSource, size);
+        } else {
+          data = await vault.read(normalizedSource);
+          hash = await sha256Hex(data);
+          size = data.byteLength;
+        }
+        this.logger.debug("Attachment hash completed", { path: normalizedSource, size, durationMs: Date.now() - readStartedAt, hash });
       }
       const targetPath = assetPathForHash(hash, file.extension);
       const objectId = `${hash}:${size}`;
       const requiresUpload = !knownObjects.has(objectId);
       if (requiresUpload) knownObjects.add(objectId);
-      plans.push({ sourcePath: normalizedSource, targetPath, hash, size, mime: this.mime(targetPath), data, requiresUpload });
+      plans.push({ sourcePath: normalizedSource, targetPath, hash, size, mime: mimeFromPath(targetPath), data, requiresUpload });
       this.advanceProgress(normalizedSource);
     }
 
     const uploads = plans.filter((plan) => plan.requiresUpload);
     if (uploads.length) {
-      const s3 = new S3Transport(this.settings(), this.logger);
+      const attachmentStore = createAttachmentStore(this.settings(), this.logger);
+      if (!attachmentStore.enabled()) throw new Error("公共附件对象存储配置不完整");
       this.startProgress("上传新附件", uploads.length);
       for (const plan of uploads) {
         const uploadStartedAt = Date.now();
         this.logger.debug("Attachment upload started", { path: plan.sourcePath, hash: plan.hash, size: plan.size, mime: plan.mime });
-        const data = plan.data ?? await vault.read(plan.sourcePath);
-        if (data.byteLength !== plan.size || await sha256Hex(data) !== plan.hash) {
-          this.logger.error("Attachment changed before upload", { path: plan.sourcePath, expectedSize: plan.size, actualSize: data.byteLength, hash: plan.hash });
-          throw new Error(`附件在同步时发生变化：${plan.sourcePath}`);
+        if (plan.size > VAULT_TRANSFER_CHUNK_SIZE) {
+          await attachmentStore.ensureUploadedFromChunks(plan.hash, plan.size, plan.mime, (onChunk) => readVaultInChunks(vault, plan.sourcePath, plan.size, onChunk));
+        } else {
+          const data = plan.data ?? await vault.read(plan.sourcePath);
+          if (data.byteLength !== plan.size || await sha256Hex(data) !== plan.hash) {
+            this.logger.error("Attachment changed before upload", { path: plan.sourcePath, expectedSize: plan.size, actualSize: data.byteLength, hash: plan.hash });
+            throw new Error(`附件在同步时发生变化：${plan.sourcePath}`);
+          }
+          await attachmentStore.ensureUploaded(plan.hash, data, plan.mime);
         }
-        await s3.ensureUploaded(plan.hash, data, plan.mime);
         this.logger.debug("Attachment upload completed", { path: plan.sourcePath, hash: plan.hash, size: plan.size, durationMs: Date.now() - uploadStartedAt });
         this.advanceProgress(plan.sourcePath);
       }
@@ -1186,8 +1642,44 @@ export class SyncCoordinator {
     }
     const linksChanged = await this.rewriteLinksForRenames(renames);
     const manifestChanged = JSON.stringify(next) !== JSON.stringify(manifest);
+    await this.recordRetiredAttachments(manifest, next);
     if (manifestChanged) await writeManifest(vault, next);
     return manifestChanged || linksChanged;
+  }
+
+  private async recordRetiredAttachments(before: AssetManifest, after: AssetManifest): Promise<void> {
+    const referenced = new Set(Object.values(after.files).map((entry) => `${entry.sha256}:${entry.size}`));
+    const now = new Date().toISOString();
+    const existing = this.settings().assetRetention ?? [];
+    const additions = Object.values(before.files)
+      .filter((entry) => !referenced.has(`${entry.sha256}:${entry.size}`))
+      .map((entry) => ({ sha256: entry.sha256, size: entry.size, markedAt: now } satisfies AssetRetentionRecord));
+    const merged = new Map(existing.map((entry) => [`${entry.sha256}:${entry.size}`, entry]));
+    for (const entry of additions) if (!merged.has(`${entry.sha256}:${entry.size}`)) merged.set(`${entry.sha256}:${entry.size}`, entry);
+    const next = [...merged.values()].sort((left, right) => left.markedAt.localeCompare(right.markedAt));
+    if (JSON.stringify(next) !== JSON.stringify(existing)) {
+      this.settings().assetRetention = next;
+      await this.callbacks.onAssetRetention?.(next);
+    }
+  }
+
+  private async collectExpiredAttachmentRetention(vault: BinaryVault): Promise<void> {
+    const records = this.settings().assetRetention ?? [];
+    if (!records.length) return;
+    const manifest = await readManifest(vault);
+    const referenced = new Set(Object.values(manifest.files).map((entry) => `${entry.sha256}:${entry.size}`));
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const expired = records.filter((entry) => Date.parse(entry.markedAt) <= cutoff && !referenced.has(`${entry.sha256}:${entry.size}`));
+    if (!expired.length) return;
+      const store = createAttachmentStore(this.settings(), this.logger);
+    const git = this.createRepository(vault);
+    const historical = await git.historicalAttachmentObjects();
+    const collectible = expired.filter((entry) => !historical.has("*") && !historical.has(`${entry.sha256}:${entry.size}`));
+    for (const entry of collectible) await store.removeObject(entry.sha256);
+    const next = records.filter((entry) => !collectible.includes(entry));
+    this.settings().assetRetention = next;
+    await this.callbacks.onAssetRetention?.(next);
+    this.logger.debug("Expired public attachment retention records collected", { count: collectible.length, protectedByHistory: expired.length - collectible.length });
   }
 
   private async collectAttachmentCandidates(pendingNotes: ReadonlySet<string>, pendingAssets: ReadonlySet<string>, fullScan: boolean): Promise<Set<string>> {
@@ -1291,13 +1783,7 @@ export class SyncCoordinator {
       for (const attachment of plan.attachments) {
         if (!attachment.createTarget || materialized.has(attachment.targetPath)) continue;
         this.assertStableNoteMove(file, currentPath, moveRevision);
-        this.internalAssetWrites.add(attachment.targetPath);
-        try {
-          await vault.mkdir(attachment.targetPath.split("/").slice(0, -1).join("/"));
-          await this.app.vault.createBinary(attachment.targetPath, attachment.data);
-        } finally {
-          this.internalAssetWrites.delete(attachment.targetPath);
-        }
+        await this.createTransferredAttachment(attachment.targetPath, attachment.data);
         this.assertStableNoteMove(file, currentPath, moveRevision);
         materialized.add(attachment.targetPath);
         createdTargets.push(attachment.targetPath);
@@ -1320,12 +1806,7 @@ export class SyncCoordinator {
         this.assertStableNoteMove(file, currentPath, moveRevision);
         const source = this.app.vault.getAbstractFileByPath(attachment.sourcePath);
         if (!(source instanceof TFile)) continue;
-        try {
-          await this.app.fileManager.trashFile(source);
-          removedSources.add(attachment.sourcePath);
-        } catch (error) {
-          this.logger.warn("Unable to remove published private attachment", { path: attachment.sourcePath, error: String(error) });
-        }
+        if (await this.removeTransferredAttachment(source, "Unable to remove published private attachment")) removedSources.add(attachment.sourcePath);
         this.assertStableNoteMove(file, currentPath, moveRevision);
       }
 
@@ -1335,6 +1816,7 @@ export class SyncCoordinator {
       this.lastError = "";
       this.pendingFiles.add(currentPath);
       for (const attachment of plan.attachments) this.pendingAssets.add(attachment.targetPath);
+      this.recordPrivateMigration();
       this.scheduleSync();
       if (plan.attachments.length) {
         this.callbacks.onNotice(`私人草稿已发布，并整理 ${plan.attachments.length} 个附件。`);
@@ -1344,7 +1826,7 @@ export class SyncCoordinator {
       if (plan) {
         for (const attachment of plan.attachments) {
           if (removedSources.has(attachment.sourcePath) && !(await vault.exists(attachment.sourcePath))) {
-            await vault.write(attachment.sourcePath, attachment.data).catch(() => undefined);
+            await this.restoreTransferredAttachment(attachment.sourcePath, attachment.data).catch(() => undefined);
           }
         }
       }
@@ -1358,9 +1840,7 @@ export class SyncCoordinator {
         }
       }
       for (const targetPath of createdTargets.reverse()) {
-        const target = this.app.vault.getAbstractFileByPath(targetPath);
-        if (target instanceof TFile) await this.app.fileManager.trashFile(target).catch(() => undefined);
-        else if (await vault.exists(targetPath)) await vault.remove(targetPath).catch(() => undefined);
+        await this.discardTransferredAttachment(targetPath).catch(() => undefined);
       }
       let rolledBack = false;
       if (stable && this.app.vault.getAbstractFileByPath(currentPath) instanceof TFile && !(await vault.exists(originalPath))) {
@@ -1417,8 +1897,7 @@ export class SyncCoordinator {
       for (const attachment of plan.attachments) {
         if (!attachment.createTarget || materialized.has(attachment.targetPath)) continue;
         this.assertStableNoteMove(file, currentPath, moveRevision);
-        await vault.mkdir(attachment.targetPath.split("/").slice(0, -1).join("/"));
-        await this.app.vault.createBinary(attachment.targetPath, attachment.data);
+        await this.createTransferredAttachment(attachment.targetPath, attachment.data);
         this.assertStableNoteMove(file, currentPath, moveRevision);
         materialized.add(attachment.targetPath);
         createdTargets.push(attachment.targetPath);
@@ -1441,15 +1920,7 @@ export class SyncCoordinator {
         this.assertStableNoteMove(file, currentPath, moveRevision);
         const source = this.app.vault.getAbstractFileByPath(attachment.sourcePath);
         if (!(source instanceof TFile)) continue;
-        this.internalAssetWrites.add(attachment.sourcePath);
-        try {
-          await this.app.fileManager.trashFile(source);
-          removedSources.add(attachment.sourcePath);
-        } catch (error) {
-          this.logger.warn("Unable to remove privatized public attachment", { path: attachment.sourcePath, error: String(error) });
-        } finally {
-          this.internalAssetWrites.delete(attachment.sourcePath);
-        }
+        if (await this.removeTransferredAttachment(source, "Unable to remove privatized public attachment")) removedSources.add(attachment.sourcePath);
         this.assertStableNoteMove(file, currentPath, moveRevision);
       }
 
@@ -1459,6 +1930,7 @@ export class SyncCoordinator {
       this.lastError = "";
       this.pendingFiles.add(normalizeVaultPath(originalPath));
       for (const sourcePath of removedSources) this.pendingAssets.add(sourcePath);
+      this.recordPrivateMigration();
       this.scheduleSync();
       if (plan.attachments.length) {
         this.callbacks.onNotice(`笔记已移入“私人笔记”，并整理 ${plan.attachments.length} 个附件。`);
@@ -1468,7 +1940,7 @@ export class SyncCoordinator {
       if (plan) {
         for (const attachment of plan.attachments) {
           if (removedSources.has(attachment.sourcePath) && !(await vault.exists(attachment.sourcePath))) {
-            await vault.write(attachment.sourcePath, attachment.data).catch(() => undefined);
+            await this.restoreTransferredAttachment(attachment.sourcePath, attachment.data).catch(() => undefined);
           }
         }
       }
@@ -1482,9 +1954,7 @@ export class SyncCoordinator {
         }
       }
       for (const targetPath of createdTargets.reverse()) {
-        const target = this.app.vault.getAbstractFileByPath(targetPath);
-        if (target instanceof TFile) await this.app.fileManager.trashFile(target).catch(() => undefined);
-        else if (await vault.exists(targetPath)) await vault.remove(targetPath).catch(() => undefined);
+        await this.discardTransferredAttachment(targetPath).catch(() => undefined);
       }
       let rolledBack = false;
       if (stable && this.app.vault.getAbstractFileByPath(currentPath) instanceof TFile && !(await vault.exists(originalPath))) {
@@ -1504,13 +1974,70 @@ export class SyncCoordinator {
     }
   }
 
+  /** Both public-to-private and private-to-public moves must suppress identical vault events. */
+  private async createTransferredAttachment(path: string, data: ArrayBuffer): Promise<void> {
+    this.internalAssetWrites.add(path);
+    try {
+      await this.createVault().mkdir(path.split("/").slice(0, -1).join("/"));
+      await this.app.vault.createBinary(path, data);
+    } finally {
+      this.internalAssetWrites.delete(path);
+    }
+  }
+
+  /** Restores a failed migration source without queuing a synthetic sync event. */
+  private async restoreTransferredAttachment(path: string, data: ArrayBuffer): Promise<void> {
+    this.internalAssetWrites.add(path);
+    try {
+      await this.createVault().mkdir(path.split("/").slice(0, -1).join("/"));
+      await this.app.vault.createBinary(path, data);
+    } finally {
+      this.internalAssetWrites.delete(path);
+    }
+  }
+
+  /** Removes a failed migration target without queuing a synthetic sync event. */
+  private async discardTransferredAttachment(path: string): Promise<void> {
+    this.internalAssetWrites.add(path);
+    try {
+      const target = this.app.vault.getAbstractFileByPath(path);
+      if (target instanceof TFile) await this.app.fileManager.trashFile(target);
+      else if (await this.createVault().exists(path)) await this.createVault().remove(path);
+    } finally {
+      this.internalAssetWrites.delete(path);
+    }
+  }
+
+  private async removeTransferredAttachment(file: TFile, warning: string): Promise<boolean> {
+    const path = normalizeVaultPath(file.path);
+    this.internalAssetWrites.add(path);
+    try {
+      await this.app.fileManager.trashFile(file);
+      return true;
+    } catch (error) {
+      this.logger.warn(warning, { path, error: String(error) });
+      return false;
+    } finally {
+      this.internalAssetWrites.delete(path);
+    }
+  }
+
+  private recordPrivateMigration(): void {
+    if (!shouldTrackPrivateSyncEvent(this.settings())) return;
+    // Attachment moves may affect several references and can occur before the
+    // final Vault events arrive, so recover once rather than guessing paths.
+    this.queuePrivatePaths([], true);
+    this.schedulePrivateSync();
+  }
+
   private manifestEntry(plan: AttachmentPlan): AssetManifestEntry {
     return {
       sha256: plan.hash,
       size: plan.size,
       mime: plan.mime,
       uploadedAt: new Date().toISOString(),
-      uploadedBy: this.settings().gitUsername.trim() || "unknown"
+      uploadedBy: this.settings().gitUsername.trim() || "unknown",
+      ...(this.settings().installationId ? { uploadedFrom: this.settings().installationId } : {})
     };
   }
 
@@ -1539,15 +2066,18 @@ export class SyncCoordinator {
   }
 
   private async materializeRemoteAttachments(before: AssetManifest, after: AssetManifest): Promise<void> {
+    this.pruneRemoteAttachmentIssues(after);
     const entries = Object.entries(after.files).filter(([path, entry]) => {
       const previous = before.files[path];
       const localFileExists = this.app.vault.getAbstractFileByPath(path) instanceof TFile;
-      return shouldMaterializeRemoteAttachment(previous, entry, localFileExists);
+      return this.remoteAttachmentIssues.has(path) || shouldMaterializeRemoteAttachment(previous, entry, localFileExists);
     });
     if (!entries.length) return;
     const vault = this.createVault();
-    const s3 = new S3Transport(this.settings(), this.logger);
+    const attachmentStore = createAttachmentStore(this.settings(), this.logger);
+    if (!attachmentStore.enabled()) throw new Error("公共附件对象存储配置不完整");
     const username = this.settings().gitUsername.trim() || "unknown";
+    const installationId = this.settings().installationId;
     this.startProgress("下载远端附件", entries.length);
     for (const [path, entry] of entries) {
       try {
@@ -1559,11 +2089,13 @@ export class SyncCoordinator {
           matches = await sha256Hex(local) === entry.sha256;
         }
         if (matches) {
+          this.remoteAttachmentIssues.delete(path);
           this.advanceProgress(path);
           continue;
         }
-        if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, username)) {
-          this.logger.warn("Local attachment differs from same-user manifest entry", { path });
+        if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, entry.uploadedFrom, installationId, username)) {
+          this.remoteAttachmentIssues.set(path, `本地附件与远端清单不一致，已保留本地文件：${path}`);
+          this.logger.warn("Local attachment differs from same-user manifest entry", { path, hash: entry.sha256 });
           this.advanceProgress(path);
           continue;
         }
@@ -1574,7 +2106,7 @@ export class SyncCoordinator {
           if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
           this.internalAssetWrites.add(path);
           try {
-            await s3.downloadInChunks(entry.sha256, entry.size, (chunk) => vault.append(temporaryPath, chunk));
+            await attachmentStore.downloadInChunks(entry.sha256, entry.size, (chunk) => vault.append(temporaryPath, chunk));
             this.logger.debug("Attachment Vault write started", { path, size: entry.size });
             await vault.rename(temporaryPath, path);
           } finally {
@@ -1584,15 +2116,17 @@ export class SyncCoordinator {
           this.logger.debug("Attachment Vault write completed", { path, size: entry.size, durationMs: Date.now() - downloadStartedAt });
           this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: entry.size, durationMs: Date.now() - downloadStartedAt });
         } else {
-          const data = await s3.download(entry.sha256);
+          const data = await attachmentStore.download(entry.sha256);
           if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
           this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
           await vault.write(path, data);
           this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
           this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
         }
+        this.remoteAttachmentIssues.delete(path);
       } catch (error) {
         if (error instanceof S3NotFoundError) {
+          this.remoteAttachmentIssues.set(path, `远端附件对象暂不可用：${path}（${entry.sha256}）`);
           this.logger.warn("Remote attachment object is missing", { path, hash: entry.sha256 });
           this.advanceProgress(path);
           continue;
@@ -1605,13 +2139,30 @@ export class SyncCoordinator {
     }
   }
 
-  private mime(path: string): string {
-    const ext = path.split(".").pop()?.toLowerCase();
-    return ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", pdf: "application/pdf", txt: "text/plain", md: "text/markdown" } as Record<string, string>)[ext ?? ""] ?? "application/octet-stream";
+  /** Git may be up to date while attachment bytes are still temporarily unavailable. */
+  private pruneRemoteAttachmentIssues(manifest: AssetManifest): void {
+    for (const path of this.remoteAttachmentIssues.keys()) {
+      if (!manifest.files[path]) this.remoteAttachmentIssues.delete(path);
+    }
+  }
+
+  /** Git may be up to date while attachment bytes are still temporarily unavailable. */
+  private finishRemoteAttachmentState(): boolean {
+    if (!this.remoteAttachmentIssues.size) {
+      this.lastError = "";
+      return true;
+    }
+    const [path, message] = [...this.remoteAttachmentIssues.entries()].sort(([left], [right]) => left.localeCompare(right))[0];
+    this.lastError = `${message}。将在下次同步重试；请确认上传该附件的设备或对象存储仍可访问。`;
+    this.logger.error("Remote attachment materialization incomplete", { path, issues: this.remoteAttachmentIssues.size });
+    this.setState("error");
+    return false;
   }
 
   private setState(state: SyncState): void {
+    const previous = this.state;
     this.state = state;
+    this.logger.debug("Synchronization state changed", { syncRunId: this.activeSyncRunId, from: previous, to: state, pendingFiles: this.pendingFiles.size, pendingAssets: this.pendingAssets.size, privateSyncDirty: this.privateSyncDirty, privatePendingPaths: this.privatePendingPaths.size, privateSyncEnabled: this.settings().privateSyncEnabled, progress: this.progress ? { phase: this.progress.phase, current: this.progress.current, total: this.progress.total } : undefined });
     this.callbacks.onSnapshot(this.snapshot());
   }
 

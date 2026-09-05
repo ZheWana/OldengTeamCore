@@ -2,6 +2,7 @@ import { requestUrl, type RequestUrlParam } from "obsidian";
 import { createSHA256 } from "hash-wasm";
 import { hmacSha256, sha256Hex, bytesToHex } from "./crypto";
 import type { Logger, TeamCoreSettings } from "./types";
+import type { PrivateIndexWriteResult, PrivateRemoteIndex } from "./private-sync";
 
 export class S3NotFoundError extends Error {
   constructor(public readonly key: string) {
@@ -25,9 +26,16 @@ interface S3Response {
 
 export const S3_DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 export const S3_CHUNKED_DOWNLOAD_THRESHOLD = S3_DOWNLOAD_CHUNK_SIZE;
+const S3_MIN_MULTIPART_PART_SIZE = 5 * 1024 * 1024;
+const S3_MAX_MULTIPART_PARTS = 10_000;
+const S3_SHA256_METADATA_HEADER = "x-amz-meta-sha256";
 
 export interface ChunkDownloadTarget {
   (chunk: ArrayBuffer, offset: number, total: number): Promise<void>;
+}
+
+export interface ChunkUploadSource {
+  (onChunk: ChunkDownloadTarget): Promise<void>;
 }
 
 const encodePath = (value: string): string => value.split("/").map((part) => encodeURIComponent(part).replace(/%2F/gi, "/")).join("/");
@@ -60,6 +68,10 @@ export class S3Transport {
     return [this.prefix, "sha256/"].filter(Boolean).join("/");
   }
 
+  managedObjectLocation(): string {
+    return this.managedObjectPrefix();
+  }
+
   objectUrl(hash: string): string {
     return this.urlForKey(this.objectKey(hash));
   }
@@ -73,13 +85,17 @@ export class S3Transport {
     return `${endpoint.origin}${basePath}${bucketPath}/${encodePath(key)}`;
   }
 
-  async head(hash: string): Promise<{ size: number; contentType?: string }> {
+  async head(hash: string): Promise<{ size: number; contentType?: string; sha256?: string }> {
     const key = this.objectKey(hash);
     const response = await this.request("HEAD", key);
     if (response.status === 404) throw new S3NotFoundError(key);
     if (response.status < 200 || response.status >= 300) throw await this.httpError("HEAD", key, response);
     const size = Number(response.headers["content-length"] ?? response.headers["Content-Length"] ?? 0);
-    return { size, contentType: response.headers["content-type"] ?? response.headers["Content-Type"] };
+    return {
+      size,
+      contentType: response.headers["content-type"] ?? response.headers["Content-Type"],
+      sha256: response.headers[S3_SHA256_METADATA_HEADER]?.toLowerCase()
+    };
   }
 
   async ensureUploaded(hash: string, data: ArrayBuffer, mime: string): Promise<void> {
@@ -87,19 +103,93 @@ export class S3Transport {
     try {
       const existing = await this.head(hash);
       if (existing.size !== data.byteLength) throw new S3PermanentError(`S3 object size mismatch for ${key}`);
-      return;
+      if (existing.sha256 === hash.toLowerCase()) return;
     } catch (error) {
       if (!(error instanceof S3NotFoundError)) throw error;
     }
     const sizeLimit = 5 * 1024 * 1024 * 1024;
     if (data.byteLength > sizeLimit) throw new S3PermanentError(`Attachment exceeds single-request limit: ${key}`);
-    const response = await this.request("PUT", key, data, mime);
+    const response = await this.request("PUT", key, data, mime, {}, { [S3_SHA256_METADATA_HEADER]: hash.toLowerCase() });
     if (response.status < 200 || response.status >= 300) {
       if (response.status === 413) throw new S3PermanentError(`Attachment exceeds provider limit: ${key}`);
       throw await this.httpError("PUT", key, response);
     }
     const verified = await this.head(hash);
-    if (verified.size !== data.byteLength) throw new S3PermanentError(`S3 upload verification failed for ${key}`);
+    if (verified.size !== data.byteLength || verified.sha256 !== hash.toLowerCase()) throw new S3PermanentError(`S3 upload verification failed for ${key}`);
+  }
+
+  /**
+   * Uploads a content-addressed attachment through S3 multipart requests. The
+   * source is read once in bounded chunks and verified before the upload is
+   * completed, so an edited source can never become the object named by an
+   * older SHA-256.
+   */
+  async ensureUploadedFromChunks(hash: string, size: number, mime: string, source: ChunkUploadSource): Promise<void> {
+    await this.ensureObjectUploadedFromChunks(this.objectKey(hash), hash, size, mime, source);
+  }
+
+  /** Multipart upload for immutable private objects with a caller-supplied key. */
+  async writeObjectFromChunks(key: string, hash: string, size: number, mime: string, source: ChunkUploadSource): Promise<void> {
+    await this.ensureObjectUploadedFromChunks(key, hash, size, mime, source);
+  }
+
+  private async ensureObjectUploadedFromChunks(key: string, expectedHash: string, size: number, mime: string, source: ChunkUploadSource): Promise<void> {
+    if (!Number.isSafeInteger(size) || size < 0 || !/^[0-9a-f]{64}$/i.test(expectedHash)) throw new S3PermanentError(`Invalid multipart upload metadata for ${key}`);
+    const existing = await this.request("HEAD", key);
+    if (existing.status >= 200 && existing.status < 300) {
+      const existingSize = Number(existing.headers["content-length"] ?? 0);
+      if (existingSize !== size) throw new S3PermanentError(`S3 object size mismatch for ${key}`);
+      if (existing.headers[S3_SHA256_METADATA_HEADER]?.toLowerCase() === expectedHash.toLowerCase()) return;
+    } else if (existing.status !== 404) {
+      throw await this.httpError("HEAD", key, existing);
+    }
+
+    const minimumPartSize = Math.max(S3_MIN_MULTIPART_PART_SIZE, Math.ceil(size / S3_MAX_MULTIPART_PARTS));
+    const initiated = await this.request("POST", key, undefined, mime, { uploads: "" }, { [S3_SHA256_METADATA_HEADER]: expectedHash.toLowerCase() });
+    if (initiated.status < 200 || initiated.status >= 300) throw await this.httpError("POST", key, initiated);
+    const uploadId = xmlTagText(new TextDecoder().decode(initiated.arrayBuffer), "UploadId");
+    if (!uploadId) throw new S3PermanentError(`S3 multipart initiation returned no upload ID for ${key}`);
+
+    const parts: Array<{ number: number; etag: string }> = [];
+    const hasher = await createSHA256();
+    hasher.init();
+    let nextOffset = 0;
+    try {
+      await source(async (chunk, offset, total) => {
+        if (total !== size || offset !== nextOffset || !chunk.byteLength || offset + chunk.byteLength > size) {
+          throw new S3PermanentError(`S3 multipart source changed during upload: ${key}`);
+        }
+        if (offset + chunk.byteLength < size && chunk.byteLength < minimumPartSize) {
+          throw new S3PermanentError(`S3 multipart chunk is smaller than the required ${minimumPartSize} byte part size: ${key}`);
+        }
+        if (parts.length >= S3_MAX_MULTIPART_PARTS) throw new S3PermanentError(`S3 multipart part limit exceeded for ${key}`);
+        const number = parts.length + 1;
+        const response = await this.request("PUT", key, chunk, mime, { partNumber: String(number), uploadId });
+        if (response.status < 200 || response.status >= 300) throw await this.httpError("PUT", key, response);
+        const etag = response.headers.etag;
+        if (!etag) throw new S3PermanentError(`S3 multipart part has no ETag for ${key}`);
+        hasher.update(new Uint8Array(chunk));
+        parts.push({ number, etag });
+        nextOffset += chunk.byteLength;
+      });
+      if (nextOffset !== size || hasher.digest() !== expectedHash.toLowerCase()) {
+        throw new S3PermanentError(`Attachment changed while uploading: ${key}`);
+      }
+      const bodyText = `<CompleteMultipartUpload>${parts.map((part) => `<Part><PartNumber>${part.number}</PartNumber><ETag>${escapeXml(part.etag)}</ETag></Part>`).join("")}</CompleteMultipartUpload>`;
+      const body = new TextEncoder().encode(bodyText);
+      const completed = await this.request("POST", key, body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength), "application/xml", { uploadId });
+      if (completed.status < 200 || completed.status >= 300) throw await this.httpError("POST", key, completed);
+      if (/<Error(?:\s|>)/.test(new TextDecoder().decode(completed.arrayBuffer))) {
+        throw new S3PermanentError(`S3 multipart completion failed for ${key}`);
+      }
+      const verified = await this.request("HEAD", key);
+      if (verified.status < 200 || verified.status >= 300 || Number(verified.headers["content-length"] ?? 0) !== size || verified.headers[S3_SHA256_METADATA_HEADER]?.toLowerCase() !== expectedHash.toLowerCase()) {
+        throw new S3PermanentError(`S3 multipart upload verification failed for ${key}`);
+      }
+    } catch (error) {
+      await this.request("DELETE", key, undefined, undefined, { uploadId }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async download(hash: string): Promise<ArrayBuffer> {
@@ -118,11 +208,26 @@ export class S3Transport {
   async downloadInChunks(hash: string, expectedSize: number, onChunk: ChunkDownloadTarget, chunkSize = S3_DOWNLOAD_CHUNK_SIZE): Promise<void> {
     if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new S3PermanentError("Invalid expected attachment size");
     if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) throw new S3PermanentError("Invalid attachment chunk size");
-    const key = this.objectKey(hash);
-    const remote = await this.head(hash);
-    if (remote.size !== expectedSize) throw new S3PermanentError(`S3 object size mismatch for ${key}`);
     const hasher = await createSHA256();
     hasher.init();
+    await this.readObjectInChunks(this.objectKey(hash), expectedSize, async (chunk, offset, total) => {
+      if (total !== expectedSize) throw new S3PermanentError("S3 chunk total changed during download");
+      hasher.update(new Uint8Array(chunk));
+      await onChunk(chunk, offset, total);
+    }, chunkSize);
+    const actual = hasher.digest();
+    if (actual !== hash.toLowerCase()) throw new S3PermanentError(`S3 hash verification failed for ${this.objectKey(hash)}`);
+  }
+
+  /** Range-download an arbitrary private object without retaining the whole body. */
+  async readObjectInChunks(key: string, expectedSize: number, onChunk: ChunkDownloadTarget, chunkSize = S3_DOWNLOAD_CHUNK_SIZE): Promise<void> {
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new S3PermanentError("Invalid expected object size");
+    if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) throw new S3PermanentError("Invalid S3 chunk size");
+    const head = await this.request("HEAD", key);
+    if (head.status === 404) throw new S3NotFoundError(key);
+    if (head.status < 200 || head.status >= 300) throw await this.httpError("HEAD", key, head);
+    const remoteSize = Number(head.headers["content-length"] ?? 0);
+    if (remoteSize !== expectedSize) throw new S3PermanentError(`S3 object size mismatch for ${key}`);
     let offset = 0;
     while (offset < expectedSize) {
       const end = Math.min(offset + chunkSize, expectedSize) - 1;
@@ -136,13 +241,10 @@ export class S3Transport {
       if (!range || Number(range[1]) !== offset || Number(range[2]) !== end || Number(range[3]) !== expectedSize || response.arrayBuffer.byteLength !== expectedChunkSize) {
         throw new S3PermanentError(`S3 range response was invalid for ${key}`);
       }
-      hasher.update(new Uint8Array(response.arrayBuffer));
       await onChunk(response.arrayBuffer, offset, expectedSize);
       this.logger.debug("S3 download chunk completed", { key, offset, size: expectedChunkSize, total: expectedSize });
       offset = end + 1;
     }
-    const actual = hasher.digest();
-    if (actual !== hash.toLowerCase()) throw new S3PermanentError(`S3 hash verification failed for ${key}`);
   }
 
   async listManagedObjects(): Promise<string[]> {
@@ -182,12 +284,24 @@ export class S3Transport {
     }
   }
 
+  async clearManagedObjects(onDeleted?: (key: string) => void): Promise<number> {
+    const keys = await this.listManagedObjects();
+    await this.deleteManagedObjects(keys, onDeleted);
+    return keys.length;
+  }
+
   /** General object operations used only by the user-owned private-note store. */
   async readObject(key: string): Promise<ArrayBuffer | undefined> {
+    return (await this.readObjectWithVersion(key)).data;
+  }
+
+  async readObjectWithVersion(key: string): Promise<PrivateRemoteIndex> {
     const response = await this.request("GET", key);
-    if (response.status === 404) return undefined;
+    if (response.status === 404) return { data: undefined, version: undefined };
     if (response.status < 200 || response.status >= 300) throw await this.httpError("GET", key, response);
-    return response.arrayBuffer;
+    const version = response.headers.etag;
+    if (!version) throw new Error(`S3 未返回 ETag，无法安全同步私人笔记：${key}`);
+    return { data: response.arrayBuffer, version };
   }
 
   async writeObject(key: string, data: ArrayBuffer, contentType = "application/octet-stream"): Promise<void> {
@@ -195,9 +309,21 @@ export class S3Transport {
     if (response.status < 200 || response.status >= 300) throw await this.httpError("PUT", key, response);
   }
 
+  async writeObjectIfUnchanged(key: string, data: ArrayBuffer, contentType: string, version: string | undefined): Promise<PrivateIndexWriteResult> {
+    const condition: Record<string, string> = version ? { "if-match": version } : { "if-none-match": "*" };
+    const response = await this.request("PUT", key, data, contentType, {}, condition);
+    if (response.status === 409 || response.status === 412) return "conflict";
+    if (response.status < 200 || response.status >= 300) throw await this.httpError("PUT", key, response);
+    return "written";
+  }
+
   async deleteObject(key: string): Promise<void> {
     const response = await this.request("DELETE", key);
     if (response.status !== 404 && (response.status < 200 || response.status >= 300)) throw await this.httpError("DELETE", key, response);
+  }
+
+  async removeObject(hash: string): Promise<void> {
+    await this.deleteObject(this.objectKey(hash));
   }
 
   private async request(method: string, key: string, body?: ArrayBuffer, contentType?: string, query: Record<string, string> = {}, extraHeaders: Record<string, string> = {}): Promise<S3Response> {
@@ -250,4 +376,13 @@ export class S3Transport {
 
 function compareAscii(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&apos;" })[character] ?? character);
+}
+
+function xmlTagText(document: string, name: string): string | undefined {
+  const match = new RegExp(`<${name}>([^<]+)</${name}>`).exec(document);
+  return match?.[1]?.trim();
 }

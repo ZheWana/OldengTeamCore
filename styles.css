@@ -127,6 +127,18 @@
 .team-core-commit-change-tab:hover:not(:disabled) { color: var(--text-normal); background: var(--background-modifier-hover); }
 .team-core-commit-change-tab.is-active { color: var(--text-accent); border-bottom-color: var(--interactive-accent); }
 .team-core-commit-change-tab:disabled { opacity: .48; cursor: default; }
+.team-core-local-changes-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+.team-core-local-changes-header h2 { margin: 0; }
+.team-core-local-changes-header > div > span { display: block; margin-top: .25rem; color: var(--text-muted); font-size: var(--font-ui-small); }
+.team-core-local-changes-header > button { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 2rem; height: 2rem; padding: 0; }
+.team-core-local-change-area-tabs { display: flex; gap: .35rem; margin: 0 0 .75rem; border-bottom: 1px solid var(--background-modifier-border); }
+.team-core-local-change-area-tab { display: inline-flex; align-items: center; gap: .38rem; min-height: 2.15rem; padding: .32rem .65rem; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: var(--text-muted); background: transparent; box-shadow: none; font-size: var(--font-ui-small); }
+.team-core-local-change-area-tab:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.team-core-local-change-area-tab.is-active { color: var(--text-accent); border-bottom-color: var(--interactive-accent); }
+.team-core-local-change-status { font-size: var(--font-ui-smaller); font-weight: var(--font-semibold); white-space: nowrap; }
+.team-core-local-change-status.is-added { color: var(--color-green); }
+.team-core-local-change-status.is-modified, .team-core-local-change-status.is-pending { color: var(--text-accent); }
+.team-core-local-change-status.is-deleted { color: var(--text-error); }
 .team-core-commit-change-tab-icon { display: inline-flex; flex: 0 0 auto; width: .95rem; height: .95rem; }
 .team-core-commit-change-tab-icon .svg-icon { width: .95rem; height: .95rem; }
 .team-core-commit-change-count { display: inline-grid; min-width: 1.25rem; height: 1.25rem; place-items: center; border-radius: 50%; color: var(--text-muted); background: var(--background-secondary); font-family: var(--font-monospace); font-size: .68rem; }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Vault } from "obsidian";
-import { mkdtemp, mkdir, readdir, readFile, rm, stat, rename, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readdir, readFile, rm, stat, rename, writeFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -11,8 +11,9 @@ import { base64UrlDecode, base64UrlEncode, base64UrlEncodeBytes, sha256Hex } fro
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
-import { PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
-import { planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { createAttachmentStore } from "../src/attachment-store";
+import { createPrivateRemote, PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
+import { classifyPrivateLocalChange, classifyPublicLocalChange, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -22,7 +23,12 @@ import { assignedOrHistoricalAuthors, clearFileAuthors, countResolvedDocumentAut
 import { Buffer as BrowserBuffer } from "../src/browser-shims";
 import { PluginLogger, parseLogEntries } from "../src/logger";
 import { AuthorDisplayService, parseAuthorDisplayMappings, serializeAuthorDisplayMappings } from "../src/author-display";
+import { SerializedPluginData } from "../src/persistence";
 import { compressSync, strToU8 } from "fflate";
+
+// Obsidian exposes its request-capable global as window. Keep production code
+// on that API while giving Node-based transport tests the equivalent runtime.
+Object.defineProperty(globalThis, "window", { configurable: true, value: globalThis });
 
 const execFileAsync = promisify(execFile);
 
@@ -44,11 +50,88 @@ const logger: Logger = { debug() {}, warn() {}, error() {} };
 
 class MemoryPrivateRemote implements PrivateSyncRemote {
   readonly objects = new Map<string, ArrayBuffer>();
+  protected indexRevision = 0;
 
   async initialize(): Promise<void> {}
   async read(path: string): Promise<ArrayBuffer | undefined> { return this.objects.get(path)?.slice(0); }
   async write(path: string, data: ArrayBuffer): Promise<void> { this.objects.set(path, data.slice(0)); }
+  async writeFromChunks(path: string, sha256: string, size: number, _contentType: string, source: (onChunk: (chunk: ArrayBuffer, offset: number, total: number) => Promise<void>) => Promise<void>): Promise<void> {
+    const chunks: Uint8Array[] = [];
+    let offset = 0;
+    await source(async (chunk, chunkOffset, total) => {
+      if (total !== size || chunkOffset !== offset) throw new Error("invalid test upload chunk");
+      chunks.push(new Uint8Array(chunk));
+      offset += chunk.byteLength;
+    });
+    const data = new Uint8Array(size);
+    let cursor = 0;
+    for (const chunk of chunks) { data.set(chunk, cursor); cursor += chunk.byteLength; }
+    if (cursor !== size || await sha256Hex(data) !== sha256) throw new Error("invalid test upload hash");
+    this.objects.set(path, data.buffer);
+  }
   async remove(path: string): Promise<void> { this.objects.delete(path); }
+  async readIndex() {
+    const data = await this.read("oldeng-team-core-private/v1/index.json");
+    return { data, version: data ? String(this.indexRevision) : undefined };
+  }
+  async writeIndex(data: ArrayBuffer, version: string | undefined) {
+    const current = this.objects.has("oldeng-team-core-private/v1/index.json") ? String(this.indexRevision) : undefined;
+    if (version !== current) return "conflict" as const;
+    this.objects.set("oldeng-team-core-private/v1/index.json", data.slice(0));
+    this.indexRevision += 1;
+    return "written" as const;
+  }
+}
+
+class ConcurrentIndexRemote extends MemoryPrivateRemote {
+  private injectOnNextIndexWrite: ArrayBuffer | undefined;
+
+  injectConcurrentIndex(data: ArrayBuffer): void {
+    this.injectOnNextIndexWrite = data;
+  }
+
+  override async writeIndex(data: ArrayBuffer, version: string | undefined) {
+    if (this.injectOnNextIndexWrite) {
+      this.objects.set("oldeng-team-core-private/v1/index.json", this.injectOnNextIndexWrite);
+      this.injectOnNextIndexWrite = undefined;
+      this.indexRevision += 1;
+    }
+    return super.writeIndex(data, version);
+  }
+}
+
+class HookedIndexRemote extends MemoryPrivateRemote {
+  onBeforeIndexWrite: (() => Promise<void>) | undefined;
+
+  override async writeIndex(data: ArrayBuffer, version: string | undefined) {
+    await this.onBeforeIndexWrite?.();
+    return super.writeIndex(data, version);
+  }
+}
+
+class CountingIndexRemote extends MemoryPrivateRemote {
+  indexWrites = 0;
+
+  override async writeIndex(data: ArrayBuffer, version: string | undefined) {
+    this.indexWrites += 1;
+    return super.writeIndex(data, version);
+  }
+}
+
+class ChunkingPrivateRemote extends MemoryPrivateRemote {
+  readonly chunkSizes: number[] = [];
+
+  override async readInChunks(path: string, expectedSize: number, onChunk: (chunk: ArrayBuffer, offset: number, total: number) => Promise<void>): Promise<void> {
+    const data = await this.read(path);
+    if (!data || data.byteLength !== expectedSize) throw new Error("missing test object");
+    const bytes = new Uint8Array(data);
+    const chunkSize = 1024 * 1024;
+    for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+      const chunk = bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength));
+      this.chunkSizes.push(chunk.byteLength);
+      await onChunk(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength), offset, bytes.byteLength);
+    }
+  }
 }
 
 class NodeVault implements BinaryVault {
@@ -66,6 +149,21 @@ class NodeVault implements BinaryVault {
   async append(path: string, data: ArrayBuffer): Promise<void> {
     await mkdir(dirname(this.resolve(path)), { recursive: true });
     await writeFile(this.resolve(path), new Uint8Array(data), { flag: "a" });
+  }
+  async readInChunks(path: string, expectedSize: number, onChunk: (chunk: ArrayBuffer, offset: number, total: number) => Promise<void>): Promise<void> {
+    const handle = await open(this.resolve(path), "r");
+    try {
+      let offset = 0;
+      while (offset < expectedSize) {
+        const chunk = new Uint8Array(Math.min(8 * 1024 * 1024, expectedSize - offset));
+        const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
+        if (bytesRead !== chunk.byteLength) throw new Error("short test read");
+        await onChunk(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + bytesRead), offset, expectedSize);
+        offset += bytesRead;
+      }
+    } finally {
+      await handle.close();
+    }
   }
   async exists(path: string): Promise<boolean> {
     try { await stat(this.resolve(path)); return true; } catch { return false; }
@@ -88,6 +186,24 @@ class NodeVault implements BinaryVault {
   rmdir(path: string): Promise<void> { return rm(this.resolve(path), { recursive: true, force: true }); }
   rename(path: string, newPath: string): Promise<void> {
     return rename(this.resolve(path), this.resolve(newPath));
+  }
+}
+
+class CountingVault extends NodeVault {
+  readonly reads: string[] = [];
+
+  override async read(path: string): Promise<ArrayBuffer> {
+    this.reads.push(path);
+    return super.read(path);
+  }
+}
+
+class ListCountingVault extends NodeVault {
+  readonly listed: string[] = [];
+
+  override async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    this.listed.push(path);
+    return super.list(path);
   }
 }
 
@@ -115,6 +231,19 @@ describe("diagnostic logging", () => {
       { timestamp: "bad", level: "unknown", message: "ignored" },
       null
     ])).toHaveLength(1);
+  });
+
+  it("serializes settings and diagnostics writes without losing either change", async () => {
+    const writes: Record<string, unknown>[] = [];
+    const store = new SerializedPluginData({ retained: "value", diagnosticLogs: ["old"] }, async (data) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      writes.push(data);
+    });
+    await Promise.all([
+      store.update({ gitUrl: "https://git.example.test/updated.git", autoSync: true }),
+      store.update({ diagnosticLogs: ["new"] })
+    ]);
+    expect(writes.at(-1)).toEqual({ retained: "value", diagnosticLogs: ["new"], gitUrl: "https://git.example.test/updated.git", autoSync: true });
   });
 });
 
@@ -220,11 +349,11 @@ async function startGitHttpServer(projectRoot: string, beforeFirstPush: () => Pr
 
 describe("configuration bundles", () => {
   it("round-trips shared settings without replacing the local identity", () => {
-    const source = settings({ gitUsername: "source-user", debounceMs: 90_000 });
-    const current = settings({ gitUsername: "local-user", debounceMs: 60_000 });
+    const source = settings({ gitUsername: "source-user", debounceMs: 90_000, installationId: "a".repeat(48) });
+    const current = settings({ gitUsername: "local-user", debounceMs: 60_000, installationId: "b".repeat(48) });
     const imported = importSettings(exportSettings(source), current);
 
-    expect(imported).toEqual({ ...source, gitUsername: "local-user" });
+    expect(imported).toEqual({ ...source, gitUsername: "local-user", installationId: current.installationId });
   });
 
   it("rejects malformed bundles and invalid timing values", () => {
@@ -237,25 +366,29 @@ describe("configuration bundles", () => {
     const source = settings({
       gitUrl: "https://git.example.test/team-core/knowledge.git",
       gitPassword: "shared-password",
-      s3Endpoint: "https://s3.example.test/bucket",
-      s3AccessKey: "access-key",
-      s3SecretKey: "secret-key",
+      attachmentStorageProvider: "webdav",
+      attachmentWebdavUrl: "https://dav.example.test/team/",
+      attachmentWebdavUsername: "team-user",
+      attachmentWebdavPassword: "team-secret",
       authorDisplayMappings: { xuchenrui: "许宸瑞", gaochenrui: "高晨瑞" }
     });
     const exported = exportSettings(source);
     expect(exported.startsWith("tc1.")).toBe(true);
     expect(exported.length).toBeLessThan(JSON.stringify(source).length * 1.34);
-    expect(importSettings(exported, settings({ gitUsername: "local-user" })).gitPassword).toBe(source.gitPassword);
+    const imported = importSettings(exported, settings({ gitUsername: "local-user" }));
+    expect(imported.gitPassword).toBe(source.gitPassword);
+    expect(imported.attachmentStorageProvider).toBe("webdav");
+    expect(imported.attachmentWebdavPassword).toBe("team-secret");
   });
 
   it("never exports diagnostic logs or other plugin-local runtime data", () => {
-    const source = settings({ authorDisplayMappings: { xuchenrui: "许宸瑞" } });
+    const source = settings({ authorDisplayMappings: { xuchenrui: "许宸瑞" }, installationId: "a".repeat(48) });
     const polluted = {
       ...source,
       diagnosticLogs: Array.from({ length: 800 }, (_, index) => ({ index, message: "x".repeat(250) })),
       futureRuntimeCache: "y".repeat(20_000)
     } as TeamCoreSettings;
-    expect(exportSettings(polluted)).toBe(exportSettings(source));
+    expect(exportSettings(polluted)).toBe(exportSettings(settings({ authorDisplayMappings: source.authorDisplayMappings })));
     expect("diagnosticLogs" in mergeSettings(polluted)).toBe(false);
     expect("futureRuntimeCache" in mergeSettings(polluted)).toBe(false);
   });
@@ -320,16 +453,129 @@ describe("configuration bundles", () => {
 });
 
 describe("private-note synchronization", () => {
+  it("classifies public and private local changes without exposing storage internals", () => {
+    expect(classifyPublicLocalChange("notes/plan.md", ".obsidian")).toBe("documents");
+    expect(classifyPublicLocalChange(".team/assets-manifest.json", ".obsidian")).toBe("attachments");
+    expect(classifyPublicLocalChange(".gitignore", ".obsidian")).toBe("settings");
+    expect(classifyPublicLocalChange(".obsidian/plugins/dataview/main.js", ".obsidian")).toBe("settings");
+    expect(classifyPublicLocalChange("exports/index.csv", ".obsidian")).toBe("other");
+    expect(classifyPrivateLocalChange("draft.md")).toBe("documents");
+    expect(classifyPrivateLocalChange("assets/sha256-aabbcc.png")).toBe("attachments");
+    expect(classifyPrivateLocalChange("research/data.csv")).toBe("other");
+  });
+
   it("does not queue private Vault events while private synchronization is disabled", () => {
     expect(shouldTrackPrivateSyncEvent(settings({ privateSyncEnabled: false }))).toBe(false);
     expect(shouldTrackPrivateSyncEvent(settings({ privateSyncEnabled: true }))).toBe(true);
+  });
+
+  it("uses WebDAV ETags for conditional private-index creation", async () => {
+    const requests: Array<{ method?: string; headers: import("node:http").IncomingHttpHeaders }> = [];
+    const server = createServer((request, response) => {
+      requests.push({ method: request.method, headers: request.headers });
+      if (request.method === "MKCOL") { response.writeHead(405); response.end(); return; }
+      if (request.method === "GET") { response.writeHead(404); response.end(); return; }
+      if (request.method === "PUT") { response.writeHead(201, { etag: '"created"' }); response.end(); return; }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve WebDAV test server port");
+    try {
+      const remote = createPrivateRemote(settings({
+        privateSyncProvider: "webdav",
+        privateWebdavUrl: `http://127.0.0.1:${address.port}/private/`
+      }), logger);
+      await remote.initialize();
+      const index = await remote.readIndex();
+      expect(index).toEqual({ data: undefined, version: undefined });
+      await expect(remote.writeIndex(encode("{}"), index.version)).resolves.toBe("written");
+      const put = requests.find((request) => request.method === "PUT");
+      expect(put?.headers["if-none-match"]).toBe("*");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("rejects a WebDAV weak ETag before attempting an unsafe conditional write", async () => {
+    let putCalls = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "MKCOL") { response.writeHead(405); response.end(); return; }
+      if (request.method === "GET") { response.writeHead(200, { etag: 'W/"weak"' }); response.end("{}\n"); return; }
+      if (request.method === "PUT") { putCalls += 1; response.writeHead(204); response.end(); return; }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve WebDAV test server port");
+    try {
+      const remote = createPrivateRemote(settings({ privateSyncProvider: "webdav", privateWebdavUrl: `http://127.0.0.1:${address.port}/private/` }), logger);
+      await expect(remote.readIndex()).rejects.toThrow("弱 ETag");
+      expect(putCalls).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("streams a large private WebDAV upload without a whole-file request body", async () => {
+    let received = 0;
+    const server = createServer((request, response) => {
+      if (request.method !== "PUT") { response.writeHead(405); response.end(); return; }
+      request.on("data", (chunk: Buffer) => { received += chunk.byteLength; });
+      request.on("end", () => { response.writeHead(201); response.end(); });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve WebDAV upload test server port");
+    try {
+      const remote = createPrivateRemote(settings({ privateSyncProvider: "webdav", privateWebdavUrl: `http://127.0.0.1:${address.port}/private/` }), logger);
+      const data = new Uint8Array(6 * 1024 * 1024 + 31).fill(19);
+      const hash = await sha256Hex(data);
+      const sourceChunks: number[] = [];
+      await remote.writeFromChunks!("oldeng-team-core-private/v1/files/large", hash, data.byteLength, "application/octet-stream", async (onChunk) => {
+        const first = data.subarray(0, 6 * 1024 * 1024);
+        const second = data.subarray(first.byteLength);
+        sourceChunks.push(first.byteLength, second.byteLength);
+        await onChunk(first.buffer.slice(first.byteOffset, first.byteOffset + first.byteLength), 0, data.byteLength);
+        await onChunk(second.buffer.slice(second.byteOffset, second.byteOffset + second.byteLength), first.byteLength, data.byteLength);
+      });
+      expect(sourceChunks).toEqual([6 * 1024 * 1024, 31]);
+      expect(received).toBe(data.byteLength);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }, 15_000);
+
+  it("rejects an early WebDAV success response before a private source is fully verified", async () => {
+    const originalFetch = window.fetch;
+    const chunks = [new Uint8Array(1024).fill(1), new Uint8Array(1024).fill(2), new Uint8Array(1024).fill(3)];
+    const data = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+    let cursor = 0;
+    for (const chunk of chunks) { data.set(chunk, cursor); cursor += chunk.byteLength; }
+    window.fetch = async (_url, request) => {
+      const stream = request?.body as ReadableStream<Uint8Array>;
+      await stream.getReader().read();
+      return new Response(undefined, { status: 201 });
+    };
+    try {
+      const remote = createPrivateRemote(settings({ privateSyncProvider: "webdav", privateWebdavUrl: "https://webdav.example.test/private/" }), logger);
+      await expect(remote.writeFromChunks!("oldeng-team-core-private/v1/files/early", await sha256Hex(data), data.byteLength, "application/octet-stream", async (onChunk) => {
+        let offset = 0;
+        for (const chunk of chunks) {
+          await onChunk(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength), offset, data.byteLength);
+          offset += chunk.byteLength;
+        }
+      })).rejects.toThrow("完整上传前");
+    } finally {
+      window.fetch = originalFetch;
+    }
   });
 
   it("uploads incrementally, downloads to another vault, and propagates deletions", async () => {
     const firstRoot = await mkdtemp(join(tmpdir(), "team-core-private-first-"));
     const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-second-"));
     try {
-      const remote = new MemoryPrivateRemote();
+      const remote = new HookedIndexRemote();
       const firstVault = new NodeVault(firstRoot);
       const secondVault = new NodeVault(secondRoot);
       const first = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
@@ -349,8 +595,11 @@ describe("private-note synchronization", () => {
       expect(decode(await secondVault.read("私人笔记/drafts/idea.md"))).toBe("first draft");
 
       await firstVault.remove("私人笔记/drafts/idea.md");
-      const deleteSync = await first.sync(firstVault, noChange.state);
+      const deleteSync = await first.sync(firstVault, { ...noChange.state, pendingPaths: ["drafts/idea.md"] });
       expect(deleteSync.deletedRemote).toBe(1);
+      // Deletion publishes a tombstone. Immutable bytes are retained until a
+      // separate, reference-aware garbage collector can safely remove them.
+      expect([...remote.objects.keys()].some((key) => key.includes("/files/"))).toBe(true);
 
       const receiveDelete = await second.sync(secondVault, secondSync.state);
       expect(receiveDelete.deletedLocal).toBe(1);
@@ -358,6 +607,146 @@ describe("private-note synchronization", () => {
     } finally {
       await rm(firstRoot, { recursive: true, force: true });
       await rm(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not conditionally rewrite an unchanged private manifest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-noop-index-"));
+    try {
+      const remote = new CountingIndexRemote();
+      const vault = new NodeVault(root);
+      await vault.write("私人笔记/idea.md", encode("unchanged"));
+      const synchronizer = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
+      const baseline = await synchronizer.sync(vault, { version: 1, entries: {} });
+      remote.indexWrites = 0;
+      await synchronizer.sync(vault, baseline.state);
+      expect(remote.indexWrites).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stages a large private download in bounded chunks instead of retaining the batch", async () => {
+    const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-chunk-target-"));
+    try {
+      const remote = new ChunkingPrivateRemote();
+      const data = new Uint8Array(8 * 1024 * 1024 + 17).fill(7);
+      const hash = await sha256Hex(data);
+      const objectKey = `oldeng-team-core-private/v1/files/${base64UrlEncode("large.bin")}-${hash}`;
+      remote.objects.set(objectKey, data.buffer.slice(0));
+      remote.objects.set("oldeng-team-core-private/v1/index.json", encode(JSON.stringify({
+        version: 1,
+        entries: { "large.bin": { sha256: hash, size: data.byteLength, updatedAt: 1, objectKey } }
+      })));
+      const secondVault = new NodeVault(secondRoot);
+      const result = await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(secondVault, { version: 1, entries: {} });
+      expect(result.downloaded).toBe(1);
+      expect(remote.chunkSizes.length).toBeGreaterThan(1);
+      expect(Math.max(...remote.chunkSizes)).toBeLessThanOrEqual(1024 * 1024);
+      expect((await secondVault.stat("私人笔记/large.bin"))?.size).toBe(data.byteLength);
+    } finally {
+      await rm(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uploads a large private local file through bounded chunks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-large-upload-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const vault = new NodeVault(root);
+      const data = new Uint8Array(8 * 1024 * 1024 + 1).fill(3);
+      await vault.write("私人笔记/large.bin", data.buffer);
+      const result = await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(vault, { version: 1, entries: {} });
+      expect(result.uploaded).toBe(1);
+      const entry = result.state.entries["large.bin"];
+      expect(entry?.objectKey).toBeTruthy();
+      expect(remote.objects.get(entry!.objectKey!)?.byteLength).toBe(data.byteLength);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("replans after an index compare-and-swap conflict without dropping another device's file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-cas-"));
+    try {
+      const remote = new ConcurrentIndexRemote();
+      const remoteData = encode("from device A");
+      const remoteHash = await sha256Hex(remoteData);
+      const remoteKey = `oldeng-team-core-private/v1/files/${base64UrlEncode("a.md")}-${remoteHash}`;
+      remote.objects.set(remoteKey, remoteData);
+      remote.injectConcurrentIndex(encode(JSON.stringify({
+        version: 1,
+        entries: { "a.md": { sha256: remoteHash, size: remoteData.byteLength, updatedAt: Date.now(), objectKey: remoteKey } }
+      })));
+
+      const vault = new NodeVault(root);
+      await vault.write("私人笔记/b.md", encode("from device B"));
+      const result = await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(vault, { version: 1, entries: {} });
+      expect(result.uploaded).toBe(1);
+      expect(decode(await vault.read("私人笔记/a.md"))).toBe("from device A");
+      const index = JSON.parse(decode(remote.objects.get("oldeng-team-core-private/v1/index.json")!)) as { entries: Record<string, unknown> };
+      expect(index.entries).toHaveProperty("a.md");
+      expect(index.entries).toHaveProperty("b.md");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a failed CAS attempt turn its own download into a newer local edit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-cas-local-effects-"));
+    try {
+      const remote = new ConcurrentIndexRemote();
+      const firstData = encode("remote revision one");
+      const secondData = encode("remote revision two");
+      const firstHash = await sha256Hex(firstData);
+      const secondHash = await sha256Hex(secondData);
+      const firstKey = `oldeng-team-core-private/v1/files/${base64UrlEncode("a.md")}-${firstHash}`;
+      const secondKey = `oldeng-team-core-private/v1/files/${base64UrlEncode("a.md")}-${secondHash}`;
+      remote.objects.set(firstKey, firstData);
+      remote.objects.set(secondKey, secondData);
+      remote.objects.set("oldeng-team-core-private/v1/index.json", encode(JSON.stringify({
+        version: 1,
+        entries: { "a.md": { sha256: firstHash, size: firstData.byteLength, updatedAt: 1, objectKey: firstKey } }
+      })));
+      remote.injectConcurrentIndex(encode(JSON.stringify({
+        version: 1,
+        entries: { "a.md": { sha256: secondHash, size: secondData.byteLength, updatedAt: Date.now() + 60_000, objectKey: secondKey } }
+      })));
+
+      const vault = new NodeVault(root);
+      await vault.write("私人笔记/local.md", encode("local update that forces CAS"));
+      await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(vault, { version: 1, entries: {} });
+
+      expect(decode(await vault.read("私人笔记/a.md"))).toBe("remote revision two");
+      const index = JSON.parse(decode(remote.objects.get("oldeng-team-core-private/v1/index.json")!)) as { entries: Record<string, { sha256: string }> };
+      expect(index.entries["a.md"].sha256).toBe(secondHash);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not overwrite a private note edited after index CAS but before local materialization", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-local-race-"));
+    try {
+      const remote = new HookedIndexRemote();
+      const remoteData = encode("remote revision");
+      const remoteHash = await sha256Hex(remoteData);
+      const remoteKey = `oldeng-team-core-private/v1/files/${base64UrlEncode("race.md")}-${remoteHash}`;
+      remote.objects.set(remoteKey, remoteData);
+      remote.objects.set("oldeng-team-core-private/v1/index.json", encode(JSON.stringify({
+        version: 1,
+        entries: { "race.md": { sha256: remoteHash, size: remoteData.byteLength, updatedAt: 1, objectKey: remoteKey } }
+      })));
+      const vault = new NodeVault(root);
+      await vault.write("私人笔记/local.md", encode("local update that forces CAS"));
+      remote.onBeforeIndexWrite = () => vault.write("私人笔记/race.md", encode("user edit after commit"));
+      await expect(new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(
+        vault,
+        { version: 1, entries: {} }
+      )).rejects.toThrow("同步期间已被修改");
+      expect(decode(await vault.read("私人笔记/race.md"))).toBe("user edit after commit");
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 
@@ -377,8 +766,81 @@ describe("private-note synchronization", () => {
       expect(result.uploaded).toBe(0);
       expect(decode(await secondVault.read("私人笔记/remote.md"))).toBe("remote note");
       expect(await secondVault.exists("私人笔记/local-only.md")).toBe(true);
+      expect(result.preservedLocal).toBe(1);
+      expect(result.state.pendingPaths).toEqual(["local-only.md"]);
       const index = JSON.parse(decode(remote.objects.get("oldeng-team-core-private/v1/index.json")!)) as { entries: Record<string, unknown> };
       expect(index.entries).not.toHaveProperty("local-only.md");
+    } finally {
+      await rm(firstRoot, { recursive: true, force: true });
+      await rm(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for one malformed remote entry without changing local or remote state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-malformed-index-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const vault = new NodeVault(root);
+      await vault.write("私人笔记/local.md", encode("local bytes"));
+      remote.objects.set("oldeng-team-core-private/v1/index.json", encode(JSON.stringify({
+        version: 1,
+        entries: {
+          "valid.md": { sha256: "a".repeat(64), size: 1, updatedAt: 1 },
+          "broken.md": { sha256: "not-a-hash", size: 1, updatedAt: 1 }
+        }
+      })));
+      await expect(new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(vault, { version: 1, entries: {} }))
+        .rejects.toThrow("broken.md");
+      expect(decode(await vault.read("私人笔记/local.md"))).toBe("local bytes");
+      expect(decode(remote.objects.get("oldeng-team-core-private/v1/index.json")!)).toContain("broken.md");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("hashes only event-journaled private files during an ordinary incremental sync", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-incremental-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const initialVault = new NodeVault(root);
+      await initialVault.write("私人笔记/changed.md", encode("before"));
+      await initialVault.write("私人笔记/unrelated.md", encode("do not read"));
+      const synchronizer = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
+      const baseline = await synchronizer.sync(initialVault, { version: 1, entries: {} });
+      const vault = new CountingVault(root);
+      await vault.write("私人笔记/changed.md", encode("after"));
+      vault.reads.length = 0;
+      const result = await synchronizer.sync(vault, { ...baseline.state, pendingPaths: ["changed.md"] });
+      expect(result.uploaded).toBe(1);
+      expect(vault.reads.filter((path) => path.startsWith("私人笔记/")).every((path) => path === "私人笔记/changed.md")).toBe(true);
+      expect(vault.reads.filter((path) => path.startsWith("私人笔记/")).length).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains locally changed matching paths during normal import and only overwrites in reset mode", async () => {
+    const firstRoot = await mkdtemp(join(tmpdir(), "team-core-private-safe-pull-first-"));
+    const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-safe-pull-second-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const firstVault = new NodeVault(firstRoot);
+      await firstVault.write("私人笔记/shared.md", encode("remote version"));
+      const remoteState = (await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote)
+        .sync(firstVault, { version: 1, entries: {} })).state;
+
+      const secondVault = new NodeVault(secondRoot);
+      await secondVault.write("私人笔记/shared.md", encode("local unsynced version"));
+      const synchronizer = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
+      const safePull = await synchronizer.pull(secondVault, remoteState);
+      expect(safePull.downloaded).toBe(0);
+      expect(safePull.preservedLocal).toBe(1);
+      expect(decode(await secondVault.read("私人笔记/shared.md"))).toBe("local unsynced version");
+
+      const forcedPull = await synchronizer.pull(secondVault, remoteState, undefined, true);
+      expect(forcedPull.downloaded).toBe(1);
+      expect(forcedPull.preservedLocal).toBe(0);
+      expect(decode(await secondVault.read("私人笔记/shared.md"))).toBe("remote version");
     } finally {
       await rm(firstRoot, { recursive: true, force: true });
       await rm(secondRoot, { recursive: true, force: true });
@@ -401,6 +863,37 @@ describe("private-note synchronization", () => {
       await expect(new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(secondVault, { version: 1, entries: {} }))
         .rejects.toThrow("校验失败");
       expect(await secondVault.exists("私人笔记/idea.md")).toBe(false);
+    } finally {
+      await rm(firstRoot, { recursive: true, force: true });
+      await rm(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back every private local write when a later transaction operation fails", async () => {
+    const firstRoot = await mkdtemp(join(tmpdir(), "team-core-private-transaction-source-"));
+    const secondRoot = await mkdtemp(join(tmpdir(), "team-core-private-transaction-target-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const firstVault = new NodeVault(firstRoot);
+      await firstVault.write("私人笔记/a.md", encode("remote a"));
+      await firstVault.write("私人笔记/b.md", encode("remote b"));
+      await new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(firstVault, { version: 1, entries: {} });
+
+      const secondVault = new NodeVault(secondRoot);
+      const rename = secondVault.rename.bind(secondVault);
+      let failed = false;
+      secondVault.rename = async (path: string, newPath: string): Promise<void> => {
+        if (newPath === "私人笔记/b.md" && !failed) {
+          failed = true;
+          throw new Error("simulated disk failure");
+        }
+        await rename(path, newPath);
+      };
+      await expect(new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote).sync(secondVault, { version: 1, entries: {} }))
+        .rejects.toThrow("simulated disk failure");
+      expect(await secondVault.exists("私人笔记/a.md")).toBe(false);
+      expect(await secondVault.exists("私人笔记/b.md")).toBe(false);
+      expect(await secondVault.exists("private-sync-transaction.json")).toBe(false);
     } finally {
       await rm(firstRoot, { recursive: true, force: true });
       await rm(secondRoot, { recursive: true, force: true });
@@ -650,7 +1143,8 @@ describe("manifest and vault path rules", () => {
           size: 10,
           mime: "application/pdf",
           uploadedAt: "2026-08-25T00:00:00Z",
-          uploadedBy: "alice"
+          uploadedBy: "alice",
+          uploadedFrom: "a".repeat(48)
         },
         "assets/a.png": {
           sha256: "a".repeat(64),
@@ -662,6 +1156,7 @@ describe("manifest and vault path rules", () => {
       }
     });
     expect(Object.keys(manifest.files)).toEqual(["assets/z.pdf", "assets/a.png"]);
+    expect(manifest.files["assets/z.pdf"].uploadedFrom).toBe("a".repeat(48));
     const serialized = serializeManifest(manifest);
     expect(serialized.indexOf("assets/a.png")).toBeLessThan(serialized.indexOf("assets/z.pdf"));
     expect(validateManifest(createEmptyManifest())).toEqual(createEmptyManifest());
@@ -768,6 +1263,14 @@ describe("manifest and vault path rules", () => {
     expect(shouldTrackVaultEvent("私人笔记/private.md", ".obsidian", [])).toBe(false);
     expect(shouldTrackVaultEvent(".team/assets-manifest.json", ".obsidian", [])).toBe(false);
     expect(shouldTrackVaultEvent(".team/file-authors.json", ".obsidian", [])).toBe(true);
+  });
+
+  it("uses explicit change signals before starting an expensive Git staging scan", () => {
+    expect(shouldCommitManagedChanges({ pendingNotes: 0, attachmentsChanged: false, gitignoreChanged: false, sharedPluginStateChanged: false })).toBe(false);
+    expect(shouldCommitManagedChanges({ pendingNotes: 1, attachmentsChanged: false, gitignoreChanged: false, sharedPluginStateChanged: false })).toBe(true);
+    expect(shouldCommitManagedChanges({ pendingNotes: 0, attachmentsChanged: true, gitignoreChanged: false, sharedPluginStateChanged: false })).toBe(true);
+    expect(shouldCommitManagedChanges({ pendingNotes: 0, attachmentsChanged: false, gitignoreChanged: true, sharedPluginStateChanged: false })).toBe(true);
+    expect(shouldCommitManagedChanges({ pendingNotes: 0, attachmentsChanged: false, gitignoreChanged: false, sharedPluginStateChanged: true })).toBe(true);
   });
 
   it("publishes private drafts only when they move into a synchronized public path", () => {
@@ -909,6 +1412,34 @@ describe("manifest and vault path rules", () => {
 });
 
 describe("S3 transport", () => {
+  it("signs S3 index conditions and preserves the returned ETag", async () => {
+    const requests: Array<{ method?: string; headers: import("node:http").IncomingHttpHeaders }> = [];
+    const server = createServer((request, response) => {
+      requests.push({ method: request.method, headers: request.headers });
+      if (request.method === "GET") {
+        response.writeHead(200, { etag: '"index-v1"', "content-type": "application/json" });
+        response.end("{}");
+        return;
+      }
+      if (request.method === "PUT") { response.writeHead(200); response.end(); return; }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve S3 test server port");
+    try {
+      const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
+      const index = await transport.readObjectWithVersion("oldeng-team-core-private/v1/index.json");
+      expect(index.version).toBe('"index-v1"');
+      await expect(transport.writeObjectIfUnchanged("oldeng-team-core-private/v1/index.json", encode("{}"), "application/json", index.version)).resolves.toBe("written");
+      const put = requests.find((request) => request.method === "PUT");
+      expect(put?.headers["if-match"]).toBe('"index-v1"');
+      expect(put?.headers.authorization).toMatch(/SignedHeaders=[^,]*if-match/);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("downloads ranged chunks with incremental verification", async () => {
     const data = new TextEncoder().encode("0123456789abcdefghijklmnopqrstuv");
     const hash = await sha256Hex(data);
@@ -944,6 +1475,165 @@ describe("S3 transport", () => {
     }
   });
 
+  it("uploads large objects through bounded S3 multipart parts and completes only after hashing the source", async () => {
+    const partNumbers: string[] = [];
+    const requests: Array<{ method: string | undefined; query: string }> = [];
+    let completed = false;
+    let sha256Metadata: string | undefined;
+    const size = 6 * 1024 * 1024 + 257;
+    const data = new Uint8Array(size).fill(11);
+    const hash = await sha256Hex(data);
+    const server = createServer((request, response) => {
+      const address = request.headers.host ?? "127.0.0.1";
+      const url = new URL(request.url ?? "/", `http://${address}`);
+      requests.push({ method: request.method, query: url.search });
+      if (request.method === "HEAD") {
+        if (completed) response.writeHead(200, { "content-length": String(size), "x-amz-meta-sha256": sha256Metadata ?? "" });
+        else response.writeHead(404);
+        response.end();
+        return;
+      }
+      if (request.method === "POST" && url.searchParams.has("uploads")) {
+        sha256Metadata = typeof request.headers["x-amz-meta-sha256"] === "string" ? request.headers["x-amz-meta-sha256"] : undefined;
+        response.writeHead(200, { "content-type": "application/xml" });
+        response.end("<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>");
+        return;
+      }
+      if (request.method === "PUT" && url.searchParams.has("partNumber")) {
+        partNumbers.push(url.searchParams.get("partNumber") ?? "");
+        request.resume();
+        request.on("end", () => { response.writeHead(200, { etag: `\"part-${partNumbers[partNumbers.length - 1]}\"` }); response.end(); });
+        return;
+      }
+      if (request.method === "POST" && url.searchParams.has("uploadId")) {
+        completed = true;
+        request.resume();
+        request.on("end", () => { response.writeHead(200); response.end(); });
+        return;
+      }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve multipart test server port");
+    try {
+      const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
+      await transport.ensureUploadedFromChunks(hash, size, "application/octet-stream", async (onChunk) => {
+        const first = data.subarray(0, 6 * 1024 * 1024);
+        const second = data.subarray(first.byteLength);
+        await onChunk(first.buffer.slice(first.byteOffset, first.byteOffset + first.byteLength), 0, size);
+        await onChunk(second.buffer.slice(second.byteOffset, second.byteOffset + second.byteLength), first.byteLength, size);
+      });
+      expect(partNumbers).toEqual(["1", "2"]);
+      expect(requests.some((request) => request.method === "POST" && request.query.includes("uploads="))).toBe(true);
+      expect(requests.some((request) => request.method === "POST" && request.query.includes("uploadId=upload-1"))).toBe(true);
+      expect(completed).toBe(true);
+      expect(sha256Metadata).toBe(hash);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("aborts a multipart upload when the source changes after planning", async () => {
+    let aborted = false;
+    const size = 6 * 1024 * 1024;
+    const expected = new Uint8Array(size).fill(1);
+    const changed = new Uint8Array(size).fill(2);
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+      if (request.method === "HEAD") { response.writeHead(404); response.end(); return; }
+      if (request.method === "POST" && url.searchParams.has("uploads")) {
+        response.writeHead(200); response.end("<UploadId>upload-2</UploadId>"); return;
+      }
+      if (request.method === "PUT") { request.resume(); request.on("end", () => { response.writeHead(200, { etag: '"part"' }); response.end(); }); return; }
+      if (request.method === "DELETE" && url.searchParams.get("uploadId") === "upload-2") { aborted = true; response.writeHead(204); response.end(); return; }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve multipart abort test server port");
+    try {
+      const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
+      await expect(transport.ensureUploadedFromChunks(await sha256Hex(expected), size, "application/octet-stream", (onChunk) =>
+        onChunk(changed.buffer, 0, size)
+      )).rejects.toThrow("changed");
+      expect(aborted).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("does not reuse a same-sized S3 object without matching SHA-256 metadata", async () => {
+    let initiated = false;
+    let completed = false;
+    const size = 6 * 1024 * 1024;
+    const data = new Uint8Array(size).fill(7);
+    const hash = await sha256Hex(data);
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+      if (request.method === "HEAD") {
+        response.writeHead(200, completed
+          ? { "content-length": String(size), "x-amz-meta-sha256": hash }
+          : { "content-length": String(size) });
+        response.end();
+        return;
+      }
+      if (request.method === "POST" && url.searchParams.has("uploads")) {
+        initiated = true;
+        response.writeHead(200); response.end("<UploadId>upload-meta</UploadId>"); return;
+      }
+      if (request.method === "PUT") { request.resume(); request.on("end", () => { response.writeHead(200, { etag: '"part"' }); response.end(); }); return; }
+      if (request.method === "POST" && url.searchParams.get("uploadId") === "upload-meta") {
+        completed = true;
+        request.resume(); request.on("end", () => { response.writeHead(200); response.end(); }); return;
+      }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve S3 metadata test server port");
+    try {
+      const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
+      await transport.ensureUploadedFromChunks(hash, size, "application/octet-stream", (onChunk) => onChunk(data.buffer, 0, size));
+      expect(initiated).toBe(true);
+      expect(completed).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("aborts before completion when a source cannot satisfy the S3 multipart part limit", async () => {
+    let initiated = false;
+    let aborted = false;
+    const chunkSize = 8 * 1024 * 1024;
+    const size = chunkSize * 10_000 + 1;
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+      if (request.method === "HEAD") { response.writeHead(404); response.end(); return; }
+      if (request.method === "POST" && url.searchParams.has("uploads")) {
+        initiated = true;
+        response.writeHead(200); response.end("<UploadId>upload-limit</UploadId>"); return;
+      }
+      if (request.method === "DELETE" && url.searchParams.get("uploadId") === "upload-limit") {
+        aborted = true;
+        response.writeHead(204); response.end(); return;
+      }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve S3 part-limit test server port");
+    try {
+      const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
+      const chunk = new ArrayBuffer(chunkSize);
+      await expect(transport.ensureUploadedFromChunks("a".repeat(64), size, "application/octet-stream", (onChunk) => onChunk(chunk, 0, size))).rejects.toThrow("required");
+      expect(initiated).toBe(true);
+      expect(aborted).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("keeps the production chunk size at 8 MiB", () => {
     expect(S3_DOWNLOAD_CHUNK_SIZE).toBe(8 * 1024 * 1024);
     expect(S3_CHUNKED_DOWNLOAD_THRESHOLD).toBe(S3_DOWNLOAD_CHUNK_SIZE);
@@ -964,6 +1654,70 @@ describe("S3 transport", () => {
   });
 });
 
+describe("public WebDAV attachment storage", () => {
+  it("stores, retrieves, and clears content-addressed public attachments under its fixed namespace", async () => {
+    const objects = new Map<string, Uint8Array>();
+    const methods: string[] = [];
+    const server = createServer((request, response) => {
+      const path = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`).pathname;
+      methods.push(`${request.method} ${path}`);
+      if (request.method === "MKCOL") { response.writeHead(405); response.end(); return; }
+      if (request.method === "HEAD") {
+        const data = objects.get(path);
+        response.writeHead(data ? 200 : 404, data ? { "content-length": String(data.byteLength) } : undefined);
+        response.end();
+        return;
+      }
+      if (request.method === "PUT") {
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => { objects.set(path, new Uint8Array(Buffer.concat(chunks))); response.writeHead(201); response.end(); });
+        return;
+      }
+      if (request.method === "GET") {
+        const data = objects.get(path);
+        if (!data) { response.writeHead(404); response.end(); return; }
+        response.writeHead(200, { "content-length": String(data.byteLength) }); response.end(data); return;
+      }
+      if (request.method === "DELETE" && path.endsWith("/oldeng-team-core-attachments/v1")) {
+        for (const key of objects.keys()) if (key.startsWith(`${path}/`)) objects.delete(key);
+        response.writeHead(204); response.end(); return;
+      }
+      response.writeHead(405); response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve public WebDAV test server port");
+    try {
+      const data = new TextEncoder().encode("team attachment");
+      const hash = await sha256Hex(data);
+      const store = createAttachmentStore(settings({
+        attachmentStorageProvider: "webdav",
+        attachmentWebdavUrl: `http://127.0.0.1:${address.port}/team/`,
+        attachmentWebdavUsername: "team",
+        attachmentWebdavPassword: "secret"
+      }), logger);
+      await store.ensureUploaded(hash, data.buffer, "text/plain");
+      expect(decode(await store.download(hash))).toBe("team attachment");
+      const large = new Uint8Array(8 * 1024 * 1024 + 19).fill(23);
+      const largeHash = await sha256Hex(large);
+      await store.ensureUploadedFromChunks(largeHash, large.byteLength, "application/octet-stream", async (onChunk) => {
+        const first = large.subarray(0, 8 * 1024 * 1024);
+        const second = large.subarray(first.byteLength);
+        await onChunk(first.buffer.slice(first.byteOffset, first.byteOffset + first.byteLength), 0, large.byteLength);
+        await onChunk(second.buffer.slice(second.byteOffset, second.byteOffset + second.byteLength), first.byteLength, large.byteLength);
+      });
+      expect(objects.get(`/team/oldeng-team-core-attachments/v1/sha256/${largeHash}`)?.byteLength).toBe(large.byteLength);
+      expect(methods.some((method) => method.includes("MKCOL /team/oldeng-team-core-attachments/v1/sha256"))).toBe(true);
+      expect(methods.some((method) => method.includes(`/team/oldeng-team-core-attachments/v1/sha256/${hash}`))).toBe(true);
+      expect(await store.clearManagedObjects()).toBe(1);
+      expect(objects.size).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+});
+
 describe("remote attachment materialization", () => {
   const entry = {
     sha256: "a".repeat(64),
@@ -979,9 +1733,10 @@ describe("remote attachment materialization", () => {
   });
 
   it("downloads a missing same-user attachment but protects an existing mismatched file", () => {
-    expect(shouldProtectMismatchedLocalAttachment(false, "wangzhe", "wangzhe")).toBe(false);
-    expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "wangzhe")).toBe(true);
-    expect(shouldProtectMismatchedLocalAttachment(true, "other-user", "wangzhe")).toBe(false);
+    expect(shouldProtectMismatchedLocalAttachment(false, "wangzhe", "device-a", "device-a", "wangzhe")).toBe(false);
+    expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "device-a", "device-a", "wangzhe")).toBe(true);
+    expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "device-b", "device-a", "wangzhe")).toBe(false);
+    expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", undefined, "device-a", "wangzhe")).toBe(true);
   });
 });
 
@@ -1031,6 +1786,83 @@ describe("sync push reconciliation", () => {
 });
 
 describe("Git repository adapter", () => {
+  it("stages an event-derived public batch without enumerating private folders", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-fast-stage-"));
+    try {
+      const initial = new NodeVault(root);
+      const bootstrap = new GitRepository(initial, settings(), logger, ".obsidian");
+      await bootstrap.init();
+      await initial.write("notes/a.md", encode("before"));
+      await bootstrap.commit("Base");
+      await initial.write("私人笔记/deep/one.md", encode("private"));
+      const vault = new ListCountingVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await vault.write("notes/a.md", encode("after"));
+      vault.listed.length = 0;
+      await repo.commit("Incremental", [], ["notes/a.md"]);
+      // isomorphic-git reads the Vault root to resolve the requested path,
+      // but its filtered status walk must not descend into private notes.
+      expect(vault.listed.some((path) => path.startsWith("私人笔记/"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("materializes a remote merge without enumerating private folders", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-fast-merge-"));
+    try {
+      await createDivergence(root, { "base.md": "base\n" }, { "local.md": "local\n" }, { "remote.md": "remote\n" });
+      const seeded = new NodeVault(root);
+      await seeded.write("私人笔记/nested/secret.md", encode("private"));
+      const vault = new ListCountingVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      vault.listed.length = 0;
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      expect(decode(await vault.read("remote.md"))).toBe("remote\n");
+      expect(vault.listed.some((path) => path === "私人笔记" || path.startsWith("私人笔记/"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not read personal plugin files for a remote Markdown-only merge", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-fast-personal-plugin-merge-"));
+    try {
+      await createDivergence(root, { "base.md": "base\n" }, { "local.md": "local\n" }, { "remote.md": "remote\n" });
+      const seeded = new NodeVault(root);
+      await seeded.write(".obsidian/plugins/personal/cache.bin", encode("local-only plugin cache"));
+      const vault = new CountingVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      vault.reads.length = 0;
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      expect(vault.reads.some((path) => path.startsWith(".obsidian/plugins/personal/"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a staged-only private blob before committing an unrelated public change", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-staged-private-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/base.md", encode("base"));
+      await repo.commit("Base");
+      await writeFile(join(root, "private-index-source"), "do not publish");
+      const { stdout } = await execFileAsync("git", ["-C", root, "hash-object", "-w", "private-index-source"]);
+      await rm(join(root, "private-index-source"));
+      await execFileAsync("git", ["-C", root, "update-index", "--add", "--cacheinfo", `100644,${stdout.trim()},私人笔记/staged-only.md`]);
+      await vault.write("notes/public.md", encode("safe public change"));
+      await repo.commit("Public change");
+      const files = await git.listFiles({ fs: repo.fs, dir: "", ref: "HEAD" });
+      expect(files).toContain("notes/public.md");
+      expect(files).not.toContain("私人笔记/staged-only.md");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("stages every file in selected plugin folders and keeps unselected folders local", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-plugins-"));
     try {
@@ -1079,6 +1911,7 @@ describe("Git repository adapter", () => {
       const vault = new NodeVault(root);
       const repo = new GitRepository(vault, settings(), logger, ".obsidian");
       await repo.init();
+      expect(await git.getConfig({ fs: repo.fs, dir: "", path: "core.filemode" })).toBe(false);
       await repo.ensureRemote();
       await repo.ensureGitignore();
       const gitignore = new TextDecoder().decode(await vault.read(".gitignore"));
@@ -1100,8 +1933,30 @@ describe("Git repository adapter", () => {
       await expect(repo.fileAuthors("私人笔记/旧索引.md")).resolves.toEqual([]);
       expect(await repo.commit("Private note must stay local")).toBeUndefined();
 
+      // Team Core opts out of executable-bit tracking for knowledge-base
+      // files and repairs an already staged same-blob mode-only entry.
+      await execFileAsync("git", ["-C", root, "update-index", "--chmod=+x", "notes/readme.md"]);
+      await repo.configureWorktreeMode();
+      expect(await repo.listPublicWorktreeChanges()).toEqual([]);
+      expect(await repo.hasManagedPathChanges(["notes/readme.md"])).toBe(false);
+      expect(await repo.hasUncommittedChanges()).toBe(false);
+      expect(await repo.recoverManagedWorktree()).toEqual({
+        changedManagedPaths: [],
+        hasBoundaryRepair: false,
+        hasChanges: false
+      });
+
       await vault.write("notes/readme.md", new TextEncoder().encode("second\n").buffer);
+      expect(await repo.hasManagedPathChanges(["notes/readme.md"])).toBe(true);
       expect(await repo.hasUncommittedChanges()).toBe(true);
+      expect(await repo.listPublicWorktreeChanges()).toEqual([
+        { path: "notes/readme.md", status: "modified" }
+      ]);
+      expect(await repo.recoverManagedWorktree()).toEqual({
+        changedManagedPaths: ["notes/readme.md"],
+        hasBoundaryRepair: false,
+        hasChanges: true
+      });
       const second = await repo.commit("Update note");
       expect(second).toMatch(/^[0-9a-f]{40}$/);
 

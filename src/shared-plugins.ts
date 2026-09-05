@@ -200,7 +200,7 @@ export async function readSharedPluginIds(vault: BinaryVault, configDir: string)
   return readSharedPluginIdsFromGitignore(content, configDir);
 }
 
-export async function writeSharedPluginIds(vault: BinaryVault, configDir: string, ids: readonly string[]): Promise<void> {
+export async function writeSharedPluginIds(vault: BinaryVault, configDir: string, ids: readonly string[]): Promise<boolean> {
   let current = "";
   if (await vault.exists(".gitignore")) current = new TextDecoder().decode(await vault.read(".gitignore"));
   let next = updateSharedPluginsInGitignore(current, configDir, ids);
@@ -208,9 +208,10 @@ export async function writeSharedPluginIds(vault: BinaryVault, configDir: string
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
   for (const entry of ["assets/", PRIVATE_PREFIX, TRASH_PREFIX]) if (!lines.some((line) => line.trim() === entry)) lines.push(entry);
   next = `${lines.join("\n")}\n`;
-  if (next === current.replace(/\r\n?/g, "\n")) return;
+  if (next === current.replace(/\r\n?/g, "\n")) return false;
   const encoded = new TextEncoder().encode(next);
   await vault.write(".gitignore", encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength));
+  return true;
 }
 
 export async function listLocalCommunityPlugins(vault: BinaryVault, configDir: string): Promise<LocalCommunityPlugin[]> {

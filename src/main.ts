@@ -4,7 +4,7 @@ import { mergeSettings } from "./config";
 import { DiagnosticsModal } from "./diagnostics-ui";
 import { parseLogEntries, PluginLogger, type LogEntry } from "./logger";
 import { SyncCoordinator } from "./sync";
-import { COMMIT_HISTORY_VIEW_TYPE, DASHBOARD_VIEW_TYPE, TeamCoreCommitHistoryView, TeamCoreDashboardView, TeamCoreSettingTab } from "./ui";
+import { COMMIT_HISTORY_VIEW_TYPE, DASHBOARD_VIEW_TYPE, LOCAL_CHANGES_VIEW_TYPE, TeamCoreCommitHistoryView, TeamCoreDashboardView, TeamCoreLocalChangesView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
 import { requestConfirmation } from "./confirm";
 import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
@@ -12,6 +12,13 @@ import { GitRepository } from "./git";
 import { FileAuthorService } from "./file-authors";
 import { AuthorDisplayService } from "./author-display";
 import { FILE_AUTHORS_PATH, PRIVATE_FOLDER } from "./constants";
+import { SerializedPluginData } from "./persistence";
+
+function createInstallationId(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 export default class TeamCorePlugin extends Plugin {
   teamCoreSettings: TeamCoreSettings = { ...DEFAULT_SETTINGS };
@@ -26,12 +33,17 @@ export default class TeamCorePlugin extends Plugin {
   private openingConflictEditor = false;
   private authorService!: FileAuthorService;
   private lastAuthorRefreshAt: number | undefined;
-  private diagnosticWrite: Promise<void> = Promise.resolve();
+  private persistentData!: SerializedPluginData;
   private restartRequiredModalOpen = false;
 
   async onload(): Promise<void> {
     const storedData: unknown = await this.loadData() as unknown;
+    this.persistentData = new SerializedPluginData(storedData, (data) => this.saveData(data));
     this.teamCoreSettings = mergeSettings(storedData);
+    if (!this.teamCoreSettings.installationId) {
+      this.teamCoreSettings.installationId = createInstallationId();
+      await this.persistentData.update({ installationId: this.teamCoreSettings.installationId });
+    }
     const storedLogs = storedData && typeof storedData === "object" && !Array.isArray(storedData)
       ? (storedData as { diagnosticLogs?: unknown }).diagnosticLogs
       : undefined;
@@ -52,9 +64,18 @@ export default class TeamCorePlugin extends Plugin {
       onSnapshot: (snapshot) => this.updateSnapshot(snapshot),
       onNotice: (message) => new Notice(message),
       onRestartRequired: () => this.openRestartRequiredModal(),
-      onPrivateSyncState: (state) => {
+      onPrivateSyncState: async (state) => {
         this.teamCoreSettings.privateSyncState = state;
-        void this.saveSettings();
+        await this.saveSettings();
+      },
+      onPendingDeletionPaths: async (paths) => {
+        this.teamCoreSettings.pendingDeletionPaths = paths;
+        await this.saveSettings();
+      },
+      confirmRemoteDeletions: (paths) => this.confirmRemoteDeletions(paths),
+      onAssetRetention: async (records) => {
+        this.teamCoreSettings.assetRetention = records;
+        await this.saveSettings();
       }
     }, this.logger);
     this.authorService = this.createFileAuthorService();
@@ -71,17 +92,23 @@ export default class TeamCorePlugin extends Plugin {
     this.addCommand({ id: "overwrite-private-notes", name: "重置私人笔记并重新同步", callback: () => void this.confirmPrivateRemoteOverwrite() });
     this.addCommand({ id: "resolve-conflicts", name: "解决同步冲突", callback: () => void this.openConflictEditor() });
     this.addCommand({ id: "normalize-attachments", name: "规范化全部附件", callback: () => void this.coordinator.normalizeAllAttachments() });
+    this.addCommand({ id: "migrate-public-attachments", name: "迁移已有公共附件到当前存储", callback: () => void this.migratePublicAttachments() });
     this.registerView(COMMIT_HISTORY_VIEW_TYPE, (leaf) => new TeamCoreCommitHistoryView(
       leaf,
       () => this.teamCoreSettings,
       () => this.authorDisplayService()
     ));
+    this.registerView(LOCAL_CHANGES_VIEW_TYPE, (leaf) => new TeamCoreLocalChangesView(
+      leaf,
+      () => this.coordinator.getLocalChangeSnapshot()
+    ));
     this.addCommand({ id: "open-dashboard", name: "打开团队看板", callback: () => void this.openDashboard() });
     this.addCommand({ id: "open-commit-history", name: "打开提交历史", callback: () => void this.openCommitHistory() });
+    this.addCommand({ id: "open-local-changes", name: "打开本地修改", callback: () => void this.openLocalChanges() });
     this.addCommand({ id: "initialize-remote", name: "初始化并同步当前知识库", callback: () => void this.confirmInitialize() });
     this.addCommand({ id: "clone-remote", name: "从远端知识库导入", callback: () => void this.confirmClone() });
     this.addCommand({ id: "overwrite-from-remote", name: "重置本地并重新同步", callback: () => void this.confirmRemoteOverwrite() });
-    this.addCommand({ id: "clear-remote-test-data", name: "测试：清空远端 Git 与 S3", callback: () => this.confirmClearRemote() });
+    this.addCommand({ id: "clear-remote-test-data", name: "测试：清空远端 Git 与公共附件", callback: () => this.confirmClearRemote() });
     this.addCommand({ id: "copy-diagnostics", name: "复制诊断信息", callback: () => void this.copyDiagnostics() });
     this.addCommand({ id: "export-diagnostics-log", name: "导出诊断日志", callback: () => void this.exportDiagnosticsFile() });
     this.registerEvent(this.app.vault.on("modify", (file) => {
@@ -135,12 +162,22 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    const stored: unknown = await this.loadData() as unknown;
-    const base = stored && typeof stored === "object" && !Array.isArray(stored) ? stored as Record<string, unknown> : {};
-    await this.saveData({ ...base, ...this.teamCoreSettings });
+    await this.persistentData.update(this.teamCoreSettings);
     this.authorService = this.createFileAuthorService();
     void this.refreshNoteAuthors();
     this.coordinator?.start();
+  }
+
+  private async confirmRemoteDeletions(paths: readonly string[]): Promise<boolean> {
+    const preview = paths.length > 12
+      ? `${paths.slice(0, 12).join("\n")}\n……以及另外 ${paths.length - 12} 项`
+      : paths.join("\n");
+    return requestConfirmation(this.app, {
+      title: "确认同步删除操作",
+      message: `以下 ${paths.length} 项删除会同步到所有成员的公共知识库：\n\n${preview}\n\n如果是误删，请取消并先从 Git 历史恢复。`,
+      confirmText: "确认同步删除",
+      destructive: true
+    });
   }
 
   refreshAuthorDisplays(): void {
@@ -227,10 +264,10 @@ export default class TeamCorePlugin extends Plugin {
       void this.refreshNoteAuthors();
     }
     if (!this.statusBar) return;
-    const state = { uninitialized: "未初始化", synced: "已同步", "local-changes": "有本地修改", syncing: "同步中", conflict: "有冲突", offline: "离线", error: "同步错误" }[snapshot.state];
-    const author = snapshot.currentAuthor ? ` · 作者：${this.authorDisplayService().display(snapshot.currentAuthor)}` : "";
     const progress = snapshot.progress;
     const progressLabel = progress && progress.total > 0 ? `${progress.phase} ${progress.current}/${progress.total}` : progress?.phase;
+    const state = { uninitialized: "未初始化", synced: "已同步", "local-changes": "有本地修改", syncing: "同步中", conflict: "有冲突", offline: "离线", error: "同步错误" }[snapshot.state];
+    const author = snapshot.currentAuthor ? ` · 作者：${this.authorDisplayService().display(snapshot.currentAuthor)}` : "";
     const progressText = progressLabel ? ` · ${progressLabel}` : "";
     this.statusText.setText(`Oldeng Team Core：${state}${progressText}${author}`);
     if (progress && progress.total > 0) {
@@ -347,6 +384,12 @@ export default class TeamCorePlugin extends Plugin {
     await this.app.workspace.revealLeaf(leaf);
   }
 
+  private async openLocalChanges(): Promise<void> {
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: LOCAL_CHANGES_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
+  }
+
   private async confirmInitialize(): Promise<void> {
     if (!this.teamCoreSettings.gitUrl) { new Notice("请先配置 Git 远端 URL"); return; }
     try {
@@ -410,7 +453,7 @@ export default class TeamCorePlugin extends Plugin {
           : "私人笔记和私人远端均会保留。";
         if (!await requestConfirmation(this.app, {
           title: "确认重置本地知识库",
-          message: `远端 Git 与 S3 不会修改。本地已有内容，请先备份。${location}\n\n确定后将清空本地公共知识库和 Git 元数据，再从远端完整下载。${privateReset}`,
+          message: `远端 Git 与公共附件存储不会修改。本地已有内容，请先备份。${location}\n\n确定后将清空本地公共知识库和 Git 元数据，再从远端完整下载。${privateReset}`,
           confirmText: "清空并重新同步",
           destructive: true
         })) return;
@@ -436,7 +479,7 @@ export default class TeamCorePlugin extends Plugin {
         : "私人笔记和私人远端均会保留。";
       if (!await requestConfirmation(this.app, {
         title: "重置本地知识库并重新同步",
-        message: `远端 Git 与 S3 不会修改。将清空本地公共知识库和 Git 元数据，再从远端完整下载。${privateReset}请确认已备份本地知识库。${location}`,
+        message: `远端 Git 与公共附件存储不会修改。将清空本地公共知识库和 Git 元数据，再从远端完整下载。${privateReset}请确认已备份本地知识库。${location}`,
         confirmText: "清空并重新同步",
         destructive: true
       })) return;
@@ -449,8 +492,20 @@ export default class TeamCorePlugin extends Plugin {
     new ClearRemoteConfirmationModal(this.app, this.teamCoreSettings, async () => {
       const result = await this.coordinator.clearRemoteData();
       const git = result.deletedGitBranch ? "远端 Git main 已删除" : "远端 Git main 原本为空";
-      new Notice(`测试数据已清空：${git}，删除 ${result.deletedS3Objects} 个 Oldeng Team Core 附件对象。本地笔记和附件已保留。`, 10_000);
+      const attachments = this.teamCoreSettings.attachmentStorageProvider === "webdav"
+        ? "已删除 Oldeng Team Core 公共附件目录"
+        : `删除 ${result.deletedS3Objects} 个 Oldeng Team Core 附件对象`;
+      new Notice(`测试数据已清空：${git}，${attachments}。本地笔记和附件已保留。`, 10_000);
     }).open();
+  }
+
+  async migratePublicAttachments(): Promise<void> {
+    try {
+      const count = await this.coordinator.migratePublicAttachmentsToConfiguredStore();
+      new Notice(count ? `已将 ${count} 个公共附件迁移到当前存储` : "没有需要迁移的公共附件");
+    } catch (error) {
+      new Notice(`迁移公共附件失败：${error instanceof Error ? error.message : String(error)}`, 10_000);
+    }
   }
 
   private async copyDiagnostics(): Promise<void> {
@@ -501,11 +556,7 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   private persistDiagnosticLogs(entries: readonly LogEntry[]): void {
-    this.diagnosticWrite = this.diagnosticWrite.then(async () => {
-      const stored: unknown = await this.loadData() as unknown;
-      const base = stored && typeof stored === "object" && !Array.isArray(stored) ? stored as Record<string, unknown> : {};
-      await this.saveData({ ...base, diagnosticLogs: entries });
-    }).catch((error: unknown) => {
+    void this.persistentData.update({ diagnosticLogs: [...entries] }).catch((error: unknown) => {
       console.warn("[Oldeng Team Core] 无法持久化诊断日志", error);
     });
   }
@@ -519,10 +570,13 @@ class ClearRemoteConfirmationModal extends Modal {
   onOpen(): void {
     this.titleEl.setText("确认清空远端测试数据");
     this.contentEl.empty();
-    this.contentEl.createEl("p", { text: "此操作不可撤销。将删除远端 Git main，并删除当前 S3 前缀下由本插件管理的全部附件对象。" });
+    this.contentEl.createEl("p", { text: "此操作不可撤销。将删除远端 Git main，并删除当前公共附件存储中由本插件管理的全部附件对象。" });
     const targets = this.contentEl.createEl("ul", { cls: "team-core-clear-targets" });
     targets.createEl("li", { text: `Git：${safeRemoteLabel(this.settings.gitUrl)}` });
-    targets.createEl("li", { text: `S3：${this.settings.s3Bucket || "未配置"}/${[this.settings.s3Prefix.replace(/^\/+|\/+$/g, ""), "sha256/"].filter(Boolean).join("/")}` });
+    const attachmentTarget = this.settings.attachmentStorageProvider === "webdav"
+      ? `WebDAV：${this.settings.attachmentWebdavUrl || "未配置"}/oldeng-team-core-attachments/v1`
+      : `S3：${this.settings.s3Bucket || "未配置"}/${[this.settings.s3Prefix.replace(/^\/+|\/+$/g, ""), "sha256/"].filter(Boolean).join("/")}`;
+    targets.createEl("li", { text: attachmentTarget });
     this.contentEl.createEl("p", { text: "“私人笔记”文件夹、知识库中的本地笔记和本地附件不会删除；本地 Git 元数据会重置，避免自动同步把测试内容立即推回远端。", cls: "team-core-clear-note" });
     const status = this.contentEl.createEl("p", { cls: "team-core-clear-status" });
     const actions = this.contentEl.createDiv("team-core-clear-actions");

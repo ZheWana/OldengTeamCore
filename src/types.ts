@@ -8,17 +8,28 @@ export type SyncState =
   | "error";
 
 export type PrivateSyncProvider = "webdav" | "s3";
+export type AttachmentStorageProvider = "webdav" | "s3";
 
 export interface PrivateSyncEntry {
   sha256?: string;
   size?: number;
   updatedAt?: number;
   deletedAt?: number;
+  /** Immutable remote object path. Legacy entries use their original path. */
+  objectKey?: string;
 }
 
 export interface PrivateSyncState {
   version: 1;
   entries: Record<string, PrivateSyncEntry>;
+  /** A complete local baseline has been established at least once. */
+  baselineEstablished?: boolean;
+  /**
+   * Local paths changed since the last confirmed private-sync baseline. This
+   * journal survives a plugin reload so routine synchronization can inspect
+   * only changed files instead of hashing the whole private workspace.
+   */
+  pendingPaths?: string[];
 }
 
 export interface TeamCoreSettings {
@@ -31,6 +42,11 @@ export interface TeamCoreSettings {
   s3Prefix: string;
   s3AccessKey: string;
   s3SecretKey: string;
+  /** Shared public-attachment object store. Existing installs stay on S3. */
+  attachmentStorageProvider: AttachmentStorageProvider;
+  attachmentWebdavUrl: string;
+  attachmentWebdavUsername: string;
+  attachmentWebdavPassword: string;
   autoSync: boolean;
   debounceMs: number;
   syncIntervalMs: number;
@@ -48,6 +64,12 @@ export interface TeamCoreSettings {
   privateS3AccessKey: string;
   privateS3SecretKey: string;
   privateSyncState: PrivateSyncState;
+  /** Stable, local-only installation identity. It is never shared in configuration bundles. */
+  installationId: string;
+  /** Public paths deleted locally and awaiting explicit remote-impact confirmation. */
+  pendingDeletionPaths: string[];
+  /** Content-addressed public objects awaiting delayed garbage collection. */
+  assetRetention: AssetRetentionRecord[];
 }
 
 export const DEFAULT_SETTINGS: TeamCoreSettings = {
@@ -60,6 +82,10 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   s3Prefix: "",
   s3AccessKey: "",
   s3SecretKey: "",
+  attachmentStorageProvider: "s3",
+  attachmentWebdavUrl: "",
+  attachmentWebdavUsername: "",
+  attachmentWebdavPassword: "",
   autoSync: false,
   debounceMs: 60_000,
   syncIntervalMs: 300_000,
@@ -76,7 +102,10 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   privateS3Prefix: "",
   privateS3AccessKey: "",
   privateS3SecretKey: "",
-  privateSyncState: { version: 1, entries: {} }
+  privateSyncState: { version: 1, entries: {}, baselineEstablished: false, pendingPaths: [] },
+  installationId: "",
+  pendingDeletionPaths: [],
+  assetRetention: []
 };
 
 export interface AssetManifestEntry {
@@ -85,11 +114,19 @@ export interface AssetManifestEntry {
   mime: string;
   uploadedAt: string;
   uploadedBy: string;
+  /** Stable installation ID of the uploader, when produced by a current client. */
+  uploadedFrom?: string;
 }
 
 export interface AssetManifest {
   version: 1;
   files: Record<string, AssetManifestEntry>;
+}
+
+export interface AssetRetentionRecord {
+  sha256: string;
+  size: number;
+  markedAt: string;
 }
 
 export interface CommitSummary {
@@ -147,7 +184,28 @@ export interface SyncSnapshot {
   currentAuthor?: string;
   pendingFiles: string[];
   pendingAssets?: string[];
+  /** Areas currently reporting local changes; derived from Git/private journal. */
+  localChangeAreas?: Array<"public" | "private">;
   progress?: SyncProgress;
+}
+
+export type LocalChangeArea = "public" | "private";
+export type LocalChangeCategory = "documents" | "attachments" | "settings" | "other";
+export type LocalChangeStatus = "added" | "modified" | "deleted" | "pending";
+
+/** One local change awaiting either public Git or private-note synchronization. */
+export interface LocalChangeItem {
+  path: string;
+  area: LocalChangeArea;
+  category: LocalChangeCategory;
+  status: LocalChangeStatus;
+}
+
+/** Read-only view model for the local-changes page. */
+export interface LocalChangeSnapshot {
+  publicChanges: LocalChangeItem[];
+  privateChanges: LocalChangeItem[];
+  privateSyncEnabled: boolean;
 }
 
 export interface SyncProgress {

@@ -1,4 +1,4 @@
-import type { DataAdapter, TFile, Vault } from "obsidian";
+import { FileSystemAdapter, Platform, type DataAdapter, type TFile, type Vault } from "obsidian";
 import { ASSETS_PREFIX, PRIVATE_FOLDER, PRIVATE_PREFIX, TRASH_FOLDER, TRASH_PREFIX } from "./constants";
 import type { ReferenceInfo } from "./types";
 
@@ -13,6 +13,86 @@ export interface BinaryVault {
   remove(path: string): Promise<void>;
   rmdir(path: string, recursive?: boolean): Promise<void>;
   rename(path: string, newPath: string): Promise<void>;
+  /** Reads a file as bounded chunks without materializing its full body. */
+  readInChunks?(path: string, expectedSize: number, onChunk: VaultChunkTarget): Promise<void>;
+}
+
+export interface VaultChunkTarget {
+  (chunk: ArrayBuffer, offset: number, total: number): Promise<void>;
+}
+
+export const VAULT_TRANSFER_CHUNK_SIZE = 8 * 1024 * 1024;
+
+export async function readVaultInChunks(
+  vault: BinaryVault,
+  path: string,
+  expectedSize: number,
+  onChunk: VaultChunkTarget,
+  chunkSize = VAULT_TRANSFER_CHUNK_SIZE
+): Promise<void> {
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new Error(`文件大小无效：${path}`);
+  if (vault.readInChunks) return vault.readInChunks(path, expectedSize, onChunk);
+  if (expectedSize > chunkSize) throw new Error(`当前设备无法分片读取大文件：${path}`);
+  const data = await vault.read(path);
+  if (data.byteLength !== expectedSize) throw new Error(`文件在读取期间发生变化：${path}`);
+  await onChunk(data, 0, expectedSize);
+}
+
+type DesktopFs = {
+  promises: {
+    open(path: string, flags: string): Promise<{
+      read(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+      close(): Promise<void>;
+    }>;
+  };
+};
+
+function desktopFs(): DesktopFs | undefined {
+  const runtime = window as Window & { require?: (name: string) => unknown };
+  if (!Platform.isDesktop || typeof runtime.require !== "function") return undefined;
+  try { return runtime.require("fs") as DesktopFs; }
+  catch { return undefined; }
+}
+
+async function readAdapterInChunks(adapter: DataAdapter, path: string, expectedSize: number, onChunk: VaultChunkTarget): Promise<void> {
+  const normalized = normalizeVaultPath(path);
+  const fullPath = adapter instanceof FileSystemAdapter ? adapter.getFullPath(normalized) : undefined;
+  const fs = desktopFs();
+  if (fullPath && fs) {
+    const handle = await fs.promises.open(fullPath, "r");
+    try {
+      let offset = 0;
+      while (offset < expectedSize) {
+        const bytes = new Uint8Array(Math.min(VAULT_TRANSFER_CHUNK_SIZE, expectedSize - offset));
+        const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, offset);
+        if (bytesRead !== bytes.byteLength) throw new Error(`文件在读取期间发生变化：${normalized}`);
+        await onChunk(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytesRead), offset, expectedSize);
+        offset += bytesRead;
+      }
+    } finally {
+      await handle.close();
+    }
+    return;
+  }
+
+  // Capacitor exposes a stable resource URI. Request one bounded range at a
+  // time, and fail closed if the runtime cannot honor ranges.
+  const resource = adapter.getResourcePath(normalized);
+  let offset = 0;
+  while (offset < expectedSize) {
+    const end = Math.min(offset + VAULT_TRANSFER_CHUNK_SIZE, expectedSize) - 1;
+    // requestUrl cannot read Obsidian resource URLs or carry a Range header safely.
+    const response = await window.fetch(resource, { headers: { range: `bytes=${offset}-${end}` }, cache: "no-store" });
+    if (response.status !== 206) throw new Error(`当前设备不支持安全分片读取：${normalized}`);
+    const contentRange = response.headers.get("content-range") ?? "";
+    const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
+    const data = await response.arrayBuffer();
+    if (!range || Number(range[1]) !== offset || Number(range[2]) !== end || Number(range[3]) !== expectedSize || data.byteLength !== end - offset + 1) {
+      throw new Error(`本地文件分片响应无效：${normalized}`);
+    }
+    await onChunk(data, offset, expectedSize);
+    offset = end + 1;
+  }
 }
 
 export function normalizeVaultPath(path: string): string {
@@ -240,7 +320,8 @@ export function createVaultAdapter(adapter: DataAdapter): BinaryVault {
     },
     remove: (path) => adapter.remove(normalizeVaultPath(path)),
     rmdir: (path, recursive = false) => adapter.rmdir(normalizeVaultPath(path), recursive),
-    rename: (path, newPath) => adapter.rename(normalizeVaultPath(path), normalizeVaultPath(newPath))
+    rename: (path, newPath) => adapter.rename(normalizeVaultPath(path), normalizeVaultPath(newPath)),
+    readInChunks: (path, expectedSize, onChunk) => readAdapterInChunks(adapter, path, expectedSize, onChunk)
   };
 }
 

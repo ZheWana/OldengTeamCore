@@ -2,6 +2,7 @@ import type { PrivateSyncEntry, PrivateSyncState, TeamCoreSettings } from "./typ
 import { DEFAULT_SETTINGS } from "./types";
 import { base64UrlDecodeBytes, base64UrlEncodeBytes } from "./crypto";
 import { normalizeAuthorDisplayMappings } from "./author-display";
+import { normalizeVaultPath } from "./vault";
 import { compressSync, decompressSync, strFromU8, strToU8 } from "fflate";
 
 const IMPORT_VERSION = 1;
@@ -18,6 +19,10 @@ type SharedSettings = Pick<TeamCoreSettings,
   | "s3Prefix"
   | "s3AccessKey"
   | "s3SecretKey"
+  | "attachmentStorageProvider"
+  | "attachmentWebdavUrl"
+  | "attachmentWebdavUsername"
+  | "attachmentWebdavPassword"
   | "autoSync"
   | "debounceMs"
   | "syncIntervalMs"
@@ -39,6 +44,10 @@ function selectSettings(settings: TeamCoreSettings): SharedSettings {
     s3Prefix: settings.s3Prefix,
     s3AccessKey: settings.s3AccessKey,
     s3SecretKey: settings.s3SecretKey,
+    attachmentStorageProvider: settings.attachmentStorageProvider,
+    attachmentWebdavUrl: settings.attachmentWebdavUrl,
+    attachmentWebdavUsername: settings.attachmentWebdavUsername,
+    attachmentWebdavPassword: settings.attachmentWebdavPassword,
     autoSync: settings.autoSync,
     debounceMs: settings.debounceMs,
     syncIntervalMs: settings.syncIntervalMs,
@@ -134,7 +143,7 @@ export function importSettings(encoded: string, current: TeamCoreSettings): Team
     autoSync: current.autoSync,
     gitUsername: current.gitUsername
   });
-  if (typeof merged.gitUrl !== "string" || typeof merged.gitPassword !== "string" || typeof merged.s3Endpoint !== "string" || typeof merged.s3Bucket !== "string") throw new Error("配置字段无效");
+  if (typeof merged.gitUrl !== "string" || typeof merged.gitPassword !== "string" || typeof merged.s3Endpoint !== "string" || typeof merged.s3Bucket !== "string" || typeof merged.attachmentWebdavUrl !== "string") throw new Error("配置字段无效");
   if (typeof merged.autoSync !== "boolean") throw new Error("自动同步开关无效");
   merged.authorDisplayMappings = normalizeAuthorDisplayMappings(merged.authorDisplayMappings);
   if (!Number.isFinite(merged.debounceMs) || merged.debounceMs < 1_000 || !Number.isFinite(merged.syncIntervalMs) || merged.syncIntervalMs < 10_000) throw new Error("同步时间必须为有效的毫秒数");
@@ -155,6 +164,10 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     s3Prefix: typeof input.s3Prefix === "string" ? input.s3Prefix : DEFAULT_SETTINGS.s3Prefix,
     s3AccessKey: typeof input.s3AccessKey === "string" ? input.s3AccessKey : DEFAULT_SETTINGS.s3AccessKey,
     s3SecretKey: typeof input.s3SecretKey === "string" ? input.s3SecretKey : DEFAULT_SETTINGS.s3SecretKey,
+    attachmentStorageProvider: input.attachmentStorageProvider === "webdav" ? "webdav" : "s3",
+    attachmentWebdavUrl: typeof input.attachmentWebdavUrl === "string" ? input.attachmentWebdavUrl : DEFAULT_SETTINGS.attachmentWebdavUrl,
+    attachmentWebdavUsername: typeof input.attachmentWebdavUsername === "string" ? input.attachmentWebdavUsername : DEFAULT_SETTINGS.attachmentWebdavUsername,
+    attachmentWebdavPassword: typeof input.attachmentWebdavPassword === "string" ? input.attachmentWebdavPassword : DEFAULT_SETTINGS.attachmentWebdavPassword,
     debounceMs: typeof input.debounceMs === "number" ? input.debounceMs : DEFAULT_SETTINGS.debounceMs,
     syncIntervalMs: typeof input.syncIntervalMs === "number" ? input.syncIntervalMs : DEFAULT_SETTINGS.syncIntervalMs,
     authorDisplayMappings: input.authorDisplayMappings ?? DEFAULT_SETTINGS.authorDisplayMappings,
@@ -170,7 +183,8 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     privateS3Prefix: typeof input.privateS3Prefix === "string" ? input.privateS3Prefix : DEFAULT_SETTINGS.privateS3Prefix,
     privateS3AccessKey: typeof input.privateS3AccessKey === "string" ? input.privateS3AccessKey : DEFAULT_SETTINGS.privateS3AccessKey,
     privateS3SecretKey: typeof input.privateS3SecretKey === "string" ? input.privateS3SecretKey : DEFAULT_SETTINGS.privateS3SecretKey,
-    privateSyncState: normalizePrivateSyncState(input.privateSyncState)
+    privateSyncState: normalizePrivateSyncState(input.privateSyncState),
+    installationId: normalizeInstallationId(input.installationId)
   });
 }
 
@@ -186,15 +200,27 @@ function normalizePrivateSyncState(value: unknown): PrivateSyncState {
     const validSize = entry.size === undefined || (Number.isSafeInteger(entry.size) && entry.size >= 0);
     const validUpdated = entry.updatedAt === undefined || (Number.isFinite(entry.updatedAt) && entry.updatedAt > 0);
     const validDeleted = entry.deletedAt === undefined || (Number.isFinite(entry.deletedAt) && entry.deletedAt > 0);
-    if (!path || !validHash || !validSize || !validUpdated || !validDeleted || (!entry.sha256 && !entry.deletedAt)) continue;
+    const validObjectKey = entry.objectKey === undefined || (typeof entry.objectKey === "string" && entry.objectKey.startsWith("oldeng-team-core-private/v1/files/") && !entry.objectKey.includes(".."));
+    if (!path || !validHash || !validSize || !validUpdated || !validDeleted || !validObjectKey || (!entry.sha256 && !entry.deletedAt)) continue;
     entries[path] = {
       ...(entry.sha256 ? { sha256: entry.sha256.toLowerCase() } : {}),
       ...(entry.size === undefined ? {} : { size: entry.size }),
       ...(entry.updatedAt === undefined ? {} : { updatedAt: entry.updatedAt }),
-      ...(entry.deletedAt === undefined ? {} : { deletedAt: entry.deletedAt })
+      ...(entry.deletedAt === undefined ? {} : { deletedAt: entry.deletedAt }),
+      ...(entry.objectKey ? { objectKey: entry.objectKey } : {})
     };
   }
-  return { version: 1, entries };
+  const pendingPaths = Array.isArray(input.pendingPaths)
+    ? [...new Set(input.pendingPaths
+      .filter((path): path is string => typeof path === "string")
+      .map((path) => path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""))
+      .filter((path) => path.length > 0 && !path.startsWith("../") && !path.includes("/../")))].sort()
+    : [];
+  return { version: 1, entries, baselineEstablished: input.baselineEstablished === true, pendingPaths };
+}
+
+function normalizeInstallationId(value: unknown): string {
+  return typeof value === "string" && /^[a-f0-9]{48}$/i.test(value) ? value.toLowerCase() : "";
 }
 
 function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
@@ -203,8 +229,20 @@ function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
     ...input,
     privateSyncEnabled: typeof input.privateSyncEnabled === "boolean" ? input.privateSyncEnabled : false,
     privateSyncWithTeam: typeof input.privateSyncWithTeam === "boolean" ? input.privateSyncWithTeam : false,
+    attachmentStorageProvider: input.attachmentStorageProvider === "webdav" ? "webdav" : "s3",
     privateSyncProvider: input.privateSyncProvider === "s3" ? "s3" : "webdav",
-    privateSyncState: normalizePrivateSyncState(input.privateSyncState)
+    privateSyncState: normalizePrivateSyncState(input.privateSyncState),
+    installationId: normalizeInstallationId(input.installationId),
+    pendingDeletionPaths: Array.isArray(input.pendingDeletionPaths)
+      ? [...new Set(input.pendingDeletionPaths.filter((path): path is string => typeof path === "string").map(normalizeVaultPath).filter(Boolean))].sort()
+      : [],
+    assetRetention: Array.isArray(input.assetRetention)
+      ? input.assetRetention.filter((item): item is { sha256: string; size: number; markedAt: string } => Boolean(item && typeof item === "object"
+        && typeof (item as { sha256?: unknown }).sha256 === "string" && /^[0-9a-f]{64}$/i.test((item as { sha256: string }).sha256)
+        && Number.isSafeInteger((item as { size?: unknown }).size) && (item as { size: number }).size >= 0
+        && typeof (item as { markedAt?: unknown }).markedAt === "string" && !Number.isNaN(Date.parse((item as { markedAt: string }).markedAt))))
+        .map((item) => ({ sha256: item.sha256.toLowerCase(), size: item.size, markedAt: new Date(item.markedAt).toISOString() }))
+      : []
   };
   try {
     return { ...merged, authorDisplayMappings: normalizeAuthorDisplayMappings(input.authorDisplayMappings) };
