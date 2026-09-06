@@ -258,6 +258,10 @@ button.team-core-destructive-button { background-color: var(--color-red); color:
 .team-core-settings .setting-item-control input[type="text"],
 .team-core-settings .setting-item-control input[type="password"],
 .team-core-settings .setting-item-control input[type="number"] { width: 100%; min-width: 0; max-width: none; }
+.team-core-settings .team-core-auto-sync-window { display: block; padding: .75rem 0; border-top: 1px solid var(--background-modifier-border); }
+.team-core-settings .team-core-auto-sync-window-sentence { display: flex; align-items: center; gap: .5rem; font-size: var(--font-ui-medium); }
+.team-core-settings .team-core-auto-sync-window-input { width: 5.25rem; min-width: 5.25rem; text-align: center; }
+.team-core-settings .team-core-auto-sync-window-desc { margin-top: .4rem; color: var(--text-muted); font-size: var(--font-ui-small); }
 .team-core-settings .team-core-config-transfer { align-items: stretch; flex-wrap: wrap; gap: .55rem 1rem; }
 .team-core-settings .team-core-config-transfer > .setting-item-info { flex: 1 0 100%; max-width: none; }
 .team-core-settings .team-core-config-transfer > .setting-item-control { display: grid; grid-template-columns: minmax(12rem, 1fr) auto auto; gap: .5rem; flex: 1 1 100%; width: 100%; max-width: none; }

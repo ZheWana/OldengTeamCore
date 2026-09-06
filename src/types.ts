@@ -48,8 +48,8 @@ export interface TeamCoreSettings {
   attachmentWebdavUsername: string;
   attachmentWebdavPassword: string;
   autoSync: boolean;
-  debounceMs: number;
-  syncIntervalMs: number;
+  /** Sliding quiet window before an automatic sync is allowed to start. */
+  autoSyncIdleMs: number;
   authorDisplayMappings: Record<string, string>;
   privateSyncEnabled: boolean;
   privateSyncWithTeam: boolean;
@@ -91,8 +91,7 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   attachmentWebdavUsername: "",
   attachmentWebdavPassword: "",
   autoSync: false,
-  debounceMs: 60_000,
-  syncIntervalMs: 300_000,
+  autoSyncIdleMs: 60_000,
   authorDisplayMappings: {},
   privateSyncEnabled: false,
   privateSyncWithTeam: false,

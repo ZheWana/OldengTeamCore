@@ -349,8 +349,8 @@ async function startGitHttpServer(projectRoot: string, beforeFirstPush: () => Pr
 
 describe("configuration bundles", () => {
   it("round-trips shared settings without replacing the local identity", () => {
-    const source = settings({ gitUsername: "source-user", debounceMs: 90_000, installationId: "a".repeat(48) });
-    const current = settings({ gitUsername: "local-user", debounceMs: 60_000, installationId: "b".repeat(48) });
+    const source = settings({ gitUsername: "source-user", autoSyncIdleMs: 90_000, installationId: "a".repeat(48) });
+    const current = settings({ gitUsername: "local-user", autoSyncIdleMs: 60_000, installationId: "b".repeat(48) });
     const imported = importSettings(exportSettings(source), current);
 
     expect(imported).toEqual({ ...source, gitUsername: "local-user", installationId: current.installationId });
@@ -358,8 +358,15 @@ describe("configuration bundles", () => {
 
   it("rejects malformed bundles and invalid timing values", () => {
     expect(() => importSettings("not-base64", settings())).toThrow();
-    const encoded = exportSettings(settings({ debounceMs: 0 }));
-    expect(() => importSettings(encoded, settings())).toThrow("同步时间");
+    const encoded = exportSettings(settings({ autoSyncIdleMs: 0 }));
+    expect(() => importSettings(encoded, settings())).toThrow("同步窗口");
+  });
+
+  it("migrates the retired save debounce into the single automatic sync window", () => {
+    const migrated = mergeSettings({ debounceMs: 75_000, syncIntervalMs: 900_000 });
+    expect(migrated.autoSyncIdleMs).toBe(75_000);
+    expect("debounceMs" in migrated).toBe(false);
+    expect("syncIntervalMs" in migrated).toBe(false);
   });
 
   it("exports a compressed, self-identifying bundle", () => {

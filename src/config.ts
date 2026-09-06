@@ -24,8 +24,7 @@ type SharedSettings = Pick<TeamCoreSettings,
   | "attachmentWebdavUsername"
   | "attachmentWebdavPassword"
   | "autoSync"
-  | "debounceMs"
-  | "syncIntervalMs"
+  | "autoSyncIdleMs"
   | "authorDisplayMappings">;
 
 interface ImportBundle {
@@ -49,8 +48,7 @@ function selectSettings(settings: TeamCoreSettings): SharedSettings {
     attachmentWebdavUsername: settings.attachmentWebdavUsername,
     attachmentWebdavPassword: settings.attachmentWebdavPassword,
     autoSync: settings.autoSync,
-    debounceMs: settings.debounceMs,
-    syncIntervalMs: settings.syncIntervalMs,
+    autoSyncIdleMs: settings.autoSyncIdleMs,
     authorDisplayMappings: settings.authorDisplayMappings
   };
 }
@@ -146,7 +144,7 @@ export function importSettings(encoded: string, current: TeamCoreSettings): Team
   if (typeof merged.gitUrl !== "string" || typeof merged.gitPassword !== "string" || typeof merged.s3Endpoint !== "string" || typeof merged.s3Bucket !== "string" || typeof merged.attachmentWebdavUrl !== "string") throw new Error("配置字段无效");
   if (typeof merged.autoSync !== "boolean") throw new Error("自动同步开关无效");
   merged.authorDisplayMappings = normalizeAuthorDisplayMappings(merged.authorDisplayMappings);
-  if (!Number.isFinite(merged.debounceMs) || merged.debounceMs < 1_000 || !Number.isFinite(merged.syncIntervalMs) || merged.syncIntervalMs < 10_000) throw new Error("同步时间必须为有效的毫秒数");
+  if (!Number.isFinite(merged.autoSyncIdleMs) || merged.autoSyncIdleMs < 1_000) throw new Error("同步窗口必须为至少 1 秒的有效时长");
   return normalizeSettings({ ...current, ...merged });
 }
 
@@ -168,8 +166,14 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     attachmentWebdavUrl: typeof input.attachmentWebdavUrl === "string" ? input.attachmentWebdavUrl : DEFAULT_SETTINGS.attachmentWebdavUrl,
     attachmentWebdavUsername: typeof input.attachmentWebdavUsername === "string" ? input.attachmentWebdavUsername : DEFAULT_SETTINGS.attachmentWebdavUsername,
     attachmentWebdavPassword: typeof input.attachmentWebdavPassword === "string" ? input.attachmentWebdavPassword : DEFAULT_SETTINGS.attachmentWebdavPassword,
-    debounceMs: typeof input.debounceMs === "number" ? input.debounceMs : DEFAULT_SETTINGS.debounceMs,
-    syncIntervalMs: typeof input.syncIntervalMs === "number" ? input.syncIntervalMs : DEFAULT_SETTINGS.syncIntervalMs,
+    // Existing local data keeps its prior save-debounce value as the new
+    // quiet window. The retired periodic interval intentionally has no
+    // replacement: automatic sync is now activity-driven only.
+    autoSyncIdleMs: typeof input.autoSyncIdleMs === "number"
+      ? input.autoSyncIdleMs
+      : typeof (input as { debounceMs?: unknown }).debounceMs === "number"
+        ? (input as { debounceMs: number }).debounceMs
+        : DEFAULT_SETTINGS.autoSyncIdleMs,
     authorDisplayMappings: input.authorDisplayMappings ?? DEFAULT_SETTINGS.authorDisplayMappings,
     privateSyncEnabled: typeof input.privateSyncEnabled === "boolean" ? input.privateSyncEnabled : DEFAULT_SETTINGS.privateSyncEnabled,
     privateSyncWithTeam: typeof input.privateSyncWithTeam === "boolean" ? input.privateSyncWithTeam : DEFAULT_SETTINGS.privateSyncWithTeam,
@@ -246,6 +250,9 @@ function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
   const merged: TeamCoreSettings = {
     ...DEFAULT_SETTINGS,
     ...input,
+    autoSyncIdleMs: Number.isFinite(input.autoSyncIdleMs) && input.autoSyncIdleMs >= 1_000
+      ? Math.round(input.autoSyncIdleMs)
+      : DEFAULT_SETTINGS.autoSyncIdleMs,
     privateSyncEnabled: typeof input.privateSyncEnabled === "boolean" ? input.privateSyncEnabled : false,
     privateSyncWithTeam: typeof input.privateSyncWithTeam === "boolean" ? input.privateSyncWithTeam : false,
     attachmentStorageProvider: input.attachmentStorageProvider === "webdav" ? "webdav" : "s3",

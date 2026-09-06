@@ -383,9 +383,7 @@ export class SyncCoordinator {
   private pendingNotePrivatizations = new Map<symbol, { file: TFile; originalPath: string }>();
   private internalCommunityPluginWriteDepth = 0;
   private debounceTimer: number | undefined;
-  private periodicTimer: number | undefined;
   private privateDebounceTimer: number | undefined;
-  private privatePeriodicTimer: number | undefined;
   private running: Promise<void> | undefined;
   private lastError = "";
   private lastSyncAt: number | undefined;
@@ -434,27 +432,19 @@ export class SyncCoordinator {
     this.sharedPluginPollTimer = window.setInterval(() => void this.pollSharedPluginChanges(false, pollGeneration), SHARED_PLUGIN_POLL_INTERVAL_MS);
     if (!settings.autoSync) return;
     if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam)) {
-      this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
+      this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().autoSyncIdleMs);
     }
     if (this.privateSyncDirty && settings.privateSyncEnabled && !settings.privateSyncWithTeam) {
-      this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.debounceMs);
-    }
-    this.periodicTimer = window.setInterval(() => void this.runCycle(false), settings.syncIntervalMs);
-    if (settings.privateSyncEnabled && !settings.privateSyncWithTeam) {
-      this.privatePeriodicTimer = window.setInterval(() => void this.syncPrivateNotes().catch(() => undefined), settings.syncIntervalMs);
+      this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.autoSyncIdleMs);
     }
   }
 
   stop(): void {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
-    if (this.periodicTimer !== undefined) window.clearInterval(this.periodicTimer);
     if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
-    if (this.privatePeriodicTimer !== undefined) window.clearInterval(this.privatePeriodicTimer);
     if (this.sharedPluginPollTimer !== undefined) window.clearInterval(this.sharedPluginPollTimer);
     this.debounceTimer = undefined;
-    this.periodicTimer = undefined;
     this.privateDebounceTimer = undefined;
-    this.privatePeriodicTimer = undefined;
     this.sharedPluginPollTimer = undefined;
     this.sharedPluginFingerprint = undefined;
     this.sharedPluginPollCount = 0;
@@ -816,7 +806,7 @@ export class SyncCoordinator {
     void this.refreshPublicEventState(generation);
     if (!this.settings().autoSync) return;
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
-    this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
+    this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().autoSyncIdleMs);
   }
 
   /** Keep the public status bar strictly aligned with an event-scoped Git read. */
@@ -855,7 +845,7 @@ export class SyncCoordinator {
     if (this.state !== "conflict") this.setState("local-changes");
     if (!settings.autoSync) return;
     if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
-    this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.debounceMs);
+    this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.autoSyncIdleMs);
   }
 
   private privateRelativePath(path: string): string {

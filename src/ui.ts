@@ -1106,8 +1106,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
       this.group("公共附件存储", this.attachmentStorageDefinitions()),
       this.group("同步", [
         this.toggleDefinition("启用自动同步", "autoSync"),
-        this.numberDefinition("保存消抖（分钟）", "debounceMs", 60_000),
-        this.numberDefinition("自动同步（分钟）", "syncIntervalMs", 300_000),
+        this.autoSyncIdleDefinition(),
         this.remoteOverwriteDefinition()
       ]),
       this.group("私人笔记多端同步", this.privateSyncDefinitions()),
@@ -1140,9 +1139,8 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     }
     this.addAttachmentMigrationAction(new Setting(containerEl).setName("迁移已有附件到当前存储").setDesc("切换公共附件存储后执行。会复制清单中的全部附件到当前存储，不修改 Git、Markdown 或旧存储。"));
     new Setting(containerEl).setName("同步").setHeading();
-    this.addToggleControl(new Setting(containerEl).setName("启用自动同步").setDesc("关闭后不会因保存或定时器自动同步，只能通过“立即同步”手动执行。"), "autoSync");
-    this.addNumberControl(new Setting(containerEl).setName("保存消抖（分钟）"), "debounceMs", 60_000);
-    this.addNumberControl(new Setting(containerEl).setName("自动同步（分钟）"), "syncIntervalMs", 300_000);
+    this.addToggleControl(new Setting(containerEl).setName("启用自动同步").setDesc("关闭后不会因保存自动同步，只能通过“立即同步”手动执行。"), "autoSync");
+    this.addAutoSyncIdleControl(new Setting(containerEl));
     this.addRemoteOverwriteEntry(new Setting(containerEl).setName("重置本地并重新同步"));
     this.renderPrivateSyncSettings(containerEl);
     new Setting(containerEl).setName("团队公共插件").setHeading();
@@ -1161,14 +1159,19 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     return { name, aliases: [String(key)], render: (setting) => this.addTextControl(setting, key, secret) };
   }
 
-  private numberDefinition(name: string, key: "debounceMs" | "syncIntervalMs", defaultMs: number): SettingDefinition {
-    return { name, aliases: [String(key)], render: (setting) => this.addNumberControl(setting, key, defaultMs) };
+  private autoSyncIdleDefinition(): SettingDefinition {
+    return {
+      name: "无操作后同步",
+      desc: "任意公共修改都会重置倒计时；独立私人笔记同步使用同一等待时间。手动同步不等待。",
+      aliases: ["自动同步窗口", "无操作", "秒后同步"],
+      render: (setting) => this.addAutoSyncIdleControl(setting)
+    };
   }
 
   private toggleDefinition(name: string, key: "autoSync"): SettingDefinition {
     return {
       name,
-      desc: "关闭后不会因保存或定时器自动同步，只能通过“立即同步”手动执行。",
+      desc: "关闭后不会因保存自动同步，只能通过“立即同步”手动执行。",
       aliases: [String(key)],
       render: (setting) => this.addToggleControl(setting, key)
     };
@@ -1512,17 +1515,30 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     });
   }
 
-  private addNumberControl(setting: Setting, key: "debounceMs" | "syncIntervalMs", defaultMs: number): void {
-    setting.addText((component) => {
-      component.setValue(String(Math.round(this.teamPlugin.teamCoreSettings[key] / 60_000) || defaultMs / 60_000));
-      component.inputEl.type = "number";
-      component.onChange(async (value) => {
-        const minutes = Number(value);
-        if (Number.isFinite(minutes) && minutes > 0) {
-          this.teamPlugin.teamCoreSettings[key] = minutes * 60_000;
-          await this.teamPlugin.saveSettings();
-        }
-      });
+  private addAutoSyncIdleControl(setting: Setting): void {
+    setting.settingEl.empty();
+    setting.settingEl.addClass("team-core-auto-sync-window");
+    const sentence = setting.settingEl.createDiv({ cls: "team-core-auto-sync-window-sentence" });
+    sentence.appendText("无操作");
+    const input = sentence.createEl("input", { type: "number", cls: "team-core-auto-sync-window-input" });
+    input.min = "1";
+    input.step = "1";
+    input.value = String(Math.round(this.teamPlugin.teamCoreSettings.autoSyncIdleMs / 1_000));
+    sentence.appendText("秒后同步");
+    setting.settingEl.createDiv({
+      text: "任意公共修改都会重置倒计时；独立私人笔记同步使用同一等待时间。不会在无本地修改时主动拉取远端；手动同步不等待。",
+      cls: "team-core-auto-sync-window-desc"
+    });
+    input.addEventListener("change", () => {
+      const seconds = Number(input.value);
+      if (!Number.isFinite(seconds) || seconds < 1) {
+        input.value = String(Math.round(this.teamPlugin.teamCoreSettings.autoSyncIdleMs / 1_000));
+        return;
+      }
+      const next = Math.round(seconds) * 1_000;
+      if (next === this.teamPlugin.teamCoreSettings.autoSyncIdleMs) return;
+      this.teamPlugin.teamCoreSettings.autoSyncIdleMs = next;
+      void this.teamPlugin.saveSettings();
     });
   }
 
