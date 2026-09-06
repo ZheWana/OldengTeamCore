@@ -732,7 +732,8 @@ class RestartRequiredModal extends Modal {
   onOpen(): void {
     this.modalEl.addClass("team-core-restart-modal");
     this.titleEl.setText("需要重启 Obsidian");
-    this.contentEl.createEl("p", { text: "同步已完成，公共插件文件或启用状态已更新。重启 Obsidian 后，插件更改才会生效。" });
+    this.contentEl.createEl("p", { text: "公共插件文件、配置或启用状态已变更。重启 Obsidian 后，变更才会可靠地生效。" });
+    this.contentEl.createEl("p", { text: "若刚刚撤销了插件配置，请在重启前不要继续编辑该插件设置；它保留的旧内存值可能再次写回 data.json。", cls: "team-core-restart-warning" });
     const actions = this.contentEl.createDiv("team-core-restart-actions");
     new ButtonComponent(actions).setButtonText("稍后重启").onClick(() => this.close());
     if (!Platform.isMobile) {
