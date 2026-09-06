@@ -13,7 +13,7 @@ import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateMa
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
 import { createAttachmentStore } from "../src/attachment-store";
 import { createPrivateRemote, PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
-import { classifyPrivateLocalChange, classifyPublicLocalChange, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { classifyPrivateLocalChange, classifyPublicLocalChange, groupRemoteDeletionPaths, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -462,6 +462,20 @@ describe("private-note synchronization", () => {
     expect(classifyPrivateLocalChange("draft.md")).toBe("documents");
     expect(classifyPrivateLocalChange("assets/sha256-aabbcc.png")).toBe("attachments");
     expect(classifyPrivateLocalChange("research/data.csv")).toBe("other");
+  });
+
+  it("separates knowledge-content and public-configuration deletion prompts", () => {
+    expect(groupRemoteDeletionPaths([
+      "assets/tc-sha256-deadbeef.png",
+      "notes/plan.md",
+      ".team/assets-manifest.json",
+      ".team/shared-plugins.json",
+      ".gitignore",
+      ".obsidian/plugins/dataview/main.js"
+    ], ".obsidian")).toEqual({
+      knowledgePaths: [".team/assets-manifest.json", "assets/tc-sha256-deadbeef.png", "notes/plan.md"],
+      configurationPaths: [".gitignore", ".obsidian/plugins/dataview/main.js", ".team/shared-plugins.json"]
+    });
   });
 
   it("does not queue private Vault events while private synchronization is disabled", () => {

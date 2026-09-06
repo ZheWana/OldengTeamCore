@@ -3,7 +3,7 @@ import { DEFAULT_SETTINGS, type SyncSnapshot, type TeamCoreSettings } from "./ty
 import { mergeSettings } from "./config";
 import { DiagnosticsModal } from "./diagnostics-ui";
 import { parseLogEntries, PluginLogger, type LogEntry } from "./logger";
-import { SyncCoordinator } from "./sync";
+import { SyncCoordinator, type RemoteDeletionGroups } from "./sync";
 import { COMMIT_HISTORY_VIEW_TYPE, DASHBOARD_VIEW_TYPE, LOCAL_CHANGES_VIEW_TYPE, TeamCoreCommitHistoryView, TeamCoreDashboardView, TeamCoreLocalChangesView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
 import { requestConfirmation } from "./confirm";
@@ -168,14 +168,33 @@ export default class TeamCorePlugin extends Plugin {
     this.coordinator?.start();
   }
 
-  private async confirmRemoteDeletions(paths: readonly string[]): Promise<boolean> {
+  private async confirmRemoteDeletions(groups: RemoteDeletionGroups): Promise<boolean> {
+    if (groups.knowledgePaths.length && !await this.confirmKnowledgeDeletion(groups.knowledgePaths)) return false;
+    if (groups.configurationPaths.length && !await this.confirmConfigurationDeletion(groups.configurationPaths)) return false;
+    return true;
+  }
+
+  private deletionPreview(paths: readonly string[]): string {
     const preview = paths.length > 12
       ? `${paths.slice(0, 12).join("\n")}\n……以及另外 ${paths.length - 12} 项`
       : paths.join("\n");
+    return preview;
+  }
+
+  private async confirmKnowledgeDeletion(paths: readonly string[]): Promise<boolean> {
     return requestConfirmation(this.app, {
-      title: "确认同步删除操作",
-      message: `以下 ${paths.length} 项删除会同步到所有成员的公共知识库：\n\n${preview}\n\n如果是误删，请取消并先从 Git 历史恢复。`,
-      confirmText: "确认同步删除",
+      title: "确认同步删除知识库内容",
+      message: `以下 ${paths.length} 项笔记、附件或知识库内容删除会同步到所有成员：\n\n${this.deletionPreview(paths)}\n\n笔记与附件可能互相引用，也可能被其他文档引用。请确认不再需要这些内容；如属误删，请取消并先从 Git 历史恢复。`,
+      confirmText: "确认删除知识库内容",
+      destructive: true
+    });
+  }
+
+  private async confirmConfigurationDeletion(paths: readonly string[]): Promise<boolean> {
+    return requestConfirmation(this.app, {
+      title: "确认同步删除公共配置",
+      message: `以下 ${paths.length} 项公共插件或共享配置删除会同步到所有成员：\n\n${this.deletionPreview(paths)}\n\n这可能改变团队插件的启用状态、版本或共同配置。请先与团队确认；如属误删，请取消并从 Git 历史恢复。`,
+      confirmText: "确认删除公共配置",
       destructive: true
     });
   }

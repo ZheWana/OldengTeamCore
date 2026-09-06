@@ -20,7 +20,7 @@ export interface SyncCallbacks {
   onRestartRequired(): void;
   onPrivateSyncState(state: PrivateSyncState): void | Promise<void>;
   onPendingDeletionPaths?(paths: string[]): void | Promise<void>;
-  confirmRemoteDeletions?(paths: string[]): Promise<boolean>;
+  confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<boolean>;
   onAssetRetention?(records: AssetRetentionRecord[]): void | Promise<void>;
 }
 
@@ -34,6 +34,12 @@ export interface ConnectionInfo {
 export interface RemoteClearResult {
   deletedS3Objects: number;
   deletedGitBranch: boolean;
+}
+
+/** Deletions have materially different user impact: knowledge content versus team environment. */
+export interface RemoteDeletionGroups {
+  knowledgePaths: string[];
+  configurationPaths: string[];
 }
 
 interface AttachmentPlan {
@@ -71,6 +77,17 @@ export function classifyPublicLocalChange(path: string, configDir: string): Loca
     || isConfigPath(normalized, configDir)) return "settings";
   if (normalized.endsWith(".md")) return "documents";
   return "other";
+}
+
+export function groupRemoteDeletionPaths(paths: readonly string[], configDir: string): RemoteDeletionGroups {
+  const knowledgePaths: string[] = [];
+  const configurationPaths: string[] = [];
+  for (const candidate of [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort()) {
+    if (candidate === ".gitignore" || candidate === FILE_AUTHORS_PATH || candidate === SHARED_PLUGIN_STATE_PATH
+      || isConfigPath(candidate, configDir)) configurationPaths.push(candidate);
+    else knowledgePaths.push(candidate);
+  }
+  return { knowledgePaths, configurationPaths };
 }
 
 export function classifyPrivateLocalChange(relativePath: string): LocalChangeCategory {
@@ -1216,8 +1233,9 @@ export class SyncCoordinator {
         ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
       ].map(normalizeVaultPath).filter(Boolean))].sort();
       if (deletionCandidates.length) {
-        this.logger.warn("Synchronization requires deletion confirmation", { syncRunId, paths: deletionCandidates });
-        const confirmed = this.callbacks.confirmRemoteDeletions ? await this.callbacks.confirmRemoteDeletions(deletionCandidates) : false;
+        const deletionGroups = groupRemoteDeletionPaths(deletionCandidates, this.app.vault.configDir);
+        this.logger.warn("Synchronization requires deletion confirmation", { syncRunId, ...deletionGroups });
+        const confirmed = this.callbacks.confirmRemoteDeletions ? await this.callbacks.confirmRemoteDeletions(deletionGroups) : false;
         if (!confirmed) {
           for (const path of pendingNotes) this.pendingFiles.add(path);
           for (const path of pendingAssets) this.pendingAssets.add(path);
