@@ -913,9 +913,13 @@ export class TeamCoreLocalChangesView extends ItemView {
   private async discardItemChange(item: LocalChangeItem, button: HTMLButtonElement, onChanged: () => void): Promise<void> {
     const label = this.itemLabel(item);
     const isAdded = item.status === "added";
+    const restoringPublicSettings = item.area === "public" && item.category === "settings" && !isAdded;
     if (!await requestConfirmation(this.app, {
       title: isAdded ? "确认撤销新增文件" : "确认撤销本地更改",
       message: isAdded ? `“${label}”尚未同步，撤销会删除该本地文件。` : `将“${label}”恢复到上次已同步版本；不会影响其他文件。`,
+      warning: restoringPublicSettings
+        ? "撤销只会还原磁盘上的公共设置文件；正在运行的第三方插件可能仍保留旧内存值。若需让撤销后的插件配置生效，请自行重启 Obsidian；在重启前不要继续编辑该插件设置。"
+        : undefined,
       confirmText: isAdded ? "删除新增文件" : "撤销此项更改",
       destructive: isAdded
     })) return;
