@@ -287,7 +287,7 @@ export function createGitFs(vault: BinaryVault) {
       rename: (from: string, to: string) => vault.rename(cleanPath(from), cleanPath(to)),
       readdir: async (path: string) => {
         const listed = await vault.list(cleanPath(path));
-        return [...listed.files, ...listed.folders].map(basename);
+        return [...(listed.files ?? []), ...(listed.folders ?? [])].map(basename);
       },
       stat: async (path: string) => {
         const value = await vault.stat(cleanPath(path));
@@ -1251,7 +1251,7 @@ export class GitRepository {
     const root = await this.vault.list("").catch(() => ({ files: [], folders: [] }));
     const indexed = await git.listFiles({ fs: this.fs, dir: "" }).catch(() => [] as string[]);
     const headed = await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]);
-    const roots = [...root.files, ...root.folders, ...indexed, ...headed]
+    const roots = [...(root.files ?? []), ...(root.folders ?? []), ...indexed, ...headed]
       .map(normalizeVaultPath)
       .map((path) => path.split("/", 1)[0])
       .filter((path) => path && !isPrivatePath(path) && path !== ".git");
