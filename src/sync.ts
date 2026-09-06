@@ -44,6 +44,11 @@ export interface RemoteDeletionGroups {
   moves: PendingPublicMove[];
 }
 
+export interface PublicFolderDeletionPaths {
+  managedPaths: string[];
+  assetPaths: string[];
+}
+
 interface AttachmentPlan {
   sourcePath: string;
   targetPath: string;
@@ -108,6 +113,17 @@ export function mergePendingPublicMove(moves: readonly PendingPublicMove[], sour
   }
   next.set(origin, { from: origin, to });
   return [...next.values()].filter((move) => move.from !== move.to).sort((left, right) => left.from.localeCompare(right.from));
+}
+
+/** Classify a deleted folder's already-indexed descendants in one batch. */
+export function classifyPublicFolderDeletionPaths(paths: readonly string[], configDir: string, sharedPluginIds: readonly string[]): PublicFolderDeletionPaths {
+  const managedPaths: string[] = [];
+  const assetPaths: string[] = [];
+  for (const path of [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort()) {
+    if (isAssetPath(path)) assetPaths.push(path);
+    else if (isManagedPath(path, configDir, sharedPluginIds)) managedPaths.push(path);
+  }
+  return { managedPaths, assetPaths };
 }
 
 export function classifyPrivateLocalChange(relativePath: string): LocalChangeCategory {
@@ -460,8 +476,15 @@ export class SyncCoordinator {
   }
 
   private rememberPendingDeletion(path: string): void {
-    if (isPrivatePath(path)) return;
-    const next = [...new Set([...(this.settings().pendingDeletionPaths ?? []), path])].sort();
+    this.rememberPendingDeletions([path]);
+  }
+
+  private rememberPendingDeletions(paths: readonly string[]): void {
+    const candidates = paths.map(normalizeVaultPath).filter((path) => path && !isPrivatePath(path));
+    if (!candidates.length) return;
+    const current = this.settings().pendingDeletionPaths ?? [];
+    const next = [...new Set([...current, ...candidates])].sort();
+    if (next.length === current.length && next.every((path, index) => path === current[index])) return;
     this.settings().pendingDeletionPaths = next;
     void this.callbacks.onPendingDeletionPaths?.(next);
   }
@@ -577,8 +600,8 @@ export class SyncCoordinator {
     visit(folder);
   }
 
-  markFolderDeleted(path: string): void {
-    const normalized = normalizeVaultPath(path);
+  markFolderDeleted(folder: TFolder): void {
+    const normalized = normalizeVaultPath(folder.path);
     if (isPrivatePath(normalized)) {
       if (!shouldTrackPrivateSyncEvent(this.settings())) return;
       const relative = this.privateRelativePath(normalized);
@@ -588,10 +611,30 @@ export class SyncCoordinator {
       this.schedulePrivateSync();
       return;
     }
-    if (!isAssetPath(normalized) && !isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds)) return;
-    this.rememberPendingDeletion(normalized);
-    this.pendingFiles.add(normalized);
-    this.fullAttachmentScanPending = true;
+    const descendants: string[] = [];
+    const visit = (current: TFolder): void => {
+      for (const child of current.children) {
+        if (child instanceof TFile) descendants.push(normalizeVaultPath(child.path));
+        else if (child instanceof TFolder) visit(child);
+      }
+    };
+    visit(folder);
+    const classified = classifyPublicFolderDeletionPaths(descendants, this.app.vault.configDir, this.sharedPluginIds);
+    // An empty folder has no Git entry to stage. Preserve the root as a
+    // fallback only for adapter-visible managed/asset folders whose children
+    // were unavailable at event time.
+    if (!classified.managedPaths.length && !classified.assetPaths.length) {
+      if (!this.isPublicSyncPath(normalized)) return;
+      this.rememberPendingDeletions([normalized]);
+      if (isAssetPath(normalized)) this.pendingAssets.add(normalized);
+      else this.pendingFiles.add(normalized);
+      this.fullAttachmentScanPending ||= isAssetPath(normalized);
+    } else {
+      this.rememberPendingDeletions([...classified.managedPaths, ...classified.assetPaths]);
+      for (const path of classified.managedPaths) this.pendingFiles.add(path);
+      for (const path of classified.assetPaths) this.pendingAssets.add(path);
+      this.fullAttachmentScanPending ||= classified.assetPaths.length > 0;
+    }
     this.scheduleSync();
   }
 

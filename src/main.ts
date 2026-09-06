@@ -133,7 +133,7 @@ export default class TeamCorePlugin extends Plugin {
         if (file.path === FILE_AUTHORS_PATH) this.invalidateFileAuthors();
         this.coordinator.markFileDeleted(file);
       }
-      else if (file instanceof TFolder) this.coordinator.markFolderDeleted(file.path);
+      else if (file instanceof TFolder) this.coordinator.markFolderDeleted(file);
     }));
     this.registerEvent(this.app.workspace.on("editor-paste", (event, editor, info) => {
       if (event.defaultPrevented) return;
