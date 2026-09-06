@@ -11,7 +11,7 @@ import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
 import { GitRepository } from "./git";
 import { FileAuthorService } from "./file-authors";
 import { AuthorDisplayService } from "./author-display";
-import { FILE_AUTHORS_PATH, PRIVATE_FOLDER } from "./constants";
+import { FILE_AUTHORS_PATH, MANIFEST_PATH, PRIVATE_FOLDER } from "./constants";
 import { SerializedPluginData } from "./persistence";
 
 function createInstallationId(): string {
@@ -92,7 +92,8 @@ export default class TeamCorePlugin extends Plugin {
       leaf,
       () => this.teamCoreSettings,
       () => this.authorService,
-      () => this.authorDisplayService()
+      () => this.authorDisplayService(),
+      () => this.coordinator.markManagedPathChanged(MANIFEST_PATH)
     ));
     this.addCommand({ id: "sync-now", name: "立即同步", callback: () => void this.handleSyncAction() });
     this.addCommand({ id: "sync-private-notes", name: "仅同步私人笔记", callback: () => void this.syncPrivateNotes() });

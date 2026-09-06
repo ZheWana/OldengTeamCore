@@ -43,7 +43,9 @@ export class TeamCoreDashboardView extends ItemView {
     leaf: WorkspaceLeaf,
     private readonly getSettings: () => TeamCoreSettings,
     private readonly getAuthorService: () => FileAuthorService,
-    private readonly getAuthorDisplay: () => AuthorDisplayService
+    private readonly getAuthorDisplay: () => AuthorDisplayService,
+    /** Called after this view writes a managed file outside Vault events. */
+    private readonly onManagedManifestChanged?: () => void
   ) {
     super(leaf);
   }
@@ -393,6 +395,9 @@ export class TeamCoreDashboardView extends ItemView {
     const adapter = createVaultAdapter(this.app.vault.adapter);
     const { writeManifest } = await import("./manifest");
     await writeManifest(adapter, manifest);
+    // This adapter write is intentionally followed by an explicit signal:
+    // direct adapter writes are not guaranteed to emit an Obsidian Vault event.
+    this.onManagedManifestChanged?.();
     new Notice(`已将 ${removed.length} 个孤立附件移入回收站；S3 对象保留`);
     await this.render();
   }
