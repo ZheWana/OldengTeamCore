@@ -10,7 +10,7 @@ import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
 import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
 import { mimeFromPath } from "./mime";
 import type { AssetManifest, AssetManifestEntry, AssetRetentionRecord, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
-import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, readVaultInChunks, rewriteAssetReferences, VAULT_TRANSFER_CHUNK_SIZE, type BinaryVault } from "./vault";
+import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, readVaultInChunks, rewriteAssetReferences, VAULT_TRANSFER_CHUNK_SIZE, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
@@ -1086,18 +1086,18 @@ export class SyncCoordinator {
 
   private async clearForRemoteClone(): Promise<void> {
     const adapter = this.createVault();
-    const files = await listRemoteOverwriteFiles(adapter, this.app.vault.configDir);
-    const hasGitDirectory = await adapter.exists(".git");
-    const cleanupItems = files.length + (hasGitDirectory ? 1 : 0);
+    const plan = await planFastRemoteReset(adapter, this.app.vault.configDir);
+    const cleanupItems = plan.files.length + plan.directories.length + (plan.hasGitDirectory ? 1 : 0);
     this.startProgress("清理本地知识库", Math.max(cleanupItems, 1));
-    for (const path of files) {
-      const indexed = this.app.vault.getAbstractFileByPath(path);
-      if (indexed instanceof TFile) await this.app.fileManager.trashFile(indexed);
-      else await adapter.remove(path);
+    for (const path of plan.files) {
+      await adapter.remove(path);
       this.advanceProgress(path);
     }
-    await pruneEmptyManagedFolders(adapter, this.app.vault.configDir);
-    if (hasGitDirectory) {
+    for (const path of plan.directories) {
+      await adapter.rmdir(path, true);
+      this.advanceProgress(path);
+    }
+    if (plan.hasGitDirectory) {
       await adapter.rmdir(".git", true);
       this.advanceProgress(".git");
     } else if (!cleanupItems) {

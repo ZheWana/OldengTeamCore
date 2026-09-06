@@ -281,6 +281,25 @@ export async function listRemoteOverwriteFiles(vault: BinaryVault, configDir: st
   return files.sort();
 }
 
+/**
+ * A confirmed remote reset is intentionally irreversible for public data. Plan
+ * it by top-level roots so large attachment/document trees can be removed in a
+ * few recursive operations while local Obsidian state, private notes, and the
+ * local recycle bin remain untouched.
+ */
+export async function planFastRemoteReset(vault: BinaryVault, configDir: string): Promise<{ files: string[]; directories: string[]; hasGitDirectory: boolean }> {
+  const listed = await vault.list("");
+  const preserve = (path: string): boolean => {
+    const normalized = normalizeVaultPath(path);
+    return isConfigPath(normalized, configDir) || isPrivatePath(normalized) || isTrashPath(normalized) || normalized === ".git";
+  };
+  return {
+    files: (listed.files ?? []).map(normalizeVaultPath).filter((path) => !preserve(path)).sort(),
+    directories: (listed.folders ?? []).map(normalizeVaultPath).filter((path) => !preserve(path)).sort(),
+    hasGitDirectory: (listed.folders ?? []).map(normalizeVaultPath).includes(".git") || await vault.exists(".git")
+  };
+}
+
 export function createVaultAdapter(adapter: DataAdapter): BinaryVault {
   const ensureParent = async (path: string): Promise<void> => {
     const parts = normalizeVaultPath(path).split("/").slice(0, -1);

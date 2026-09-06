@@ -14,7 +14,7 @@ import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } fr
 import { createAttachmentStore } from "../src/attachment-store";
 import { createPrivateRemote, PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
 import { classifyPrivateLocalChange, classifyPublicLocalChange, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
-import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
+import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
 import type { BinaryVault } from "../src/vault";
@@ -1129,6 +1129,29 @@ describe("manifest and vault path rules", () => {
         "assets/hidden.png",
         "notes/readme.md"
       ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("plans confirmed remote reset by top-level public roots", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-fast-reset-"));
+    try {
+      const vault = new NodeVault(root);
+      await vault.write("assets/nested/large.pdf", encode("asset"));
+      await vault.write("notes/readme.md", encode("note"));
+      await vault.write(".team/assets-manifest.json", encode("{}"));
+      await vault.write(".gitignore", encode("assets/\n"));
+      await vault.write(".obsidian/app.json", encode("{}"));
+      await vault.write("私人笔记/draft.md", encode("draft"));
+      await vault.write(".trash/deleted.md", encode("deleted"));
+      await vault.write(".git/HEAD", encode("ref: refs/heads/main\n"));
+
+      await expect(planFastRemoteReset(vault, ".obsidian")).resolves.toEqual({
+        files: [".gitignore"],
+        directories: [".team", "assets", "notes"],
+        hasGitDirectory: true
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
