@@ -206,7 +206,7 @@ async function scanPrivateFiles(vault: BinaryVault): Promise<Map<string, LocalSn
   const visit = async (folder: string): Promise<void> => {
     const listed = await vault.list(folder).catch(() => undefined);
     if (!listed) return;
-    for (const path of listed.files.map(normalizeVaultPath)) {
+    for (const path of (listed.files ?? []).map(normalizeVaultPath)) {
       const relative = privateRelativePath(path.slice(`${PRIVATE_FOLDER}/`.length));
       const stat = await vault.stat(path);
       if (!stat || stat.type !== "file") continue;
@@ -214,7 +214,7 @@ async function scanPrivateFiles(vault: BinaryVault): Promise<Map<string, LocalSn
       // every file body in the JavaScript heap at the same time.
       files.set(relative, { path: relative, sha256: await hashPrivateFile(vault, path, stat.size), size: stat.size, updatedAt: stat.mtime });
     }
-    for (const path of listed.folders.map(normalizeVaultPath)) await visit(path);
+    for (const path of (listed.folders ?? []).map(normalizeVaultPath)) await visit(path);
   };
   await visit(PRIVATE_FOLDER);
   return files;

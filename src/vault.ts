@@ -239,7 +239,7 @@ export async function pruneEmptyManagedFolders(vault: BinaryVault, configDir: st
     || isAssetPath(path);
   const visit = async (path: string): Promise<void> => {
     const listed = await vault.list(path);
-    for (const folder of listed.folders.map(normalizeVaultPath).sort((a, b) => b.length - a.length)) {
+    for (const folder of (listed.folders ?? []).map(normalizeVaultPath).sort((a, b) => b.length - a.length)) {
       if (protectedFolder(folder)) continue;
       await visit(folder);
       const after = await vault.list(folder);
@@ -270,10 +270,10 @@ export async function listRemoteOverwriteFiles(vault: BinaryVault, configDir: st
   };
   const visit = async (path: string): Promise<void> => {
     const listed = await vault.list(path);
-    for (const file of listed.files.map(normalizeVaultPath)) {
+    for (const file of (listed.files ?? []).map(normalizeVaultPath)) {
       if (!preserved(file)) files.push(file);
     }
-    for (const folder of listed.folders.map(normalizeVaultPath)) {
+    for (const folder of (listed.folders ?? []).map(normalizeVaultPath)) {
       if (!preserved(folder)) await visit(folder);
     }
   };
