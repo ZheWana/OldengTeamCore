@@ -155,10 +155,10 @@
 .team-core-local-change-table th:nth-child(2) { width: 11%; }
 .team-core-local-change-table th:nth-child(3) { width: 28%; }
 .team-core-local-change-table th:nth-child(4) { width: 12%; }
-.team-core-commit-change-table th, .team-core-commit-change-table td { vertical-align: middle; }
+.team-core-history-view .team-core-commit-change-table > thead > tr > th, .team-core-history-view .team-core-commit-change-table > tbody > tr > td { vertical-align: middle; }
 .team-core-commit-change-table td { padding: .5rem .55rem; overflow-wrap: anywhere; }
 .team-core-local-change-actions { text-align: center; white-space: nowrap; }
-.team-core-local-change-undo { display: inline-flex; align-items: center; justify-content: center; min-width: 3.2rem; height: 1.75rem; padding: 0 .55rem; color: var(--text-muted); }
+.team-core-local-change-undo { display: inline-flex; align-items: center; justify-content: center; width: auto; min-width: 0; min-height: 0; height: auto; padding: .18rem .42rem; color: var(--text-muted); font-size: var(--font-ui-smaller); line-height: 1.25; }
 .team-core-local-change-undo:hover { color: var(--text-normal); }
 .team-core-commit-change-table tbody tr:last-child td { border-bottom: 0; }
 .team-core-commit-change-content { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
