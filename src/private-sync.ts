@@ -338,6 +338,26 @@ export class PrivateNotesSynchronizer {
     throw new Error("私人笔记同步清单在其他设备上连续更新，未覆盖远端数据，请稍后重试");
   }
 
+  /** Restore one private path to the last confirmed local sync baseline. */
+  async restoreBaselinePath(vault: BinaryVault, state: PrivateSyncState, path: string): Promise<"restored" | "removed"> {
+    const relativePath = privateRelativePath(path);
+    const previous = state.entries[relativePath];
+    const current = await readPrivateFile(vault, relativePath);
+    await vault.mkdir(PRIVATE_FOLDER);
+    await this.remote.initialize();
+    if (isLive(previous)) {
+      const operation: PrivateLocalApplication = { kind: "download", path: relativePath, entry: previous, expectedLocal: current };
+      await this.downloadAndStage(vault, [operation]);
+      await this.applyLocalTransaction(vault, [operation], () => undefined, "撤销本地更改");
+      return "restored";
+    }
+    if (current) {
+      const operation: PrivateLocalApplication = { kind: "delete-local", path: relativePath, expectedLocal: current };
+      await this.applyLocalTransaction(vault, [operation], () => undefined, "撤销本地新增");
+    }
+    return "removed";
+  }
+
   private async syncOnce(vault: BinaryVault, state: PrivateSyncState, onProgress: PrivateSyncProgress | undefined, fullScan: boolean): Promise<PrivateSyncResult | undefined> {
     await vault.mkdir(PRIVATE_FOLDER);
     await this.recoverLocalTransaction(vault);

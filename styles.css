@@ -151,7 +151,14 @@
 .team-core-commit-change-table th:nth-child(1) { width: 44%; }
 .team-core-commit-change-table th:nth-child(2) { width: 34%; }
 .team-core-commit-change-table th:nth-child(3) { width: 22%; }
+.team-core-local-change-table th:nth-child(1) { width: 49%; }
+.team-core-local-change-table th:nth-child(2) { width: 11%; }
+.team-core-local-change-table th:nth-child(3) { width: 28%; }
+.team-core-local-change-table th:nth-child(4) { width: 12%; }
 .team-core-commit-change-table td { padding: .5rem .55rem; vertical-align: middle; overflow-wrap: anywhere; }
+.team-core-local-change-actions { text-align: center; white-space: nowrap; }
+.team-core-local-change-undo { display: inline-flex; align-items: center; justify-content: center; width: 1.75rem; height: 1.75rem; padding: 0; color: var(--text-muted); }
+.team-core-local-change-undo:hover { color: var(--text-normal); }
 .team-core-commit-change-table tbody tr:last-child td { border-bottom: 0; }
 .team-core-commit-change-content { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .team-core-commit-change-link { display: inline; color: var(--text-accent); cursor: pointer; text-decoration: none; }

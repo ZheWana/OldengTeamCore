@@ -483,6 +483,27 @@ export class GitRepository {
     return restored;
   }
 
+  /** Discard exactly one public index/worktree change without touching peers. */
+  async discardManagedPathChange(path: string): Promise<"restored" | "removed" | undefined> {
+    const filepath = normalizeVaultPath(path);
+    if (!filepath || isAssetPath(filepath)) return undefined;
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    if (!isManagedPath(filepath, this.configDir, sharedPluginIds)) return undefined;
+    const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    if (!head) return undefined;
+    const tracked = new Set(await git.listFiles({ fs: this.fs, dir: "", ref: head }));
+    if (tracked.has(filepath)) {
+      await this.writeTreeFile(head, filepath);
+      await git.resetIndex({ fs: this.fs, dir: "", filepath });
+      return "restored";
+    }
+    // A locally added file has no HEAD counterpart. Removing it is the Git
+    // equivalent of discarding an uncommitted addition.
+    if (await this.vault.exists(filepath)) await this.vault.remove(filepath);
+    await git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined);
+    return "removed";
+  }
+
   private async readConflictState(): Promise<GitConflictState | undefined> {
     if (!(await this.vault.exists(CONFLICT_STATE_PATH))) return undefined;
     try {

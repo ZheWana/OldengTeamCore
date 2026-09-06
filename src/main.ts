@@ -109,7 +109,8 @@ export default class TeamCorePlugin extends Plugin {
     ));
     this.registerView(LOCAL_CHANGES_VIEW_TYPE, (leaf) => new TeamCoreLocalChangesView(
       leaf,
-      () => this.coordinator.getLocalChangeSnapshot()
+      () => this.coordinator.getLocalChangeSnapshot(),
+      (item) => this.coordinator.discardLocalChange(item)
     ));
     this.addCommand({ id: "open-dashboard", name: "打开团队看板", callback: () => void this.openDashboard() });
     this.addCommand({ id: "open-commit-history", name: "打开提交历史", callback: () => void this.openCommitHistory() });

@@ -9,6 +9,7 @@ import { listLocalCommunityPlugins, readSharedPluginIds } from "./shared-plugins
 import { requestConfirmation } from "./confirm";
 import { createEmptyFileAuthorRegistry, listAuthorableMarkdownFiles, type FileAuthorRegistry, type FileAuthorService } from "./file-authors";
 import { AuthorDisplayService, parseAuthorDisplayMappings, type AuthorDisplayMappings } from "./author-display";
+import { PRIVATE_FOLDER } from "./constants";
 
 export const DASHBOARD_VIEW_TYPE = "team-core-history";
 export const COMMIT_HISTORY_VIEW_TYPE = "team-core-commit-history";
@@ -602,7 +603,7 @@ export class TeamCoreCommitHistoryView extends ItemView {
         page = 0;
         renderTable();
       });
-      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table" });
+      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table team-core-local-change-table" });
       const head = table.createEl("thead").createEl("tr");
       head.createEl("th", { text: "更新内容" });
       head.createEl("th", { text: "变更概览" });
@@ -749,7 +750,8 @@ export class TeamCoreLocalChangesView extends ItemView {
 
   constructor(
     leaf: WorkspaceLeaf,
-    private readonly getSnapshot: () => Promise<LocalChangeSnapshot>
+    private readonly getSnapshot: () => Promise<LocalChangeSnapshot>,
+    private readonly discardChange: (item: LocalChangeItem) => Promise<"restored" | "removed">
   ) {
     super(leaf);
   }
@@ -857,8 +859,9 @@ export class TeamCoreLocalChangesView extends ItemView {
       head.createEl("th", { text: "变更内容" });
       head.createEl("th", { text: "状态" });
       head.createEl("th", { text: "位置" });
+      head.createEl("th", { text: "操作" });
       const tableBody = table.createEl("tbody");
-      for (const item of visible) this.renderChangeRow(tableBody, item);
+      for (const item of visible) this.renderChangeRow(tableBody, item, renderTable);
       if (pageCount > 1) {
         const pagination = tableArea.createDiv("team-core-commit-change-pagination");
         this.pageButton(pagination, "跳转到第一页", "chevrons-left", page === 0, () => { page = 0; renderTable(); });
@@ -882,7 +885,7 @@ export class TeamCoreLocalChangesView extends ItemView {
     renderTable();
   }
 
-  private renderChangeRow(body: HTMLElement, item: LocalChangeItem): void {
+  private renderChangeRow(body: HTMLElement, item: LocalChangeItem, onChanged: () => void): void {
     const row = body.createEl("tr");
     const content = row.createEl("td", { cls: "team-core-commit-change-content" });
     const label = this.itemLabel(item);
@@ -898,6 +901,34 @@ export class TeamCoreLocalChangesView extends ItemView {
     const status = row.createEl("td", { cls: `team-core-local-change-status is-${item.status}` });
     status.setText(this.statusLabel(item.status));
     row.createEl("td", { text: this.location(item.path), cls: "team-core-commit-change-location" });
+    const actions = row.createEl("td", { cls: "team-core-local-change-actions" });
+    if (item.path === PRIVATE_FOLDER) {
+      actions.setText("—");
+      return;
+    }
+    const undo = actions.createEl("button", { cls: "team-core-local-change-undo", attr: { "aria-label": "撤销此项更改", title: "撤销此项更改" } });
+    setIcon(undo, "rotate-ccw");
+    undo.addEventListener("click", () => void this.discardItemChange(item, undo, onChanged));
+  }
+
+  private async discardItemChange(item: LocalChangeItem, button: HTMLButtonElement, onChanged: () => void): Promise<void> {
+    const label = this.itemLabel(item);
+    const isAdded = item.status === "added";
+    if (!await requestConfirmation(this.app, {
+      title: isAdded ? "确认撤销新增文件" : "确认撤销本地更改",
+      message: isAdded ? `“${label}”尚未同步，撤销会删除该本地文件。` : `将“${label}”恢复到上次已同步版本；不会影响其他文件。`,
+      confirmText: isAdded ? "删除新增文件" : "撤销此项更改",
+      destructive: isAdded
+    })) return;
+    button.disabled = true;
+    try {
+      const result = await this.discardChange(item);
+      new Notice(result === "removed" ? `已删除未同步新增文件：${label}` : `已撤销本地更改：${label}`);
+      onChanged();
+    } catch (error) {
+      new Notice(`无法撤销更改：${error instanceof Error ? error.message : String(error)}`);
+      button.disabled = false;
+    }
   }
 
   private itemLabel(item: LocalChangeItem): string {

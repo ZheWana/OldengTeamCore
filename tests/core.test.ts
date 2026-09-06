@@ -735,6 +735,28 @@ describe("private-note synchronization", () => {
     }
   });
 
+  it("restores one private file to its last synchronized baseline without touching another pending file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-private-single-revert-"));
+    try {
+      const remote = new MemoryPrivateRemote();
+      const vault = new NodeVault(root);
+      const synchronizer = new PrivateNotesSynchronizer(settings({ privateSyncEnabled: true }), logger, remote);
+      await vault.write("私人笔记/restore.md", encode("baseline"));
+      await vault.write("私人笔记/keep.md", encode("baseline keep"));
+      const baseline = (await synchronizer.sync(vault, { version: 1, entries: {} })).state;
+      await vault.write("私人笔记/restore.md", encode("local change"));
+      await vault.write("私人笔记/keep.md", encode("keep local change"));
+      await synchronizer.restoreBaselinePath(vault, baseline, "restore.md");
+      expect(decode(await vault.read("私人笔记/restore.md"))).toBe("baseline");
+      expect(decode(await vault.read("私人笔记/keep.md"))).toBe("keep local change");
+      await vault.write("私人笔记/new.md", encode("new file"));
+      await expect(synchronizer.restoreBaselinePath(vault, baseline, "new.md")).resolves.toBe("removed");
+      expect(await vault.exists("私人笔记/new.md")).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("replans after an index compare-and-swap conflict without dropping another device's file", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-private-cas-"));
     try {
@@ -1893,6 +1915,31 @@ describe("Git repository adapter", () => {
       expect(await repo.hasStagedPublicChanges()).toBe(true);
       await repo.commitStaged("Update vault");
       expect(await repo.listPublicStagedChanges()).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("discards one public change without reverting another local file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-discard-one-change-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/restore.md", encode("baseline"));
+      await vault.write("notes/keep.md", encode("baseline keep"));
+      await repo.commit("Base");
+      await vault.write("notes/restore.md", encode("local change"));
+      await vault.write("notes/keep.md", encode("keep local change"));
+      await repo.stageManagedEventPath("notes/restore.md");
+      await repo.stageManagedEventPath("notes/keep.md");
+      await expect(repo.discardManagedPathChange("notes/restore.md")).resolves.toBe("restored");
+      expect(decode(await vault.read("notes/restore.md"))).toBe("baseline");
+      expect(await repo.listPublicStagedChanges()).toEqual([{ path: "notes/keep.md", status: "modified" }]);
+      await vault.write("notes/new.md", encode("uncommitted"));
+      await repo.stageManagedEventPath("notes/new.md");
+      await expect(repo.discardManagedPathChange("notes/new.md")).resolves.toBe("removed");
+      expect(await vault.exists("notes/new.md")).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
