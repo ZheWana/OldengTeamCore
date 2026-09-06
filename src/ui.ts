@@ -906,8 +906,7 @@ export class TeamCoreLocalChangesView extends ItemView {
       actions.setText("—");
       return;
     }
-    const undo = actions.createEl("button", { cls: "team-core-local-change-undo", attr: { "aria-label": "撤销此项更改", title: "撤销此项更改" } });
-    setIcon(undo, "rotate-ccw");
+    const undo = actions.createEl("button", { text: "撤销", cls: "team-core-local-change-undo", attr: { "aria-label": "撤销此项更改", title: "撤销此项更改" } });
     undo.addEventListener("click", () => void this.discardItemChange(item, undo, onChanged));
   }
 
