@@ -13,7 +13,7 @@ import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateMa
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
 import { createAttachmentStore } from "../src/attachment-store";
 import { createPrivateRemote, PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
-import { classifyPrivateLocalChange, classifyPublicFolderDeletionPaths, classifyPublicLocalChange, groupRemoteDeletionPaths, mergePendingPublicMove, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { classifyPrivateLocalChange, classifyPublicFolderDeletionPaths, classifyPublicLocalChange, groupRemoteDeletionPaths, isPublicPluginConfigurationPath, mergePendingPublicMove, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -498,6 +498,14 @@ describe("private-note synchronization", () => {
       folders: [],
       moves: []
     });
+  });
+
+  it("marks all shared plugin configuration surfaces for explicit confirmation", () => {
+    expect(isPublicPluginConfigurationPath(".obsidian/plugins/dataview/data.json", ".obsidian")).toBe(true);
+    expect(isPublicPluginConfigurationPath(".team/shared-plugins.json", ".obsidian")).toBe(true);
+    expect(isPublicPluginConfigurationPath(".gitignore", ".obsidian")).toBe(true);
+    expect(isPublicPluginConfigurationPath(".team/file-authors.json", ".obsidian")).toBe(false);
+    expect(isPublicPluginConfigurationPath("notes/readme.md", ".obsidian")).toBe(false);
   });
 
   it("keeps deleted folder roots only when they contain pending deletion paths", () => {

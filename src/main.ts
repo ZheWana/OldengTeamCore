@@ -4,6 +4,7 @@ import { mergeSettings } from "./config";
 import { DiagnosticsModal } from "./diagnostics-ui";
 import { parseLogEntries, PluginLogger, type LogEntry } from "./logger";
 import { SyncCoordinator, type RemoteDeletionDecision, type RemoteDeletionGroups } from "./sync";
+import type { PublicWorktreeChange } from "./git";
 import { COMMIT_HISTORY_VIEW_TYPE, DASHBOARD_VIEW_TYPE, LOCAL_CHANGES_VIEW_TYPE, TeamCoreCommitHistoryView, TeamCoreDashboardView, TeamCoreLocalChangesView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
 import { requestConfirmation, requestDeletionConfirmation, type DeletionRestoreItem } from "./confirm";
@@ -81,6 +82,7 @@ export default class TeamCorePlugin extends Plugin {
         await this.saveSettings();
       },
       confirmRemoteDeletions: (paths) => this.confirmRemoteDeletions(paths),
+      confirmPublicConfigurationChanges: (changes) => this.confirmPublicConfigurationChanges(changes),
       onAssetRetention: async (records) => {
         this.teamCoreSettings.assetRetention = records;
         await this.saveSettings();
@@ -237,6 +239,18 @@ export default class TeamCorePlugin extends Plugin {
       warning: "可在每一项右侧撤回删除；仅会恢复所选配置，不会撤回其他本地修改。请先与团队确认剩余的配置删除。",
       confirmText: "确认删除公共配置",
       destructive: true
+    });
+  }
+
+  private async confirmPublicConfigurationChanges(changes: readonly PublicWorktreeChange[]): Promise<boolean> {
+    const describe = (change: PublicWorktreeChange): string => `${change.status === "added" ? "新增" : "修改"} ${change.path}`;
+    return requestConfirmation(this.app, {
+      title: "确认同步公共插件配置",
+      message: `以下 ${changes.length} 项公共插件或共享配置更改会同步到所有成员：`,
+      details: changes.map(describe),
+      warning: "这会更新团队成员的公共插件版本、设置、启用状态或同步白名单。请确认已与团队达成一致。",
+      confirmText: "确认同步公共配置",
+      destructive: false
     });
   }
 

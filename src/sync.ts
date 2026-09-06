@@ -2,7 +2,7 @@ import { FileSystemAdapter, Platform, TFile, TFolder, type App, type Editor } fr
 import { createSHA256 } from "hash-wasm";
 import { FILE_AUTHORS_PATH, MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from "./constants";
 import { sha256Hex } from "./crypto";
-import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
+import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution, type PublicWorktreeChange } from "./git";
 import { PluginLogger } from "./logger";
 import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, validateManifest, writeManifest } from "./manifest";
 import { createAttachmentStore } from "./attachment-store";
@@ -25,6 +25,7 @@ export interface SyncCallbacks {
   onPendingDeletionFolders?(folders: string[]): void | Promise<void>;
   onPendingPublicMoves?(moves: PendingPublicMove[]): void | Promise<void>;
   confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<RemoteDeletionDecision>;
+  confirmPublicConfigurationChanges?(changes: readonly PublicWorktreeChange[]): Promise<boolean>;
   onAssetRetention?(records: AssetRetentionRecord[]): void | Promise<void>;
 }
 
@@ -47,6 +48,14 @@ export interface RemoteDeletionGroups {
   /** Folder roots captured by Obsidian's delete event, for whole-folder undo. */
   folders: string[];
   moves: PendingPublicMove[];
+}
+
+/** Shared plugin files and their team-wide enablement/rule state affect every member. */
+export function isPublicPluginConfigurationPath(path: string, configDir: string): boolean {
+  const normalized = normalizeVaultPath(path);
+  return isConfigPath(normalized, configDir)
+    || normalized === ".gitignore"
+    || normalized === SHARED_PLUGIN_STATE_PATH;
 }
 
 export interface RemoteDeletionDecision {
@@ -1512,7 +1521,8 @@ export class SyncCoordinator {
       const pendingMoves = await this.reconcilePendingPublicMoves(git, syncRunId);
       const movedSourcePaths = new Set(pendingMoves.map((move) => normalizeVaultPath(move.from)));
       const manifestForDeletionCheck = await readManifest(vault);
-      const deletedManagedPaths = (await git.listPublicStagedChanges())
+      const stagedPublicChanges = await git.listPublicStagedChanges();
+      const deletedManagedPaths = stagedPublicChanges
         .filter((change) => change.status === "deleted")
         .map((change) => change.path);
       const deletedAssetPaths = [...new Set([
@@ -1526,6 +1536,12 @@ export class SyncCoordinator {
       let deletionCandidates = [...new Set([...deletedManagedPaths, ...deletedAssetPaths])]
         .filter((path) => !movedSourcePaths.has(path))
         .sort();
+      const publicConfigurationChanges = stagedPublicChanges
+        .filter((change) => isPublicPluginConfigurationPath(change.path, this.app.vault.configDir))
+        .filter((change) => change.status !== "deleted" || !movedSourcePaths.has(change.path));
+      const configurationDeletionPaths = deletionCandidates
+        .filter((path) => isPublicPluginConfigurationPath(path, this.app.vault.configDir));
+      const configurationUpdateChanges = publicConfigurationChanges.filter((change) => change.status !== "deleted");
       const recordedDeletionPaths = this.settings().pendingDeletionPaths ?? [];
       const staleDeletionPaths = recordedDeletionPaths.filter((path) => !deletionCandidates.includes(normalizeVaultPath(path)));
       if (staleDeletionPaths.length) {
@@ -1539,9 +1555,13 @@ export class SyncCoordinator {
       // Small, ordinary deletions remain low-friction. A move is always shown
       // separately because Git represents it as a delete plus an add.
       const requiresDeletionConfirmation = deletionCandidates.length > 3;
-      if (requiresDeletionConfirmation || pendingMoves.length) {
+      const requiresConfigurationDeletionConfirmation = configurationDeletionPaths.length > 0;
+      if (requiresDeletionConfirmation || requiresConfigurationDeletionConfirmation || pendingMoves.length) {
+        const confirmedDeletionPaths = requiresDeletionConfirmation
+          ? deletionCandidates
+          : configurationDeletionPaths;
         const deletionGroups = groupRemoteDeletionPaths(
-          requiresDeletionConfirmation ? deletionCandidates : [],
+          confirmedDeletionPaths,
           this.app.vault.configDir,
           this.settings().pendingDeletionFolders ?? []
         );
@@ -1575,6 +1595,21 @@ export class SyncCoordinator {
             restored: restored.restoredPaths,
             unavailable: restored.unavailablePaths
           });
+        }
+      }
+      if (configurationUpdateChanges.length) {
+        this.logger.warn("Synchronization requires public plugin configuration confirmation", {
+          syncRunId,
+          changes: configurationUpdateChanges
+        });
+        const confirmed = this.callbacks.confirmPublicConfigurationChanges
+          ? await this.callbacks.confirmPublicConfigurationChanges(configurationUpdateChanges)
+          : false;
+        if (!confirmed) {
+          for (const path of pendingNotes) this.pendingFiles.add(path);
+          for (const path of pendingAssets) this.pendingAssets.add(path);
+          this.setState("local-changes");
+          return;
         }
       }
       const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
