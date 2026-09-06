@@ -449,6 +449,40 @@ export class GitRepository {
     return typeof value === "string" ? value : undefined;
   }
 
+  /** Read one file from the current local HEAD without touching the worktree. */
+  async readHeadFile(path: string): Promise<ArrayBuffer | undefined> {
+    const filepath = normalizeVaultPath(path);
+    if (!filepath) return undefined;
+    const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    if (!head) return undefined;
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid: head, filepath });
+      return blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Restore exact managed worktree paths from HEAD.  It deliberately does not
+   * perform checkout/reset for any other path, so unrelated local edits and
+   * additions remain untouched.
+   */
+  async restoreManagedPathsFromHead(paths: readonly string[]): Promise<string[]> {
+    const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    if (!head) return [];
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const tracked = new Set(await git.listFiles({ fs: this.fs, dir: "", ref: head }));
+    const restored: string[] = [];
+    for (const candidate of [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort()) {
+      if (candidate === MANIFEST_PATH || !isManagedPath(candidate, this.configDir, sharedPluginIds) || !tracked.has(candidate)) continue;
+      await this.writeTreeFile(head, candidate);
+      await git.resetIndex({ fs: this.fs, dir: "", filepath: candidate }).catch(() => undefined);
+      restored.push(candidate);
+    }
+    return restored;
+  }
+
   private async readConflictState(): Promise<GitConflictState | undefined> {
     if (!(await this.vault.exists(CONFLICT_STATE_PATH))) return undefined;
     try {

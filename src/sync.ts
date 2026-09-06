@@ -4,7 +4,7 @@ import { FILE_AUTHORS_PATH, MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from
 import { sha256Hex } from "./crypto";
 import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution } from "./git";
 import { PluginLogger } from "./logger";
-import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, writeManifest } from "./manifest";
+import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, validateManifest, writeManifest } from "./manifest";
 import { createAttachmentStore } from "./attachment-store";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
 import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
@@ -20,8 +20,9 @@ export interface SyncCallbacks {
   onRestartRequired(): void;
   onPrivateSyncState(state: PrivateSyncState): void | Promise<void>;
   onPendingDeletionPaths?(paths: string[]): void | Promise<void>;
+  onPendingDeletionFolders?(folders: string[]): void | Promise<void>;
   onPendingPublicMoves?(moves: PendingPublicMove[]): void | Promise<void>;
-  confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<boolean>;
+  confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<RemoteDeletionDecision>;
   onAssetRetention?(records: AssetRetentionRecord[]): void | Promise<void>;
 }
 
@@ -41,7 +42,15 @@ export interface RemoteClearResult {
 export interface RemoteDeletionGroups {
   knowledgePaths: string[];
   configurationPaths: string[];
+  /** Folder roots captured by Obsidian's delete event, for whole-folder undo. */
+  folders: string[];
   moves: PendingPublicMove[];
+}
+
+export interface RemoteDeletionDecision {
+  confirmed: boolean;
+  /** Deleted paths selected for restoration from the current Git HEAD. */
+  restorePaths: string[];
 }
 
 export interface PublicFolderDeletionPaths {
@@ -86,7 +95,7 @@ export function classifyPublicLocalChange(path: string, configDir: string): Loca
   return "other";
 }
 
-export function groupRemoteDeletionPaths(paths: readonly string[], configDir: string): RemoteDeletionGroups {
+export function groupRemoteDeletionPaths(paths: readonly string[], configDir: string, folders: readonly string[] = []): RemoteDeletionGroups {
   const knowledgePaths: string[] = [];
   const configurationPaths: string[] = [];
   for (const candidate of [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort()) {
@@ -94,7 +103,11 @@ export function groupRemoteDeletionPaths(paths: readonly string[], configDir: st
       || isConfigPath(candidate, configDir)) configurationPaths.push(candidate);
     else knowledgePaths.push(candidate);
   }
-  return { knowledgePaths, configurationPaths, moves: [] };
+  const allPaths = new Set([...knowledgePaths, ...configurationPaths]);
+  const normalizedFolders = [...new Set(folders.map(normalizeVaultPath).filter(Boolean))]
+    .filter((folder) => [...allPaths].some((path) => path === folder || path.startsWith(`${folder}/`)))
+    .sort();
+  return { knowledgePaths, configurationPaths, folders: normalizedFolders, moves: [] };
 }
 
 /** Coalesce a chain such as A → B → C into one user-visible A → C move. */
@@ -489,6 +502,33 @@ export class SyncCoordinator {
     void this.callbacks.onPendingDeletionPaths?.(next);
   }
 
+  private rememberPendingDeletionFolder(path: string): void {
+    const folder = normalizeVaultPath(path);
+    if (!folder || isPrivatePath(folder)) return;
+    const current = this.settings().pendingDeletionFolders ?? [];
+    const next = [...new Set([...current, folder])].sort();
+    if (next.length === current.length && next.every((candidate, index) => candidate === current[index])) return;
+    this.settings().pendingDeletionFolders = next;
+    void this.callbacks.onPendingDeletionFolders?.(next);
+  }
+
+  private async discardPendingDeletionPaths(paths: readonly string[]): Promise<void> {
+    const handled = new Set(paths.map(normalizeVaultPath).filter(Boolean));
+    if (!handled.size) return;
+    const currentPaths = this.settings().pendingDeletionPaths ?? [];
+    const nextPaths = currentPaths.filter((path) => !handled.has(normalizeVaultPath(path)));
+    if (nextPaths.length !== currentPaths.length) {
+      this.settings().pendingDeletionPaths = nextPaths;
+      await this.callbacks.onPendingDeletionPaths?.(nextPaths);
+    }
+    const currentFolders = this.settings().pendingDeletionFolders ?? [];
+    const nextFolders = currentFolders.filter((folder) => nextPaths.some((path) => path === folder || path.startsWith(`${folder}/`)));
+    if (nextFolders.length !== currentFolders.length) {
+      this.settings().pendingDeletionFolders = nextFolders;
+      await this.callbacks.onPendingDeletionFolders?.(nextFolders);
+    }
+  }
+
   private isPublicSyncPath(path: string): boolean {
     const normalized = normalizeVaultPath(path);
     return isAssetPath(normalized) || isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds);
@@ -620,6 +660,7 @@ export class SyncCoordinator {
     };
     visit(folder);
     const classified = classifyPublicFolderDeletionPaths(descendants, this.app.vault.configDir, this.sharedPluginIds);
+    this.rememberPendingDeletionFolder(normalized);
     // An empty folder has no Git entry to stage. Preserve the root as a
     // fallback only for adapter-visible managed/asset folders whose children
     // were unavailable at event time.
@@ -1306,8 +1347,6 @@ export class SyncCoordinator {
       await git.ensureRemote();
       const gitignoreChanged = await git.ensureGitignore();
       const sharedPluginStateChanged = await this.syncSharedPluginStateBeforeCommit(vault);
-      const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
-      this.logger.debug("Synchronization inputs prepared", { syncRunId, capturedPendingNotes: pendingNotes.size, capturedPendingAssets: pendingAssets.size, attachmentsChanged: changed, forceFullAttachmentScan, recoveryCommitPending });
       if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
         for (const path of pendingNotes) this.pendingFiles.add(path);
         for (const path of pendingAssets) this.pendingAssets.add(path);
@@ -1318,7 +1357,7 @@ export class SyncCoordinator {
       }
       const pendingMoves = this.settings().pendingPublicMoves ?? [];
       const movedSourcePaths = new Set(pendingMoves.map((move) => normalizeVaultPath(move.from)));
-      const deletionCandidates = [...new Set([
+      let deletionCandidates = [...new Set([
         ...(this.settings().pendingDeletionPaths ?? []),
         ...[...pendingNotes].filter((path) => !this.app.vault.getAbstractFileByPath(path)),
         ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
@@ -1327,23 +1366,47 @@ export class SyncCoordinator {
       // separately because Git represents it as a delete plus an add.
       const requiresDeletionConfirmation = deletionCandidates.length > 3;
       if (requiresDeletionConfirmation || pendingMoves.length) {
-        const deletionGroups = groupRemoteDeletionPaths(requiresDeletionConfirmation ? deletionCandidates : [], this.app.vault.configDir);
+        const deletionGroups = groupRemoteDeletionPaths(
+          requiresDeletionConfirmation ? deletionCandidates : [],
+          this.app.vault.configDir,
+          this.settings().pendingDeletionFolders ?? []
+        );
         deletionGroups.moves = pendingMoves;
         this.logger.warn("Synchronization requires change confirmation", { syncRunId, ...deletionGroups, deletionCandidateCount: deletionCandidates.length });
-        const confirmed = this.callbacks.confirmRemoteDeletions ? await this.callbacks.confirmRemoteDeletions(deletionGroups) : false;
-        if (!confirmed) {
+        const decision = this.callbacks.confirmRemoteDeletions
+          ? await this.callbacks.confirmRemoteDeletions(deletionGroups)
+          : { confirmed: false, restorePaths: [] };
+        if (!decision.confirmed) {
           for (const path of pendingNotes) this.pendingFiles.add(path);
           for (const path of pendingAssets) this.pendingAssets.add(path);
           this.setState("local-changes");
           return;
         }
+        if (decision.restorePaths.length) {
+          const restored = await this.restoreDeletedPublicPaths(git, vault, decision.restorePaths);
+          const restoredPaths = new Set(restored.restoredPaths);
+          for (const path of restoredPaths) {
+            pendingNotes.delete(path);
+            pendingAssets.delete(path);
+          }
+          deletionCandidates = deletionCandidates.filter((path) => !restoredPaths.has(path));
+          await this.discardPendingDeletionPaths(decision.restorePaths);
+          const unavailable = restored.unavailablePaths.length;
+          this.callbacks.onNotice(unavailable
+            ? `已撤回 ${restored.restoredPaths.length} 项删除；另有 ${unavailable} 项没有可恢复的 Git 版本，请从 Obsidian 回收站恢复。`
+            : `已撤回 ${restored.restoredPaths.length} 项删除，其余已确认的更改将继续同步。`);
+          this.logger.debug("Selected public deletions restored", {
+            syncRunId,
+            requested: decision.restorePaths.length,
+            restored: restored.restoredPaths,
+            unavailable: restored.unavailablePaths
+          });
+        }
       }
+      const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
+      this.logger.debug("Synchronization inputs prepared", { syncRunId, capturedPendingNotes: pendingNotes.size, capturedPendingAssets: pendingAssets.size, attachmentsChanged: changed, forceFullAttachmentScan, recoveryCommitPending });
       const handledPaths = new Set([...deletionCandidates, ...pendingMoves.map((move) => normalizeVaultPath(move.from))]);
-      const remaining = (this.settings().pendingDeletionPaths ?? []).filter((path) => !handledPaths.has(normalizeVaultPath(path)));
-      if (remaining.length !== (this.settings().pendingDeletionPaths ?? []).length) {
-        this.settings().pendingDeletionPaths = remaining;
-        await this.callbacks.onPendingDeletionPaths?.(remaining);
-      }
+      await this.discardPendingDeletionPaths([...handledPaths]);
       if (pendingMoves.length) {
         this.settings().pendingPublicMoves = [];
         await this.callbacks.onPendingPublicMoves?.([]);
@@ -1635,6 +1698,53 @@ export class SyncCoordinator {
     this.lastError = `待解决的 Git 冲突：${conflicts.join(", ")}`;
     if (notify) this.callbacks.onNotice(`检测到 Git 冲突：${conflicts.join(", ")}。已停止推送，请先解决冲突。`);
     this.setState("conflict");
+  }
+
+  /** Restore only explicitly selected deleted public paths from the local Git HEAD. */
+  private async restoreDeletedPublicPaths(git: GitRepository, vault: BinaryVault, paths: readonly string[]): Promise<{ restoredPaths: string[]; unavailablePaths: string[] }> {
+    const requested = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort();
+    const assetPaths = requested.filter(isAssetPath);
+    const managedPaths = requested.filter((path) => !isAssetPath(path) && path !== MANIFEST_PATH);
+    const restored = new Set(await git.restoreManagedPathsFromHead(managedPaths));
+    const unavailable = new Set(requested.filter((path) => !isAssetPath(path) && path !== MANIFEST_PATH && !restored.has(path)));
+
+    const shouldRestoreManifest = requested.includes(MANIFEST_PATH);
+    if (assetPaths.length || shouldRestoreManifest) {
+      const headManifestBytes = await git.readHeadFile(MANIFEST_PATH);
+      if (!headManifestBytes) {
+        for (const path of assetPaths) unavailable.add(path);
+        if (shouldRestoreManifest) unavailable.add(MANIFEST_PATH);
+      } else {
+        let headManifest: AssetManifest;
+        try {
+          headManifest = validateManifest(JSON.parse(new TextDecoder().decode(headManifestBytes)));
+        } catch (error) {
+          throw new Error(`无法恢复删除的附件：Git 历史中的附件清单无效（${error instanceof Error ? error.message : String(error)}）`);
+        }
+        const currentManifest = await readManifest(vault);
+        let nextManifest = shouldRestoreManifest ? headManifest : currentManifest;
+        if (shouldRestoreManifest) restored.add(MANIFEST_PATH);
+        const materializationBefore: AssetManifest = { version: nextManifest.version, files: { ...nextManifest.files } };
+        for (const path of assetPaths) {
+          const entry = headManifest.files[path];
+          if (!entry) {
+            unavailable.add(path);
+            continue;
+          }
+          nextManifest = updateManifestEntry(nextManifest, path, entry);
+          delete materializationBefore.files[path];
+          restored.add(path);
+        }
+        if (JSON.stringify(currentManifest) !== JSON.stringify(nextManifest) || shouldRestoreManifest) {
+          await writeManifest(vault, nextManifest);
+        }
+        if (assetPaths.some((path) => restored.has(path))) await this.materializeRemoteAttachments(materializationBefore, nextManifest);
+      }
+    }
+    return {
+      restoredPaths: [...restored].sort(),
+      unavailablePaths: [...unavailable].sort()
+    };
   }
 
   private async prepareAttachments(pendingNotes: ReadonlySet<string>, pendingAssets: ReadonlySet<string>, forceFullScan = false): Promise<boolean> {

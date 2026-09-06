@@ -251,6 +251,9 @@ function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
     pendingDeletionPaths: Array.isArray(input.pendingDeletionPaths)
       ? [...new Set(input.pendingDeletionPaths.filter((path): path is string => typeof path === "string").map(normalizeVaultPath).filter(Boolean))].sort()
       : [],
+    pendingDeletionFolders: Array.isArray(input.pendingDeletionFolders)
+      ? [...new Set(input.pendingDeletionFolders.filter((path): path is string => typeof path === "string").map(normalizeVaultPath).filter(Boolean))].sort()
+      : [],
     pendingPublicMoves: normalizePendingPublicMoves(input.pendingPublicMoves),
     assetRetention: Array.isArray(input.assetRetention)
       ? input.assetRetention.filter((item): item is { sha256: string; size: number; markedAt: string } => Boolean(item && typeof item === "object"

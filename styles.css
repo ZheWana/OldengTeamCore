@@ -237,6 +237,11 @@ button.team-core-destructive-button { background-color: var(--color-red); color:
   line-height: 1.45;
 }
 .team-core-confirm-list-item:last-child { border-bottom: 0; }
+.team-core-confirm-restore-row { display: flex; align-items: center; gap: .55rem; }
+.team-core-confirm-restore-label { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+.team-core-confirm-restore-count { flex: 0 0 auto; color: var(--text-muted); font-family: var(--font-interface); }
+.team-core-confirm-restore-button { flex: 0 0 auto; white-space: nowrap; }
+.team-core-confirm-restore-button:disabled { opacity: .72; color: var(--text-success); }
 .team-core-confirm-note { margin: .55em 0 0; color: var(--text-muted); line-height: 1.5; }
 .team-core-update-notes { margin-top: .4em; color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .team-core-update-actions { display: flex; justify-content: flex-end; gap: .5em; margin-top: .7em; }

@@ -475,7 +475,18 @@ describe("private-note synchronization", () => {
     ], ".obsidian")).toEqual({
       knowledgePaths: [".team/assets-manifest.json", "assets/tc-sha256-deadbeef.png", "notes/plan.md"],
       configurationPaths: [".gitignore", ".obsidian/plugins/dataview/main.js", ".team/shared-plugins.json"],
+      folders: [],
       moves: []
+    });
+  });
+
+  it("keeps deleted folder roots only when they contain pending deletion paths", () => {
+    expect(groupRemoteDeletionPaths([
+      "projects/alpha/a.md",
+      "projects/alpha/sub/b.md",
+      "notes/plan.md"
+    ], ".obsidian", ["projects/alpha", "empty-folder"])).toMatchObject({
+      folders: ["projects/alpha"]
     });
   });
 
@@ -1853,6 +1864,28 @@ describe("sync push reconciliation", () => {
 });
 
 describe("Git repository adapter", () => {
+  it("restores only selected deleted paths from HEAD without reverting other edits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-restore-selected-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/restore.md", encode("restore this\n"));
+      await vault.write("notes/keep.md", encode("keep base\n"));
+      await repo.commit("Base");
+
+      await vault.remove("notes/restore.md");
+      await vault.write("notes/keep.md", encode("keep local edit\n"));
+
+      expect(await repo.restoreManagedPathsFromHead(["notes/restore.md"])).toEqual(["notes/restore.md"]);
+      expect(decode(await vault.read("notes/restore.md"))).toBe("restore this\n");
+      expect(decode(await vault.read("notes/keep.md"))).toBe("keep local edit\n");
+      expect(await repo.hasUncommittedChanges()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("stages an event-derived public batch without enumerating private folders", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-fast-stage-"));
     try {

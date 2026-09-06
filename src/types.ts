@@ -68,6 +68,8 @@ export interface TeamCoreSettings {
   installationId: string;
   /** Public paths deleted locally and awaiting explicit remote-impact confirmation. */
   pendingDeletionPaths: string[];
+  /** Deleted public folders, retained so confirmation can restore a whole folder at once. */
+  pendingDeletionFolders: string[];
   /** Public Vault rename events awaiting an explicit sync-impact acknowledgement. */
   pendingPublicMoves: PendingPublicMove[];
   /** Content-addressed public objects awaiting delayed garbage collection. */
@@ -107,6 +109,7 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   privateSyncState: { version: 1, entries: {}, baselineEstablished: false, pendingPaths: [] },
   installationId: "",
   pendingDeletionPaths: [],
+  pendingDeletionFolders: [],
   pendingPublicMoves: [],
   assetRetention: []
 };

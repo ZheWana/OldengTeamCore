@@ -3,10 +3,10 @@ import { DEFAULT_SETTINGS, type SyncSnapshot, type TeamCoreSettings } from "./ty
 import { mergeSettings } from "./config";
 import { DiagnosticsModal } from "./diagnostics-ui";
 import { parseLogEntries, PluginLogger, type LogEntry } from "./logger";
-import { SyncCoordinator, type RemoteDeletionGroups } from "./sync";
+import { SyncCoordinator, type RemoteDeletionDecision, type RemoteDeletionGroups } from "./sync";
 import { COMMIT_HISTORY_VIEW_TYPE, DASHBOARD_VIEW_TYPE, LOCAL_CHANGES_VIEW_TYPE, TeamCoreCommitHistoryView, TeamCoreDashboardView, TeamCoreLocalChangesView, TeamCoreSettingTab } from "./ui";
 import { ConflictEditorModal } from "./conflict-ui";
-import { requestConfirmation } from "./confirm";
+import { requestConfirmation, requestDeletionConfirmation, type DeletionRestoreItem } from "./confirm";
 import { createVaultAdapter, isHiddenAssetsFolderPath } from "./vault";
 import { GitRepository } from "./git";
 import { FileAuthorService } from "./file-authors";
@@ -70,6 +70,10 @@ export default class TeamCorePlugin extends Plugin {
       },
       onPendingDeletionPaths: async (paths) => {
         this.teamCoreSettings.pendingDeletionPaths = paths;
+        await this.saveSettings();
+      },
+      onPendingDeletionFolders: async (folders) => {
+        this.teamCoreSettings.pendingDeletionFolders = folders;
         await this.saveSettings();
       },
       onPendingPublicMoves: async (moves) => {
@@ -172,19 +176,40 @@ export default class TeamCorePlugin extends Plugin {
     this.coordinator?.start();
   }
 
-  private async confirmRemoteDeletions(groups: RemoteDeletionGroups): Promise<boolean> {
-    if (groups.moves.length && !await this.confirmPublicMoves(groups.moves)) return false;
-    if (groups.knowledgePaths.length && !await this.confirmKnowledgeDeletion(groups.knowledgePaths)) return false;
-    if (groups.configurationPaths.length && !await this.confirmConfigurationDeletion(groups.configurationPaths)) return false;
-    return true;
+  private async confirmRemoteDeletions(groups: RemoteDeletionGroups): Promise<RemoteDeletionDecision> {
+    if (groups.moves.length && !await this.confirmPublicMoves(groups.moves)) return { confirmed: false, restorePaths: [] };
+    const restorePaths: string[] = [];
+    if (groups.knowledgePaths.length) {
+      const result = await this.confirmKnowledgeDeletion(groups.knowledgePaths, groups.folders);
+      if (!result.confirmed) return { confirmed: false, restorePaths: [] };
+      restorePaths.push(...result.restorePaths);
+    }
+    if (groups.configurationPaths.length) {
+      const result = await this.confirmConfigurationDeletion(groups.configurationPaths, groups.folders);
+      if (!result.confirmed) return { confirmed: false, restorePaths: [] };
+      restorePaths.push(...result.restorePaths);
+    }
+    return { confirmed: true, restorePaths: [...new Set(restorePaths)].sort() };
   }
 
-  private async confirmKnowledgeDeletion(paths: readonly string[]): Promise<boolean> {
-    return requestConfirmation(this.app, {
+  private deletionRestoreItems(paths: readonly string[], folders: readonly string[]): DeletionRestoreItem[] {
+    const normalizedPaths = [...new Set(paths)].sort();
+    const folderItems = [...new Set(folders)].sort()
+      .map((folder) => ({ folder, paths: normalizedPaths.filter((path) => path === folder || path.startsWith(`${folder}/`)) }))
+      .filter((item) => item.paths.length > 0)
+      .map((item) => ({ label: `${item.folder}/`, paths: item.paths, kind: "folder" as const }));
+    return [
+      ...folderItems,
+      ...normalizedPaths.map((path) => ({ label: path, paths: [path], kind: "file" as const }))
+    ];
+  }
+
+  private async confirmKnowledgeDeletion(paths: readonly string[], folders: readonly string[]) {
+    return requestDeletionConfirmation(this.app, {
       title: "确认同步删除知识库内容",
       message: `以下 ${paths.length} 项笔记、附件或知识库内容删除会同步到所有成员：`,
-      details: paths,
-      warning: "笔记与附件可能互相引用，也可能被其他文档引用。请确认不再需要这些内容；如属误删，请取消并先从 Git 历史恢复。",
+      items: this.deletionRestoreItems(paths, folders),
+      warning: "笔记与附件可能互相引用，也可能被其他文档引用。可在每一项右侧撤回删除；仅会恢复所选项目，不会撤回其他本地修改。没有 Git 历史版本的新文件请从 Obsidian 回收站恢复。",
       confirmText: "确认删除知识库内容",
       destructive: true
     });
@@ -202,12 +227,12 @@ export default class TeamCorePlugin extends Plugin {
     });
   }
 
-  private async confirmConfigurationDeletion(paths: readonly string[]): Promise<boolean> {
-    return requestConfirmation(this.app, {
+  private async confirmConfigurationDeletion(paths: readonly string[], folders: readonly string[]) {
+    return requestDeletionConfirmation(this.app, {
       title: "确认同步删除公共配置",
       message: `以下 ${paths.length} 项公共插件或共享配置删除会同步到所有成员：`,
-      details: paths,
-      warning: "这可能改变团队插件的启用状态、版本或共同配置。请先与团队确认；如属误删，请取消并从 Git 历史恢复。",
+      items: this.deletionRestoreItems(paths, folders),
+      warning: "可在每一项右侧撤回删除；仅会恢复所选配置，不会撤回其他本地修改。请先与团队确认剩余的配置删除。",
       confirmText: "确认删除公共配置",
       destructive: true
     });
