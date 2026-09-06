@@ -1058,12 +1058,13 @@ export class SyncCoordinator {
   }
 
   /**
-   * Produces the local-changes view model without mutating the Vault, staging
-   * Git paths, or making a network request. Public changes come from the
-   * durable Git index; private changes come from the durable
-   * incremental journal so opening the view never hashes the whole directory.
+   * Produces the local-changes view model. Before reading the index it performs
+   * one bounded reconciliation of whitelisted plugin folders, because those
+   * plugins can bypass Obsidian's Vault events. It never contacts a remote,
+   * commits, or scans notes/assets/private notes.
    */
   async getLocalChangeSnapshot(): Promise<LocalChangeSnapshot> {
+    await this.reconcileSharedPluginChangesForLocalView();
     const settings = this.settings();
     const vault = this.createVault();
     const repository = this.createRepository(vault, settings);
@@ -1129,6 +1130,24 @@ export class SyncCoordinator {
       privateSyncEnabled: settings.privateSyncEnabled
     };
     return snapshot;
+  }
+
+  private async reconcileSharedPluginChangesForLocalView(): Promise<void> {
+    const changed = await this.runExclusive(async () => {
+      const vault = this.createVault();
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = this.createRepository(vault);
+      if (!(await git.exists())) return false;
+      const staged = await git.stageSharedPluginWorktreeChanges();
+      this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+      return staged.length > 0;
+    });
+    if (!changed) return;
+    this.logger.debug("Local changes view staged direct shared-plugin changes");
+    if (this.state !== "syncing" && this.state !== "conflict") this.setState("local-changes");
+    // This only schedules the user's already-enabled automatic mode; the view
+    // itself never performs a network operation or creates a commit.
+    this.scheduleSync();
   }
 
   /** Revert one row from the local-changes view without creating a Git commit. */
