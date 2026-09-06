@@ -799,6 +799,49 @@ export class GitRepository {
     else await git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined);
   }
 
+  /**
+   * Reconcile only the explicitly shared plugin folders with the index.
+   *
+   * Community plugins commonly write their own data.json through an adapter
+   * or native module, bypassing Obsidian's Vault events.  Their files are
+   * nevertheless part of the public boundary when the plugin is whitelisted.
+   * This narrow scan is the recovery boundary for those direct writes; it does
+   * not inspect notes, assets, private notes, personal plugins, or Team Core's
+   * own local configuration.
+   */
+  async stageSharedPluginWorktreeChanges(): Promise<string[]> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const config = normalizeVaultPath(this.configDir);
+    const roots = sharedPluginIds.map((id) => `${config}/plugins/${id}`);
+    if (!roots.length) return [];
+    const candidates = new Set<string>();
+    const collectKnownPaths = (paths: readonly string[]): void => {
+      for (const rawPath of paths) {
+        const path = normalizeVaultPath(rawPath);
+        if (isSharedPluginPath(path, this.configDir, sharedPluginIds)) candidates.add(path);
+      }
+    };
+    collectKnownPaths(await git.listFiles({ fs: this.fs, dir: "" }).catch(() => [] as string[]));
+    collectKnownPaths(await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]));
+    const collectWorktreePaths = async (folder: string): Promise<void> => {
+      const entries = await this.vault.list(folder).catch(() => undefined);
+      if (!entries) return;
+      collectKnownPaths(entries.files);
+      await Promise.all(entries.folders.map((child) => collectWorktreePaths(normalizeVaultPath(child))));
+    };
+    await Promise.all(roots.map((root) => collectWorktreePaths(root)));
+    if (!candidates.size) return [];
+    // Do not use statusMatrix here. Some adapters can report a same-size
+    // direct rewrite with unchanged/coarse mtime, which makes Git's stat
+    // shortcut miss the new bytes. This intentionally asks Git to recalculate
+    // blobs for the bounded whitelist only.
+    for (const path of candidates) {
+      if (await this.vault.exists(path)) await git.add({ fs: this.fs, dir: "", filepath: path });
+      else await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+    }
+    return this.changedIndexPaths([...candidates]);
+  }
+
   /** Lists public changes in HEAD ↔ index only, without traversing the Vault. */
   async listPublicStagedChanges(): Promise<PublicWorktreeChange[]> {
     const sharedPluginIds = await this.currentSharedPluginIds();

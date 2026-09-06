@@ -734,10 +734,10 @@ export class SyncCoordinator {
     await writeSharedPluginIds(vault, this.app.vault.configDir, ids);
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     await this.refreshState();
-    if (this.state !== "uninitialized") {
-      this.pendingFiles.add(".gitignore");
-      this.scheduleSync();
-    }
+    // This is Team Core's own write, so it must not depend on a Vault modify
+    // event arriving later.  data.json remains outside isManagedPath and is
+    // never staged by this path.
+    if (this.state !== "uninitialized") this.stagePublicEvent(".gitignore");
   }
 
   private scheduleSync(): void {
@@ -1380,6 +1380,16 @@ export class SyncCoordinator {
       const sharedPluginStateChanged = await this.syncSharedPluginStateBeforeCommit(vault);
       if (gitignoreChanged) await git.stageManagedEventPath(".gitignore");
       if (sharedPluginStateChanged) await git.stageManagedEventPath(SHARED_PLUGIN_STATE_PATH);
+      // A shared community plugin can update its own config directly and
+      // bypass Obsidian's Vault events. Reconcile only its whitelisted folder
+      // at the normal sync boundary; this is intentionally not a vault scan.
+      const directSharedPluginChanges = await git.stageSharedPluginWorktreeChanges();
+      if (directSharedPluginChanges.length) {
+        this.logger.debug("Staged direct shared-plugin configuration changes", {
+          syncRunId,
+          paths: directSharedPluginChanges
+        });
+      }
       if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
         for (const path of pendingNotes) this.pendingFiles.add(path);
         for (const path of pendingAssets) this.pendingAssets.add(path);

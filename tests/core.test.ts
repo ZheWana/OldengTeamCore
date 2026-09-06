@@ -2087,6 +2087,34 @@ describe("Git repository adapter", () => {
     }
   });
 
+  it("reconciles direct writes from whitelisted plugins without staging Team Core settings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-direct-plugin-config-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian", ["calendar"]);
+      await repo.init();
+      await repo.ensureGitignore();
+      await vault.write(".obsidian/plugins/calendar/data.json", encode('{"weekStart":1}\n'));
+      await vault.write(".obsidian/plugins/team-core/data.json", encode('{"gitPassword":"local-only"}\n'));
+      await repo.commit("Base shared plugin configuration");
+      expect(await readSharedPluginIdsFromGitignore(decode(await vault.read(".gitignore")), ".obsidian")).toEqual(["calendar"]);
+      expect(await git.listFiles({ fs: repo.fs, dir: "", ref: "HEAD" })).toContain(".obsidian/plugins/calendar/data.json");
+
+      // Simulate a community plugin writing straight to its adapter rather
+      // than through an Obsidian Vault event.
+      await vault.write(".obsidian/plugins/calendar/data.json", encode('{"weekStart":0}\n'));
+      await vault.write(".obsidian/plugins/team-core/data.json", encode('{"gitPassword":"still-local"}\n'));
+      expect(await repo.stageSharedPluginWorktreeChanges()).toEqual([".obsidian/plugins/calendar/data.json"]);
+      expect(await repo.listPublicStagedChanges()).toEqual([{ path: ".obsidian/plugins/calendar/data.json", status: "modified" }]);
+      await repo.commitStaged("Sync shared plugin configuration");
+      const files = await git.listFiles({ fs: repo.fs, dir: "", ref: "HEAD" });
+      expect(files).toContain(".obsidian/plugins/calendar/data.json");
+      expect(files).not.toContain(".obsidian/plugins/team-core/data.json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("initializes, commits, reports history, and detects working-tree changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-git-"));
     try {
