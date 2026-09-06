@@ -3,6 +3,8 @@ import { ButtonComponent, Modal, type App } from "obsidian";
 interface ConfirmationOptions {
   title: string;
   message: string;
+  details?: readonly string[];
+  warning?: string;
   confirmText?: string;
   destructive?: boolean;
 }
@@ -26,7 +28,13 @@ class ConfirmationModal extends Modal {
 
   onOpen(): void {
     this.titleEl.setText(this.options.title);
-    this.contentEl.createEl("p", { text: this.options.message });
+    this.modalEl.addClass("team-core-confirm-modal");
+    this.contentEl.createEl("p", { text: this.options.message, cls: "team-core-confirm-description" });
+    if (this.options.details?.length) {
+      const details = this.contentEl.createDiv({ cls: "team-core-confirm-list", attr: { role: "list" } });
+      for (const detail of this.options.details) details.createDiv({ text: detail, cls: "team-core-confirm-list-item", attr: { role: "listitem" } });
+    }
+    if (this.options.warning) this.contentEl.createEl("p", { text: this.options.warning, cls: "team-core-confirm-note" });
     const actions = this.contentEl.createDiv("team-core-confirm-actions");
     new ButtonComponent(actions).setButtonText("取消").onClick(() => this.finish(false));
     const confirm = new ButtonComponent(actions)

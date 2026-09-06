@@ -179,17 +179,12 @@ export default class TeamCorePlugin extends Plugin {
     return true;
   }
 
-  private deletionPreview(paths: readonly string[]): string {
-    const preview = paths.length > 12
-      ? `${paths.slice(0, 12).join("\n")}\n……以及另外 ${paths.length - 12} 项`
-      : paths.join("\n");
-    return preview;
-  }
-
   private async confirmKnowledgeDeletion(paths: readonly string[]): Promise<boolean> {
     return requestConfirmation(this.app, {
       title: "确认同步删除知识库内容",
-      message: `以下 ${paths.length} 项笔记、附件或知识库内容删除会同步到所有成员：\n\n${this.deletionPreview(paths)}\n\n笔记与附件可能互相引用，也可能被其他文档引用。请确认不再需要这些内容；如属误删，请取消并先从 Git 历史恢复。`,
+      message: `以下 ${paths.length} 项笔记、附件或知识库内容删除会同步到所有成员：`,
+      details: paths,
+      warning: "笔记与附件可能互相引用，也可能被其他文档引用。请确认不再需要这些内容；如属误删，请取消并先从 Git 历史恢复。",
       confirmText: "确认删除知识库内容",
       destructive: true
     });
@@ -199,7 +194,9 @@ export default class TeamCorePlugin extends Plugin {
     const paths = moves.map((move) => `${move.from}  →  ${move.to}`);
     return requestConfirmation(this.app, {
       title: "确认同步移动文件",
-      message: `检测到以下 ${moves.length} 项公共文件移动：\n\n${this.deletionPreview(paths)}\n\nGit 会将移动记录为删除旧路径和新增路径；Team Core 已将其识别为移动，而非内容删除。确认后会把新的位置同步给所有成员。`,
+      message: `检测到以下 ${moves.length} 项公共文件移动：`,
+      details: paths,
+      warning: "Git 会将移动记录为删除旧路径和新增路径；Team Core 已将其识别为移动，而非内容删除。确认后会把新的位置同步给所有成员。",
       confirmText: "确认同步移动",
       destructive: false
     });
@@ -208,7 +205,9 @@ export default class TeamCorePlugin extends Plugin {
   private async confirmConfigurationDeletion(paths: readonly string[]): Promise<boolean> {
     return requestConfirmation(this.app, {
       title: "确认同步删除公共配置",
-      message: `以下 ${paths.length} 项公共插件或共享配置删除会同步到所有成员：\n\n${this.deletionPreview(paths)}\n\n这可能改变团队插件的启用状态、版本或共同配置。请先与团队确认；如属误删，请取消并从 Git 历史恢复。`,
+      message: `以下 ${paths.length} 项公共插件或共享配置删除会同步到所有成员：`,
+      details: paths,
+      warning: "这可能改变团队插件的启用状态、版本或共同配置。请先与团队确认；如属误删，请取消并从 Git 历史恢复。",
       confirmText: "确认删除公共配置",
       destructive: true
     });
