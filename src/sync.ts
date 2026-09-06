@@ -9,7 +9,7 @@ import { createAttachmentStore } from "./attachment-store";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
 import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
 import { mimeFromPath } from "./mime";
-import type { AssetManifest, AssetManifestEntry, AssetRetentionRecord, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
+import type { AssetManifest, AssetManifestEntry, AssetRetentionRecord, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PendingPublicMove, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, readVaultInChunks, rewriteAssetReferences, VAULT_TRANSFER_CHUNK_SIZE, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
@@ -20,6 +20,7 @@ export interface SyncCallbacks {
   onRestartRequired(): void;
   onPrivateSyncState(state: PrivateSyncState): void | Promise<void>;
   onPendingDeletionPaths?(paths: string[]): void | Promise<void>;
+  onPendingPublicMoves?(moves: PendingPublicMove[]): void | Promise<void>;
   confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<boolean>;
   onAssetRetention?(records: AssetRetentionRecord[]): void | Promise<void>;
 }
@@ -40,6 +41,7 @@ export interface RemoteClearResult {
 export interface RemoteDeletionGroups {
   knowledgePaths: string[];
   configurationPaths: string[];
+  moves: PendingPublicMove[];
 }
 
 interface AttachmentPlan {
@@ -87,7 +89,25 @@ export function groupRemoteDeletionPaths(paths: readonly string[], configDir: st
       || isConfigPath(candidate, configDir)) configurationPaths.push(candidate);
     else knowledgePaths.push(candidate);
   }
-  return { knowledgePaths, configurationPaths };
+  return { knowledgePaths, configurationPaths, moves: [] };
+}
+
+/** Coalesce a chain such as A → B → C into one user-visible A → C move. */
+export function mergePendingPublicMove(moves: readonly PendingPublicMove[], sourcePath: string, targetPath: string): PendingPublicMove[] {
+  const from = normalizeVaultPath(sourcePath);
+  const to = normalizeVaultPath(targetPath);
+  if (!from || !to || from === to) return [...moves];
+  const next = new Map(moves.map((move) => [move.from, move]));
+  let origin = from;
+  for (const move of next.values()) {
+    if (move.to === from) {
+      origin = move.from;
+      next.delete(move.from);
+      break;
+    }
+  }
+  next.set(origin, { from: origin, to });
+  return [...next.values()].filter((move) => move.from !== move.to).sort((left, right) => left.from.localeCompare(right.from));
 }
 
 export function classifyPrivateLocalChange(relativePath: string): LocalChangeCategory {
@@ -428,6 +448,7 @@ export class SyncCoordinator {
 
   markFileDeleted(file: TFile): void {
     const path = normalizeVaultPath(file.path);
+    this.forgetPendingPublicMoves(path);
     if (path === MANIFEST_PATH) {
       this.pendingFiles.add(path);
       this.fullAttachmentScanPending = true;
@@ -443,6 +464,27 @@ export class SyncCoordinator {
     const next = [...new Set([...(this.settings().pendingDeletionPaths ?? []), path])].sort();
     this.settings().pendingDeletionPaths = next;
     void this.callbacks.onPendingDeletionPaths?.(next);
+  }
+
+  private isPublicSyncPath(path: string): boolean {
+    const normalized = normalizeVaultPath(path);
+    return isAssetPath(normalized) || isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds);
+  }
+
+  private rememberPendingPublicMove(sourcePath: string, targetPath: string): void {
+    if (!this.isPublicSyncPath(sourcePath) || !this.isPublicSyncPath(targetPath)) return;
+    const next = mergePendingPublicMove(this.settings().pendingPublicMoves ?? [], sourcePath, targetPath);
+    this.settings().pendingPublicMoves = next;
+    void this.callbacks.onPendingPublicMoves?.(next);
+  }
+
+  private forgetPendingPublicMoves(path: string): void {
+    const normalized = normalizeVaultPath(path);
+    const current = this.settings().pendingPublicMoves ?? [];
+    const next = current.filter((move) => move.from !== normalized && move.to !== normalized);
+    if (next.length === current.length) return;
+    this.settings().pendingPublicMoves = next;
+    void this.callbacks.onPendingPublicMoves?.(next);
   }
 
   markFileRenamed(file: TFile, oldPath: string): void {
@@ -502,6 +544,7 @@ export class SyncCoordinator {
       return;
     }
     if (isAssetPath(previous)) {
+      this.rememberPendingPublicMove(previous, current);
       this.pendingAssets.add(previous);
       if (shouldNormalizeMovedAttachment(previous, current, this.app.vault.configDir)) this.pendingAssets.add(current);
       this.scheduleSync();
@@ -512,7 +555,10 @@ export class SyncCoordinator {
       this.scheduleSync();
       return;
     }
-    if (isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds) && !isPrivatePath(previous) && previous !== MANIFEST_PATH) this.pendingFiles.add(previous);
+    if (isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds) && !isPrivatePath(previous) && previous !== MANIFEST_PATH) {
+      this.rememberPendingPublicMove(previous, current);
+      this.pendingFiles.add(previous);
+    }
     this.markFileChanged(file);
     if (this.pendingFiles.has(previous) || this.pendingAssets.has(previous)) this.scheduleSync();
   }
@@ -1227,14 +1273,20 @@ export class SyncCoordinator {
         this.deferForLocalChanges();
         return;
       }
+      const pendingMoves = this.settings().pendingPublicMoves ?? [];
+      const movedSourcePaths = new Set(pendingMoves.map((move) => normalizeVaultPath(move.from)));
       const deletionCandidates = [...new Set([
         ...(this.settings().pendingDeletionPaths ?? []),
         ...[...pendingNotes].filter((path) => !this.app.vault.getAbstractFileByPath(path)),
         ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
-      ].map(normalizeVaultPath).filter(Boolean))].sort();
-      if (deletionCandidates.length) {
-        const deletionGroups = groupRemoteDeletionPaths(deletionCandidates, this.app.vault.configDir);
-        this.logger.warn("Synchronization requires deletion confirmation", { syncRunId, ...deletionGroups });
+      ].map(normalizeVaultPath).filter((path) => path && !movedSourcePaths.has(path)))].sort();
+      // Small, ordinary deletions remain low-friction. A move is always shown
+      // separately because Git represents it as a delete plus an add.
+      const requiresDeletionConfirmation = deletionCandidates.length > 3;
+      if (requiresDeletionConfirmation || pendingMoves.length) {
+        const deletionGroups = groupRemoteDeletionPaths(requiresDeletionConfirmation ? deletionCandidates : [], this.app.vault.configDir);
+        deletionGroups.moves = pendingMoves;
+        this.logger.warn("Synchronization requires change confirmation", { syncRunId, ...deletionGroups, deletionCandidateCount: deletionCandidates.length });
         const confirmed = this.callbacks.confirmRemoteDeletions ? await this.callbacks.confirmRemoteDeletions(deletionGroups) : false;
         if (!confirmed) {
           for (const path of pendingNotes) this.pendingFiles.add(path);
@@ -1242,9 +1294,16 @@ export class SyncCoordinator {
           this.setState("local-changes");
           return;
         }
-        const remaining = (this.settings().pendingDeletionPaths ?? []).filter((path) => !deletionCandidates.includes(normalizeVaultPath(path)));
+      }
+      const handledPaths = new Set([...deletionCandidates, ...pendingMoves.map((move) => normalizeVaultPath(move.from))]);
+      const remaining = (this.settings().pendingDeletionPaths ?? []).filter((path) => !handledPaths.has(normalizeVaultPath(path)));
+      if (remaining.length !== (this.settings().pendingDeletionPaths ?? []).length) {
         this.settings().pendingDeletionPaths = remaining;
         await this.callbacks.onPendingDeletionPaths?.(remaining);
+      }
+      if (pendingMoves.length) {
+        this.settings().pendingPublicMoves = [];
+        await this.callbacks.onPendingPublicMoves?.([]);
       }
       if (shouldCommitManagedChanges({
         pendingNotes: pendingNotes.size,

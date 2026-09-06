@@ -72,6 +72,10 @@ export default class TeamCorePlugin extends Plugin {
         this.teamCoreSettings.pendingDeletionPaths = paths;
         await this.saveSettings();
       },
+      onPendingPublicMoves: async (moves) => {
+        this.teamCoreSettings.pendingPublicMoves = moves;
+        await this.saveSettings();
+      },
       confirmRemoteDeletions: (paths) => this.confirmRemoteDeletions(paths),
       onAssetRetention: async (records) => {
         this.teamCoreSettings.assetRetention = records;
@@ -169,6 +173,7 @@ export default class TeamCorePlugin extends Plugin {
   }
 
   private async confirmRemoteDeletions(groups: RemoteDeletionGroups): Promise<boolean> {
+    if (groups.moves.length && !await this.confirmPublicMoves(groups.moves)) return false;
     if (groups.knowledgePaths.length && !await this.confirmKnowledgeDeletion(groups.knowledgePaths)) return false;
     if (groups.configurationPaths.length && !await this.confirmConfigurationDeletion(groups.configurationPaths)) return false;
     return true;
@@ -187,6 +192,16 @@ export default class TeamCorePlugin extends Plugin {
       message: `以下 ${paths.length} 项笔记、附件或知识库内容删除会同步到所有成员：\n\n${this.deletionPreview(paths)}\n\n笔记与附件可能互相引用，也可能被其他文档引用。请确认不再需要这些内容；如属误删，请取消并先从 Git 历史恢复。`,
       confirmText: "确认删除知识库内容",
       destructive: true
+    });
+  }
+
+  private async confirmPublicMoves(moves: ReadonlyArray<RemoteDeletionGroups["moves"][number]>): Promise<boolean> {
+    const paths = moves.map((move) => `${move.from}  →  ${move.to}`);
+    return requestConfirmation(this.app, {
+      title: "确认同步移动文件",
+      message: `检测到以下 ${moves.length} 项公共文件移动：\n\n${this.deletionPreview(paths)}\n\nGit 会将移动记录为删除旧路径和新增路径；Team Core 已将其识别为移动，而非内容删除。确认后会把新的位置同步给所有成员。`,
+      confirmText: "确认同步移动",
+      destructive: false
     });
   }
 

@@ -223,6 +223,21 @@ function normalizeInstallationId(value: unknown): string {
   return typeof value === "string" && /^[a-f0-9]{48}$/i.test(value) ? value.toLowerCase() : "";
 }
 
+function normalizePendingPublicMoves(value: unknown): TeamCoreSettings["pendingPublicMoves"] {
+  if (!Array.isArray(value)) return [];
+  const moves = new Map<string, { from: string; to: string }>();
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const source = item as { from?: unknown; to?: unknown };
+    if (typeof source.from !== "string" || typeof source.to !== "string") continue;
+    const from = normalizeVaultPath(source.from);
+    const to = normalizeVaultPath(source.to);
+    if (!from || !to || from === to) continue;
+    moves.set(from, { from, to });
+  }
+  return [...moves.values()].sort((left, right) => left.from.localeCompare(right.from));
+}
+
 function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
   const merged: TeamCoreSettings = {
     ...DEFAULT_SETTINGS,
@@ -236,6 +251,7 @@ function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
     pendingDeletionPaths: Array.isArray(input.pendingDeletionPaths)
       ? [...new Set(input.pendingDeletionPaths.filter((path): path is string => typeof path === "string").map(normalizeVaultPath).filter(Boolean))].sort()
       : [],
+    pendingPublicMoves: normalizePendingPublicMoves(input.pendingPublicMoves),
     assetRetention: Array.isArray(input.assetRetention)
       ? input.assetRetention.filter((item): item is { sha256: string; size: number; markedAt: string } => Boolean(item && typeof item === "object"
         && typeof (item as { sha256?: unknown }).sha256 === "string" && /^[0-9a-f]{64}$/i.test((item as { sha256: string }).sha256)
