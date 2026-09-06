@@ -1223,8 +1223,6 @@ export class SyncCoordinator {
   /** Revert one row from the local-changes view without creating a Git commit. */
   async discardLocalChange(change: LocalChangeItem): Promise<"restored" | "removed"> {
     if (change.path === PRIVATE_FOLDER) throw new Error("私人笔记尚未建立同步基线，无法按单文件撤销");
-    const restoredPublicPluginConfiguration = change.area === "public"
-      && isPublicPluginConfigurationPath(change.path, this.app.vault.configDir);
     let result: "restored" | "removed";
     if (change.area === "private") {
       result = await this.runExclusive(async () => {
@@ -1256,13 +1254,6 @@ export class SyncCoordinator {
     // that was just rendered. Re-evaluate it before the view asks for a new
     // snapshot so both surfaces settle together.
     await this.refreshState();
-    if (restoredPublicPluginConfiguration) {
-      // Community plugins keep their settings in memory. Reverting data.json
-      // cannot safely replace that memory, so a full Obsidian restart is the
-      // only reliable point at which the restored configuration takes effect.
-      this.restartRequiredAfterSync = true;
-      this.notifyRestartRequired();
-    }
     return result;
   }
 
