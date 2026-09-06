@@ -1223,8 +1223,9 @@ export class SyncCoordinator {
   /** Revert one row from the local-changes view without creating a Git commit. */
   async discardLocalChange(change: LocalChangeItem): Promise<"restored" | "removed"> {
     if (change.path === PRIVATE_FOLDER) throw new Error("私人笔记尚未建立同步基线，无法按单文件撤销");
+    let result: "restored" | "removed";
     if (change.area === "private") {
-      return this.runExclusive(async () => {
+      result = await this.runExclusive(async () => {
         const settings = this.settings();
         if (!settings.privateSyncEnabled) throw new Error("未启用私人笔记多端同步");
         const relativePath = this.privateRelativePath(change.path);
@@ -1235,19 +1236,25 @@ export class SyncCoordinator {
         await this.persistPrivateSyncState({ ...settings.privateSyncState, pendingPaths: [...this.privatePendingPaths].sort() });
         return result;
       });
+    } else {
+      result = await this.runExclusive(async () => {
+        const vault = this.createVault();
+        const git = this.createRepository(vault);
+        if (!(await git.exists())) throw new Error("本地 Git 仓库尚未初始化");
+        const discarded = await git.discardManagedPathChange(change.path);
+        if (!discarded) throw new Error("此类附件变更请通过附件审计或删除确认恢复");
+        this.pendingFiles.delete(normalizeVaultPath(change.path));
+        this.pendingAssets.delete(normalizeVaultPath(change.path));
+        await this.discardPendingDeletionPaths([change.path]);
+        this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+        return discarded;
+      });
     }
-    return this.runExclusive(async () => {
-      const vault = this.createVault();
-      const git = this.createRepository(vault);
-      if (!(await git.exists())) throw new Error("本地 Git 仓库尚未初始化");
-      const result = await git.discardManagedPathChange(change.path);
-      if (!result) throw new Error("此类附件变更请通过附件审计或删除确认恢复");
-      this.pendingFiles.delete(normalizeVaultPath(change.path));
-      this.pendingAssets.delete(normalizeVaultPath(change.path));
-      await this.discardPendingDeletionPaths([change.path]);
-      this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
-      return result;
-    });
+    // The status bar is derived from Git/private baseline, not from the row
+    // that was just rendered. Re-evaluate it before the view asks for a new
+    // snapshot so both surfaces settle together.
+    await this.refreshState();
+    return result;
   }
 
   async runCycle(force: boolean): Promise<void> {

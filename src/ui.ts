@@ -861,7 +861,7 @@ export class TeamCoreLocalChangesView extends ItemView {
       head.createEl("th", { text: "位置" });
       head.createEl("th", { text: "操作" });
       const tableBody = table.createEl("tbody");
-      for (const item of visible) this.renderChangeRow(tableBody, item, renderTable);
+      for (const item of visible) this.renderChangeRow(tableBody, item, () => void this.render());
       if (pageCount > 1) {
         const pagination = tableArea.createDiv("team-core-commit-change-pagination");
         this.pageButton(pagination, "跳转到第一页", "chevrons-left", page === 0, () => { page = 0; renderTable(); });
