@@ -603,7 +603,7 @@ export class TeamCoreCommitHistoryView extends ItemView {
         page = 0;
         renderTable();
       });
-      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table team-core-local-change-table" });
+      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table" });
       const head = table.createEl("thead").createEl("tr");
       head.createEl("th", { text: "更新内容" });
       head.createEl("th", { text: "变更概览" });
@@ -854,7 +854,7 @@ export class TeamCoreLocalChangesView extends ItemView {
       for (const size of [10, 25, 50]) pageSize.createEl("option", { text: `${size} 条/页`, value: String(size) });
       pageSize.value = String(this.pageSize);
       pageSize.addEventListener("change", () => { this.pageSize = Number(pageSize.value); page = 0; renderTable(); });
-      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table" });
+      const table = tableArea.createEl("table", { cls: "team-core-commit-change-table team-core-local-change-table" });
       const head = table.createEl("thead").createEl("tr");
       head.createEl("th", { text: "变更内容" });
       head.createEl("th", { text: "状态" });
