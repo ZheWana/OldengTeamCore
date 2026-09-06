@@ -495,6 +495,7 @@ describe("private-note synchronization", () => {
     expect(first).toEqual([{ from: "notes/a.md", to: "notes/b.md" }]);
     expect(mergePendingPublicMove(first, "notes/b.md", "archive/a.md"))
       .toEqual([{ from: "notes/a.md", to: "archive/a.md" }]);
+    expect(mergePendingPublicMove(first, "notes/b.md", "notes/a.md")).toEqual([]);
   });
 
   it("expands folder descendants before applying the public-deletion threshold", () => {
@@ -1864,6 +1865,32 @@ describe("sync push reconciliation", () => {
 });
 
 describe("Git repository adapter", () => {
+  it("uses Git's final worktree state to discard a move that returned home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-actual-move-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("power/plan.md", encode("plan\n"));
+      await repo.commit("Base");
+
+      await vault.write("ml/plan.md", encode("plan\n"));
+      await vault.remove("power/plan.md");
+      expect(await repo.actualPublicMoves([{ from: "power/plan.md", to: "ml/plan.md" }]))
+        .toEqual([{ from: "power/plan.md", to: "ml/plan.md" }]);
+      expect(await repo.actualPublicDeletedPaths(["power/plan.md", "ml/plan.md"]))
+        .toEqual(["power/plan.md"]);
+
+      await vault.write("power/plan.md", encode("plan\n"));
+      await vault.remove("ml/plan.md");
+      expect(await repo.actualPublicMoves([{ from: "power/plan.md", to: "ml/plan.md" }])).toEqual([]);
+      expect(await repo.actualPublicDeletedPaths(["power/plan.md", "ml/plan.md"]))
+        .toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores only selected deleted paths from HEAD without reverting other edits", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-restore-selected-"));
     try {

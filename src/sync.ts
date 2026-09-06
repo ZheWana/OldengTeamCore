@@ -1355,13 +1355,43 @@ export class SyncCoordinator {
         this.deferForLocalChanges();
         return;
       }
-      const pendingMoves = this.settings().pendingPublicMoves ?? [];
+      const recordedMoves = this.settings().pendingPublicMoves ?? [];
+      const pendingMoves = await git.actualPublicMoves(recordedMoves);
+      if (pendingMoves.length !== recordedMoves.length) {
+        this.settings().pendingPublicMoves = pendingMoves;
+        await this.callbacks.onPendingPublicMoves?.(pendingMoves);
+        this.logger.debug("Discarded stale public move events", {
+          syncRunId,
+          recorded: recordedMoves.length,
+          actual: pendingMoves.length
+        });
+      }
       const movedSourcePaths = new Set(pendingMoves.map((move) => normalizeVaultPath(move.from)));
-      let deletionCandidates = [...new Set([
+      const hintedDeletionPaths = [...new Set([
         ...(this.settings().pendingDeletionPaths ?? []),
         ...[...pendingNotes].filter((path) => !this.app.vault.getAbstractFileByPath(path)),
         ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
-      ].map(normalizeVaultPath).filter((path) => path && !movedSourcePaths.has(path)))].sort();
+      ].map(normalizeVaultPath).filter(Boolean))].sort();
+      const manifestForDeletionCheck = await readManifest(vault);
+      const deletedManagedPaths = await git.actualPublicDeletedPaths(hintedDeletionPaths.filter((path) => !isAssetPath(path)));
+      const deletedAssetPaths = hintedDeletionPaths.filter((path) => (
+        isAssetPath(path)
+        && !this.app.vault.getAbstractFileByPath(path)
+        && Boolean(manifestForDeletionCheck.files[path])
+      ));
+      let deletionCandidates = [...new Set([...deletedManagedPaths, ...deletedAssetPaths])]
+        .filter((path) => !movedSourcePaths.has(path))
+        .sort();
+      const recordedDeletionPaths = this.settings().pendingDeletionPaths ?? [];
+      const staleDeletionPaths = recordedDeletionPaths.filter((path) => !deletionCandidates.includes(normalizeVaultPath(path)));
+      if (staleDeletionPaths.length) {
+        await this.discardPendingDeletionPaths(staleDeletionPaths);
+        this.logger.debug("Discarded stale public deletion events", {
+          syncRunId,
+          recorded: recordedDeletionPaths.length,
+          actual: deletionCandidates.length
+        });
+      }
       // Small, ordinary deletions remain low-friction. A move is always shown
       // separately because Git represents it as a delete plus an add.
       const requiresDeletionConfirmation = deletionCandidates.length > 3;

@@ -1,7 +1,7 @@
 import git, { STAGE, TREE, walk, type GitProgressEvent, type MergeDriverParams } from "isomorphic-git";
 import diff3Merge from "diff3";
 import { requestUrl, type RequestUrlParam } from "obsidian";
-import type { AssetManifest, CommitChangeDetails, CommitDocumentChange, CommitPluginChange, Logger, CommitSummary, TeamCoreSettings } from "./types";
+import type { AssetManifest, CommitChangeDetails, CommitDocumentChange, CommitPluginChange, Logger, CommitSummary, PendingPublicMove, TeamCoreSettings } from "./types";
 import { collectMarkdownReferences, isAssetPath, isManagedPath, isPrivatePath, normalizeVaultPath, type BinaryVault } from "./vault";
 import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH, PRIVATE_FOLDER } from "./constants";
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
@@ -1275,6 +1275,50 @@ export class GitRepository {
       });
     }
     return changes.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  /**
+   * Keep event-derived rename hints only when Git still observes their final
+   * delete-plus-add shape. Folder moves can emit duplicate or late descendant
+   * events; this is the authoritative guard against a stale move prompt.
+   */
+  async actualPublicMoves(moves: readonly PendingPublicMove[]): Promise<PendingPublicMove[]> {
+    const candidates = moves
+      .map((move) => ({ from: normalizeVaultPath(move.from), to: normalizeVaultPath(move.to) }))
+      .filter((move) => move.from && move.to && move.from !== move.to);
+    if (!candidates.length) return [];
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const gitCandidates = candidates.filter((move) => isManagedPath(move.from, this.configDir, sharedPluginIds)
+      && isManagedPath(move.to, this.configDir, sharedPluginIds));
+    const statuses = new Map((await this.publicStatusMatrix(gitCandidates.flatMap((move) => [move.from, move.to])))
+      .map((status) => [normalizeVaultPath(status[0]), status]));
+    const actual: PendingPublicMove[] = [];
+    for (const move of candidates) {
+      if (isAssetPath(move.from) && isAssetPath(move.to)) {
+        // Attachments are deliberately outside Git. Their final on-disk shape
+        // still tells us whether this event-derived move remains real.
+        if (!(await this.vault.exists(move.from)) && await this.vault.exists(move.to)) actual.push(move);
+        continue;
+      }
+      const source = statuses.get(move.from);
+      const target = statuses.get(move.to);
+      if (source && target && source[1] !== 0 && source[2] === 0 && target[1] === 0 && target[2] !== 0) actual.push(move);
+    }
+    return actual.sort((left, right) => left.from.localeCompare(right.from));
+  }
+
+  /** Return only event-hinted paths that Git currently records as deletions. */
+  async actualPublicDeletedPaths(paths: readonly string[]): Promise<string[]> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const candidates = [...new Set(paths.map(normalizeVaultPath).filter((path) => (
+      path && isManagedPath(path, this.configDir, sharedPluginIds)
+    )))];
+    if (!candidates.length) return [];
+    const matrix = await this.publicStatusMatrix(candidates);
+    return matrix
+      .filter(([path, head, workdir]) => isManagedPath(path, this.configDir, sharedPluginIds) && head !== 0 && workdir === 0)
+      .map(([path]) => normalizeVaultPath(path))
+      .sort();
   }
 
   private async publicStatusMatrix(paths?: readonly string[]): Promise<Array<[string, number, number, number]>> {
