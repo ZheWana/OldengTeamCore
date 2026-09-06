@@ -2162,6 +2162,27 @@ describe("Git repository adapter", () => {
     }
   });
 
+  it("fingerprints only whitelisted plugin worktree files for lightweight polling", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-shared-plugin-fingerprint-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian", ["calendar"]);
+      await repo.init();
+      await repo.ensureGitignore();
+      await vault.write(".obsidian/plugins/calendar/data.json", encode('{"weekStart":1}\n'));
+      await vault.write(".obsidian/plugins/team-core/data.json", encode('{"token":"local"}\n'));
+      const before = await repo.sharedPluginWorktreeFingerprint();
+
+      await vault.write(".obsidian/plugins/team-core/data.json", encode('{"token":"changed locally"}\n'));
+      expect(await repo.sharedPluginWorktreeFingerprint()).toBe(before);
+
+      await vault.write(".obsidian/plugins/calendar/data.json", encode('{"weekStart":10}\n'));
+      expect(await repo.sharedPluginWorktreeFingerprint()).not.toBe(before);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("initializes, commits, reports history, and detects working-tree changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-git-"));
     try {

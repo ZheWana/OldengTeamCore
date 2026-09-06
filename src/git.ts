@@ -832,6 +832,34 @@ export class GitRepository {
    */
   async stageSharedPluginWorktreeChanges(): Promise<string[]> {
     const sharedPluginIds = await this.currentSharedPluginIds();
+    // Known index/HEAD paths are consulted only after a change is detected,
+    // so a deleted config file can be removed from the index too.
+    const candidates = await this.sharedPluginWorktreePaths(sharedPluginIds, true);
+    if (!candidates.length) return [];
+    // Do not use statusMatrix here. Some adapters can report a same-size
+    // direct rewrite with unchanged/coarse mtime, which makes Git's stat
+    // shortcut miss the new bytes. This intentionally asks Git to recalculate
+    // blobs for the bounded whitelist only.
+    for (const path of candidates) {
+      if (await this.vault.exists(path)) await git.add({ fs: this.fs, dir: "", filepath: path });
+      else await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+    }
+    return this.changedIndexPaths(candidates);
+  }
+
+  /** Cheap directory fingerprint for background shared-plugin polling. */
+  async sharedPluginWorktreeFingerprint(): Promise<string> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const candidates = await this.sharedPluginWorktreePaths(sharedPluginIds);
+    const parts: string[] = [];
+    for (const path of candidates) {
+      const stat = await this.vault.stat(path);
+      parts.push(`${path}\u0000${stat?.type ?? "missing"}\u0000${stat?.size ?? -1}\u0000${stat?.mtime ?? -1}`);
+    }
+    return parts.join("\u0001");
+  }
+
+  private async sharedPluginWorktreePaths(sharedPluginIds: readonly string[], includeKnownGitPaths = false): Promise<string[]> {
     const config = normalizeVaultPath(this.configDir);
     const roots = sharedPluginIds.map((id) => `${config}/plugins/${id}`);
     if (!roots.length) return [];
@@ -842,8 +870,10 @@ export class GitRepository {
         if (isSharedPluginPath(path, this.configDir, sharedPluginIds)) candidates.add(path);
       }
     };
-    collectKnownPaths(await git.listFiles({ fs: this.fs, dir: "" }).catch(() => [] as string[]));
-    collectKnownPaths(await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]));
+    if (includeKnownGitPaths) {
+      collectKnownPaths(await git.listFiles({ fs: this.fs, dir: "" }).catch(() => [] as string[]));
+      collectKnownPaths(await git.listFiles({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => [] as string[]));
+    }
     const collectWorktreePaths = async (folder: string): Promise<void> => {
       const entries = await this.vault.list(folder).catch(() => undefined);
       if (!entries) return;
@@ -851,16 +881,7 @@ export class GitRepository {
       await Promise.all(entries.folders.map((child) => collectWorktreePaths(normalizeVaultPath(child))));
     };
     await Promise.all(roots.map((root) => collectWorktreePaths(root)));
-    if (!candidates.size) return [];
-    // Do not use statusMatrix here. Some adapters can report a same-size
-    // direct rewrite with unchanged/coarse mtime, which makes Git's stat
-    // shortcut miss the new bytes. This intentionally asks Git to recalculate
-    // blobs for the bounded whitelist only.
-    for (const path of candidates) {
-      if (await this.vault.exists(path)) await git.add({ fs: this.fs, dir: "", filepath: path });
-      else await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
-    }
-    return this.changedIndexPaths([...candidates]);
+    return [...candidates].sort();
   }
 
   /** Lists public changes in HEAD ↔ index only, without traversing the Vault. */

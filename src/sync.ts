@@ -14,6 +14,8 @@ import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentRe
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
+const SHARED_PLUGIN_POLL_INTERVAL_MS = 15_000;
+const SHARED_PLUGIN_FORCE_CONTENT_CHECK_EVERY = 20;
 export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
   onNotice(message: string): void;
@@ -398,6 +400,11 @@ export class SyncCoordinator {
   private publicRecoveryCheckComplete = false;
   /** Forces one authoritative stage/commit after Git restores lost event state. */
   private recoveryCommitPending = false;
+  private sharedPluginPollTimer: number | undefined;
+  private sharedPluginFingerprint: string | undefined;
+  private sharedPluginPollCount = 0;
+  /** Invalidates outstanding asynchronous poll passes after restart/unload. */
+  private sharedPluginPollGeneration = 0;
   private syncRunSequence = 0;
   private activeSyncRunId: number | undefined;
   /** Paths whose remote bytes could not be materialized in the current session. */
@@ -422,6 +429,9 @@ export class SyncCoordinator {
   start(): void {
     this.stop();
     const settings = this.settings();
+    const pollGeneration = ++this.sharedPluginPollGeneration;
+    void this.initializeSharedPluginPoll(pollGeneration);
+    this.sharedPluginPollTimer = window.setInterval(() => void this.pollSharedPluginChanges(false, pollGeneration), SHARED_PLUGIN_POLL_INTERVAL_MS);
     if (!settings.autoSync) return;
     if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam)) {
       this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
@@ -440,10 +450,71 @@ export class SyncCoordinator {
     if (this.periodicTimer !== undefined) window.clearInterval(this.periodicTimer);
     if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
     if (this.privatePeriodicTimer !== undefined) window.clearInterval(this.privatePeriodicTimer);
+    if (this.sharedPluginPollTimer !== undefined) window.clearInterval(this.sharedPluginPollTimer);
     this.debounceTimer = undefined;
     this.periodicTimer = undefined;
     this.privateDebounceTimer = undefined;
     this.privatePeriodicTimer = undefined;
+    this.sharedPluginPollTimer = undefined;
+    this.sharedPluginFingerprint = undefined;
+    this.sharedPluginPollCount = 0;
+    this.sharedPluginPollGeneration += 1;
+  }
+
+  /**
+   * Community plugins often save their own `data.json` through an adapter
+   * which bypasses Obsidian's Vault events.  Keep that narrow boundary
+   * observable even while automatic sync is off: polling records a local
+   * Git change, but only the user's enabled automatic-sync mode may publish.
+   */
+  private async initializeSharedPluginPoll(generation: number): Promise<void> {
+    await this.pollSharedPluginChanges(true, generation);
+  }
+
+  private async pollSharedPluginChanges(forceContentCheck: boolean, generation: number): Promise<void> {
+    if (generation !== this.sharedPluginPollGeneration) return;
+    try {
+      const outcome = await this.runExclusive(async () => {
+        if (generation !== this.sharedPluginPollGeneration) return undefined;
+        const vault = this.createVault();
+        this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+        const git = this.createRepository(vault);
+        if (!(await git.exists())) return { detected: false, hasChanges: false };
+
+        // Ordinary ticks read only path, size and mtime under explicitly
+        // shared plugin folders.  A bounded full content check covers
+        // adapters with coarse timestamps or same-size rewrites.
+        const fingerprint = await git.sharedPluginWorktreeFingerprint();
+        if (generation !== this.sharedPluginPollGeneration) return undefined;
+        this.sharedPluginPollCount += 1;
+        const contentCheckRequired = forceContentCheck
+          || this.sharedPluginFingerprint === undefined
+          || this.sharedPluginPollCount % SHARED_PLUGIN_FORCE_CONTENT_CHECK_EVERY === 0;
+        if (!contentCheckRequired && fingerprint === this.sharedPluginFingerprint) {
+          return { detected: false, hasChanges: this.hasPublicStagedChanges };
+        }
+
+        const staged = await git.stageSharedPluginWorktreeChanges();
+        this.sharedPluginFingerprint = await git.sharedPluginWorktreeFingerprint();
+        this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+        return { detected: staged.length > 0, hasChanges: this.hasPublicStagedChanges };
+      });
+      if (!outcome || generation !== this.sharedPluginPollGeneration || !outcome.detected) return;
+
+      this.logger.debug("Background shared-plugin configuration change detected", {
+        sharedPluginCount: this.sharedPluginIds.length,
+        hasPublicChanges: outcome.hasChanges,
+        automaticSync: this.settings().autoSync
+      });
+      if (outcome.hasChanges && this.state !== "syncing" && this.state !== "conflict") this.setState("local-changes");
+      // scheduleSync itself is a local state refresh when automatic sync is
+      // disabled, and only arms the existing debounce when it is enabled.
+      this.scheduleSync();
+    } catch (error) {
+      // This is observational recovery for third-party writes. An unavailable
+      // adapter must never surface as a synchronization failure on its own.
+      this.logger.debug("Unable to poll shared-plugin configuration", { error: String(error) });
+    }
   }
 
   markFileChanged(file: TFile): void {
