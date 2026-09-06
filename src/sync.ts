@@ -971,6 +971,7 @@ export class SyncCoordinator {
         return;
       }
       await this.recoverLocalWorktree(git, vault);
+      await this.reconcilePendingPublicMoves(git);
       this.pruneRemoteAttachmentIssues(await readManifest(vault));
       if (!this.finishRemoteAttachmentState()) return;
       // Git is the authority for public changes. Event queues are only an
@@ -1398,17 +1399,7 @@ export class SyncCoordinator {
         this.deferForLocalChanges();
         return;
       }
-      const recordedMoves = this.settings().pendingPublicMoves ?? [];
-      const pendingMoves = await git.actualPublicMoves(recordedMoves);
-      if (pendingMoves.length !== recordedMoves.length) {
-        this.settings().pendingPublicMoves = pendingMoves;
-        await this.callbacks.onPendingPublicMoves?.(pendingMoves);
-        this.logger.debug("Discarded stale public move events", {
-          syncRunId,
-          recorded: recordedMoves.length,
-          actual: pendingMoves.length
-        });
-      }
+      const pendingMoves = await this.reconcilePendingPublicMoves(git, syncRunId);
       const movedSourcePaths = new Set(pendingMoves.map((move) => normalizeVaultPath(move.from)));
       const manifestForDeletionCheck = await readManifest(vault);
       const deletedManagedPaths = (await git.listPublicStagedChanges())
@@ -1659,6 +1650,28 @@ export class SyncCoordinator {
 
   private privateTransactionPath(): string {
     return `${normalizeVaultPath(this.app.vault.configDir)}/plugins/team-core/private-sync-transaction.json`;
+  }
+
+  /**
+   * Rename events are only scheduling hints. Verify them against the durable
+   * Git index before exposing a prompt, including during startup, so a move
+   * that was later undone cannot survive in data.json indefinitely.
+   */
+  private async reconcilePendingPublicMoves(git: GitRepository, syncRunId?: number): Promise<PendingPublicMove[]> {
+    const recorded = this.settings().pendingPublicMoves ?? [];
+    if (!recorded.length) return [];
+    const actual = await git.actualPublicMoves(recorded);
+    const unchanged = actual.length === recorded.length
+      && actual.every((move, index) => move.from === recorded[index]?.from && move.to === recorded[index]?.to);
+    if (unchanged) return actual;
+    this.settings().pendingPublicMoves = actual;
+    await this.callbacks.onPendingPublicMoves?.(actual);
+    this.logger.debug("Discarded stale public move events", {
+      syncRunId,
+      recorded: recorded.length,
+      actual: actual.length
+    });
+    return actual;
   }
 
   private async ensureSharedPluginState(vault: BinaryVault): Promise<void> {
