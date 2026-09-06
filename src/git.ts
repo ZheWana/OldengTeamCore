@@ -789,6 +789,55 @@ export class GitRepository {
     return this.changedIndexPaths(candidates.filter((path) => !excluded.has(path)));
   }
 
+  /** Stage one public Vault event immediately; this is the durable public-change journal. */
+  async stageManagedEventPath(path: string): Promise<void> {
+    const filepath = normalizeVaultPath(path);
+    if (!filepath || isPrivatePath(filepath)) return;
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    if (!isManagedPath(filepath, this.configDir, sharedPluginIds)) return;
+    if (await this.vault.exists(filepath)) await git.add({ fs: this.fs, dir: "", filepath });
+    else await git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined);
+  }
+
+  /** Lists public changes in HEAD ↔ index only, without traversing the Vault. */
+  async listPublicStagedChanges(): Promise<PublicWorktreeChange[]> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const changes = await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [TREE({ ref: "HEAD" }), STAGE()],
+      map: async (path, [head, stage]) => {
+        if (path === ".") return undefined;
+        const entry = head ?? stage;
+        if (!entry) return undefined;
+        if (await entry.type() === "tree") return isPrivatePath(normalizeVaultPath(path)) ? null : undefined;
+        if (!isManagedPath(path, this.configDir, sharedPluginIds)) return undefined;
+        if (head && stage && await head.oid() === await stage.oid() && await head.mode() === await stage.mode()) return undefined;
+        return {
+          path: normalizeVaultPath(path),
+          status: !stage ? "deleted" : !head ? "added" : "modified"
+        } satisfies PublicWorktreeChange;
+      }
+    }) as PublicWorktreeChange[];
+    return changes.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  async hasStagedPublicChanges(): Promise<boolean> {
+    return (await this.listPublicStagedChanges()).length > 0;
+  }
+
+  /** Commit the existing managed index delta without re-reading the worktree. */
+  async commitStaged(message: string): Promise<string | undefined> {
+    await this.repairIndexBoundary();
+    const changed = await this.listPublicStagedChanges();
+    if (!changed.length) return undefined;
+    const username = this.settings.gitUsername.trim() || "unknown";
+    const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
+    const oid = await git.commit({ fs: this.fs, dir: "", message, author: { name: username, email }, committer: { name: username, email } });
+    this.logger.debug("Created Git commit from staged public changes", { oid, files: changed.map((change) => change.path) });
+    return oid;
+  }
+
   async commit(message: string, excludedPaths: readonly string[] | (() => readonly string[]) = [], paths?: readonly string[]): Promise<string | undefined> {
     const changed = paths ? await this.stageManagedPaths(paths, excludedPaths) : await this.stageManagedChanges(excludedPaths);
     if (!changed.length) return undefined;
@@ -1417,5 +1466,16 @@ export class GitRepository {
       }
     }) as string[];
     await Promise.all(privatePaths.map((filepath) => git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined)));
+  }
+
+  /** Remove every index entry outside the managed public boundary before committing. */
+  private async repairIndexBoundary(): Promise<void> {
+    await this.repairPrivateIndexBoundary();
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const staged = await git.listFiles({ fs: this.fs, dir: "" }).catch(() => [] as string[]);
+    const forbidden = staged
+      .map(normalizeVaultPath)
+      .filter((path) => path && !isManagedPath(path, this.configDir, sharedPluginIds));
+    await Promise.all(forbidden.map((filepath) => git.remove({ fs: this.fs, dir: "", filepath }).catch(() => undefined)));
   }
 }

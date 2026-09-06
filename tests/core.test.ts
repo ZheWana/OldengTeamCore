@@ -393,6 +393,19 @@ describe("configuration bundles", () => {
     expect("futureRuntimeCache" in mergeSettings(polluted)).toBe(false);
   });
 
+  it("restores local attachment retention and safety records from plugin data", () => {
+    const restored = mergeSettings({
+      pendingDeletionPaths: ["notes/obsolete.md"],
+      pendingDeletionFolders: ["notes"],
+      pendingPublicMoves: [{ from: "notes/a.md", to: "archive/a.md" }],
+      assetRetention: [{ sha256: "a".repeat(64), size: 42, markedAt: "2026-09-06T00:00:00.000Z" }]
+    });
+    expect(restored.pendingDeletionPaths).toEqual(["notes/obsolete.md"]);
+    expect(restored.pendingDeletionFolders).toEqual(["notes"]);
+    expect(restored.pendingPublicMoves).toEqual([{ from: "notes/a.md", to: "archive/a.md" }]);
+    expect(restored.assetRetention).toEqual([{ sha256: "a".repeat(64), size: 42, markedAt: "2026-09-06T00:00:00.000Z" }]);
+  });
+
   it("preserves the automatic-sync choice and defaults legacy settings to enabled", () => {
     const source = settings({ autoSync: false });
     expect(importSettings(exportSettings(source), settings({ autoSync: true })).autoSync).toBe(true);
@@ -1865,6 +1878,48 @@ describe("sync push reconciliation", () => {
 });
 
 describe("Git repository adapter", () => {
+  it("uses the index as a durable public-change journal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-index-journal-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/plan.md", encode("before\n"));
+      await repo.commit("Base");
+
+      await vault.write("notes/plan.md", encode("after\n"));
+      await repo.stageManagedEventPath("notes/plan.md");
+      expect(await repo.listPublicStagedChanges()).toEqual([{ path: "notes/plan.md", status: "modified" }]);
+      expect(await repo.hasStagedPublicChanges()).toBe(true);
+      await repo.commitStaged("Update vault");
+      expect(await repo.listPublicStagedChanges()).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not commit a staged private file alongside an indexed public event", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-index-boundary-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/base.md", encode("base\n"));
+      await repo.commit("Base");
+      await vault.write("私人笔记/secret.md", encode("secret\n"));
+      await git.add({ fs: repo.fs, dir: "", filepath: "私人笔记/secret.md" });
+      await vault.write("notes/base.md", encode("updated\n"));
+      await repo.stageManagedEventPath("notes/base.md");
+      const commit = await repo.commitStaged("Public update");
+      if (!commit) throw new Error("Expected public commit");
+      const tree = await git.listFiles({ fs: repo.fs, dir: "", ref: commit });
+      expect(tree).toContain("notes/base.md");
+      expect(tree).not.toContain("私人笔记/secret.md");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses Git's final worktree state to discard a move that returned home", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-actual-move-"));
     try {

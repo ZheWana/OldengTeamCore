@@ -184,7 +184,11 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     privateS3AccessKey: typeof input.privateS3AccessKey === "string" ? input.privateS3AccessKey : DEFAULT_SETTINGS.privateS3AccessKey,
     privateS3SecretKey: typeof input.privateS3SecretKey === "string" ? input.privateS3SecretKey : DEFAULT_SETTINGS.privateS3SecretKey,
     privateSyncState: normalizePrivateSyncState(input.privateSyncState),
-    installationId: normalizeInstallationId(input.installationId)
+    installationId: normalizeInstallationId(input.installationId),
+    pendingDeletionPaths: Array.isArray(input.pendingDeletionPaths) ? input.pendingDeletionPaths : DEFAULT_SETTINGS.pendingDeletionPaths,
+    pendingDeletionFolders: Array.isArray(input.pendingDeletionFolders) ? input.pendingDeletionFolders : DEFAULT_SETTINGS.pendingDeletionFolders,
+    pendingPublicMoves: Array.isArray(input.pendingPublicMoves) ? input.pendingPublicMoves : DEFAULT_SETTINGS.pendingPublicMoves,
+    assetRetention: Array.isArray(input.assetRetention) ? input.assetRetention : DEFAULT_SETTINGS.assetRetention
   });
 }
 

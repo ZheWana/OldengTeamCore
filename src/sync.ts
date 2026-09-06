@@ -361,6 +361,10 @@ export class SyncCoordinator {
   private state: SyncState = "uninitialized";
   private pendingFiles = new Set<string>();
   private pendingAssets = new Set<string>();
+  /** Cached result of the durable HEAD ↔ index public-change journal. */
+  private hasPublicStagedChanges = false;
+  /** Latest immediate public-index write, awaited by an explicit manual sync. */
+  private publicStagePersistence: Promise<void> = Promise.resolve();
   private publicStateCheckGeneration = 0;
   private privateSyncDirty = false;
   /** Persisted, generation-aware private-note event journal. */
@@ -390,6 +394,8 @@ export class SyncCoordinator {
   private restartRequiredAfterSync = false;
   /** A full attachment reconciliation is scheduled only at recovery boundaries. */
   private recoveryAttachmentCheckComplete = false;
+  /** A full public worktree recovery runs once at startup or after an explicit recovery boundary. */
+  private publicRecoveryCheckComplete = false;
   /** Forces one authoritative stage/commit after Git restores lost event state. */
   private recoveryCommitPending = false;
   private syncRunSequence = 0;
@@ -417,7 +423,7 @@ export class SyncCoordinator {
     this.stop();
     const settings = this.settings();
     if (!settings.autoSync) return;
-    if (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam)) {
+    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam)) {
       this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().debounceMs);
     }
     if (this.privateSyncDirty && settings.privateSyncEnabled && !settings.privateSyncWithTeam) {
@@ -451,8 +457,7 @@ export class SyncCoordinator {
     }
     if (isCommunityPluginStatePath(path, this.app.vault.configDir)) {
       if (this.internalCommunityPluginWriteDepth > 0) return;
-      this.pendingFiles.add(SHARED_PLUGIN_STATE_PATH);
-      this.scheduleSync();
+      this.stagePublicEvent(SHARED_PLUGIN_STATE_PATH);
       return;
     }
     // Attachments are managed through S3 rather than Git, but their Vault
@@ -464,28 +469,53 @@ export class SyncCoordinator {
       return;
     }
     if (this.internalMarkdownWrites.delete(path)) return;
-    this.pendingFiles.add(path);
-    this.scheduleSync();
+    // Markdown paths remain in this small queue only so attachment-reference
+    // rewriting can inspect the note incrementally. Public Git state itself
+    // is staged immediately and never inferred from this queue.
+    if (path.endsWith(".md")) this.pendingFiles.add(path);
+    this.stagePublicEvent(path);
   }
 
   markManagedPathChanged(path: string): void {
     const normalized = normalizeVaultPath(path);
     if (!isManagedPath(normalized, this.app.vault.configDir, this.sharedPluginIds)) return;
-    this.pendingFiles.add(normalized);
-    this.scheduleSync();
+    if (normalized.endsWith(".md")) this.pendingFiles.add(normalized);
+    this.stagePublicEvent(normalized);
   }
 
   markFileDeleted(file: TFile): void {
     const path = normalizeVaultPath(file.path);
     this.forgetPendingPublicMoves(path);
     if (path === MANIFEST_PATH) {
-      this.pendingFiles.add(path);
       this.fullAttachmentScanPending = true;
-      this.scheduleSync();
+      this.stagePublicEvent(path);
       return;
     }
     this.rememberPendingDeletion(path);
     this.markFileChanged(file);
+  }
+
+  /** Serialize immediate public staging with all Git-mutating sync operations. */
+  private stagePublicEvent(path: string): void {
+    const normalized = normalizeVaultPath(path);
+    if (!normalized) return;
+    const task = this.runExclusive(async () => {
+      const vault = this.createVault();
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const git = this.createRepository(vault);
+      if (!(await git.exists())) return false;
+      await git.stageManagedEventPath(normalized);
+      return git.hasStagedPublicChanges();
+    }).then((hasStagedChanges) => {
+      this.hasPublicStagedChanges = hasStagedChanges;
+      if (hasStagedChanges && this.state !== "syncing" && this.state !== "conflict") this.setState("local-changes");
+      this.scheduleSync();
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error("Immediate public staging failed", { path: normalized, error: message });
+      this.callbacks.onNotice(`无法记录本地公共修改：${message}`);
+    });
+    this.publicStagePersistence = task.catch(() => undefined);
   }
 
   private rememberPendingDeletion(path: string): void {
@@ -572,9 +602,8 @@ export class SyncCoordinator {
       return;
     }
     if (previous === MANIFEST_PATH) {
-      this.pendingFiles.add(MANIFEST_PATH);
       this.fullAttachmentScanPending = true;
-      this.scheduleSync();
+      this.stagePublicEvent(MANIFEST_PATH);
       return;
     }
     if (shouldPublishPrivateDraftRename(previous, current, file.extension, this.app.vault.configDir, this.sharedPluginIds)) {
@@ -620,10 +649,10 @@ export class SyncCoordinator {
     }
     if (isManagedPath(previous, this.app.vault.configDir, this.sharedPluginIds) && !isPrivatePath(previous) && previous !== MANIFEST_PATH) {
       this.rememberPendingPublicMove(previous, current);
-      this.pendingFiles.add(previous);
+      if (previous.endsWith(".md")) this.pendingFiles.add(previous);
+      this.stagePublicEvent(previous);
     }
     this.markFileChanged(file);
-    if (this.pendingFiles.has(previous) || this.pendingAssets.has(previous)) this.scheduleSync();
   }
 
   markFolderRenamed(folder: TFolder, oldPath: string): void {
@@ -668,11 +697,11 @@ export class SyncCoordinator {
       if (!this.isPublicSyncPath(normalized)) return;
       this.rememberPendingDeletions([normalized]);
       if (isAssetPath(normalized)) this.pendingAssets.add(normalized);
-      else this.pendingFiles.add(normalized);
+      else this.stagePublicEvent(normalized);
       this.fullAttachmentScanPending ||= isAssetPath(normalized);
     } else {
       this.rememberPendingDeletions([...classified.managedPaths, ...classified.assetPaths]);
-      for (const path of classified.managedPaths) this.pendingFiles.add(path);
+      for (const path of classified.managedPaths) this.stagePublicEvent(path);
       for (const path of classified.assetPaths) this.pendingAssets.add(path);
       this.fullAttachmentScanPending ||= classified.assetPaths.length > 0;
     }
@@ -803,7 +832,7 @@ export class SyncCoordinator {
   async flushDebounce(): Promise<void> {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = undefined;
-    if (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam)) await this.runCycle(true);
+    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam)) await this.runCycle(true);
   }
 
   private async flushPrivateDebounce(): Promise<void> {
@@ -815,6 +844,7 @@ export class SyncCoordinator {
   }
 
   async runManual(): Promise<void> {
+    await this.publicStagePersistence;
     this.logger.debug("Manual synchronization requested", {
       state: this.state,
       pendingFiles: this.pendingFiles.size,
@@ -822,7 +852,7 @@ export class SyncCoordinator {
       privateSyncEnabled: this.settings().privateSyncEnabled,
       privateSyncDirty: this.privateSyncDirty
     });
-    if (this.debounceTimer !== undefined && (this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam))) {
+    if (this.debounceTimer !== undefined && (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam))) {
       await this.flushDebounce();
       return;
     }
@@ -948,7 +978,8 @@ export class SyncCoordinator {
       // reload, external repair, or a mode-only normalization. Once the
       // complete Git status is clean, discard those stale signals so the
       // status bar cannot report a phantom local change.
-      const hasGitChanges = await git.hasUncommittedChanges();
+      const hasGitChanges = await git.hasStagedPublicChanges();
+      this.hasPublicStagedChanges = hasGitChanges;
       if (!hasGitChanges) {
         this.pendingFiles.clear();
         this.pendingAssets.clear();
@@ -1020,15 +1051,15 @@ export class SyncCoordinator {
   snapshot(): SyncSnapshot {
     const settings = this.settings();
     const localChangeAreas: Array<"public" | "private"> = [];
-    if (this.pendingFiles.size || this.pendingAssets.size || this.recoveryCommitPending || this.fullAttachmentScanPending) localChangeAreas.push("public");
+    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || this.recoveryCommitPending || this.fullAttachmentScanPending) localChangeAreas.push("public");
     if (this.privateSyncDirty && settings.privateSyncEnabled) localChangeAreas.push("private");
     return { state: this.state, lastError: this.lastError || undefined, lastSyncAt: this.lastSyncAt, currentAuthor: this.currentAuthor, pendingFiles: [...this.pendingFiles].sort(), pendingAssets: [...this.pendingAssets].sort(), localChangeAreas, progress: this.progress ? { ...this.progress } : undefined };
   }
 
   /**
    * Produces the local-changes view model without mutating the Vault, staging
-   * Git paths, or making a network request. Public changes come from Git's
-   * authoritative worktree matrix; private changes come from the durable
+   * Git paths, or making a network request. Public changes come from the
+   * durable Git index; private changes come from the durable
    * incremental journal so opening the view never hashes the whole directory.
    */
   async getLocalChangeSnapshot(): Promise<LocalChangeSnapshot> {
@@ -1049,7 +1080,7 @@ export class SyncCoordinator {
       });
     };
     if (await repository.exists()) {
-      for (const change of await repository.listPublicWorktreeChanges()) addPublic(change.path, change.status);
+      for (const change of await repository.listPublicStagedChanges()) addPublic(change.path, change.status);
     } else {
       // Until a repository exists there is no Git fact to show. The captured
       // event queue is the only useful initialization preview.
@@ -1347,6 +1378,8 @@ export class SyncCoordinator {
       await git.ensureRemote();
       const gitignoreChanged = await git.ensureGitignore();
       const sharedPluginStateChanged = await this.syncSharedPluginStateBeforeCommit(vault);
+      if (gitignoreChanged) await git.stageManagedEventPath(".gitignore");
+      if (sharedPluginStateChanged) await git.stageManagedEventPath(SHARED_PLUGIN_STATE_PATH);
       if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
         for (const path of pendingNotes) this.pendingFiles.add(path);
         for (const path of pendingAssets) this.pendingAssets.add(path);
@@ -1367,14 +1400,14 @@ export class SyncCoordinator {
         });
       }
       const movedSourcePaths = new Set(pendingMoves.map((move) => normalizeVaultPath(move.from)));
-      const hintedDeletionPaths = [...new Set([
-        ...(this.settings().pendingDeletionPaths ?? []),
-        ...[...pendingNotes].filter((path) => !this.app.vault.getAbstractFileByPath(path)),
-        ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
-      ].map(normalizeVaultPath).filter(Boolean))].sort();
       const manifestForDeletionCheck = await readManifest(vault);
-      const deletedManagedPaths = await git.actualPublicDeletedPaths(hintedDeletionPaths.filter((path) => !isAssetPath(path)));
-      const deletedAssetPaths = hintedDeletionPaths.filter((path) => (
+      const deletedManagedPaths = (await git.listPublicStagedChanges())
+        .filter((change) => change.status === "deleted")
+        .map((change) => change.path);
+      const deletedAssetPaths = [...new Set([
+        ...(this.settings().pendingDeletionPaths ?? []),
+        ...[...pendingAssets].filter((path) => !this.app.vault.getAbstractFileByPath(path))
+      ].map(normalizeVaultPath).filter(Boolean))].filter((path) => (
         isAssetPath(path)
         && !this.app.vault.getAbstractFileByPath(path)
         && Boolean(manifestForDeletionCheck.files[path])
@@ -1434,6 +1467,7 @@ export class SyncCoordinator {
         }
       }
       const changed = await this.prepareAttachments(pendingNotes, pendingAssets, forceFullAttachmentScan);
+      if (changed) await git.stageManagedEventPath(MANIFEST_PATH);
       this.logger.debug("Synchronization inputs prepared", { syncRunId, capturedPendingNotes: pendingNotes.size, capturedPendingAssets: pendingAssets.size, attachmentsChanged: changed, forceFullAttachmentScan, recoveryCommitPending });
       const handledPaths = new Set([...deletionCandidates, ...pendingMoves.map((move) => normalizeVaultPath(move.from))]);
       await this.discardPendingDeletionPaths([...handledPaths]);
@@ -1441,24 +1475,10 @@ export class SyncCoordinator {
         this.settings().pendingPublicMoves = [];
         await this.callbacks.onPendingPublicMoves?.([]);
       }
-      if (shouldCommitManagedChanges({
-        pendingNotes: pendingNotes.size,
-        attachmentsChanged: changed,
-        gitignoreChanged,
-        sharedPluginStateChanged,
-        recoveryCommitPending
-      })) {
+      if (await git.hasStagedPublicChanges()) {
         this.startProgress("提交本地更改", 1);
-        const commitPaths = new Set<string>(pendingNotes);
-        if (changed) commitPaths.add(MANIFEST_PATH);
-        if (gitignoreChanged) commitPaths.add(".gitignore");
-        if (sharedPluginStateChanged) commitPaths.add(SHARED_PLUGIN_STATE_PATH);
-        await git.commit(
-          `Update vault: ${pendingNotes.size || 1} files`,
-          () => [...this.pendingDraftPublications.values(), ...this.pendingNotePrivatizations.values()]
-            .flatMap(({ file, originalPath }) => [normalizeVaultPath(file.path), normalizeVaultPath(originalPath)]),
-          [...commitPaths]
-        );
+        await git.commitStaged(`Update vault`);
+        this.hasPublicStagedChanges = false;
         this.advanceProgress();
       }
       const manifestBeforeRemote = await readManifest(vault);
@@ -1508,7 +1528,8 @@ export class SyncCoordinator {
       }
       this.lastSyncAt = Date.now();
       this.progress = undefined;
-      const queuedChanges = this.pendingFiles.size > 0
+      const queuedChanges = this.hasPublicStagedChanges
+        || this.pendingFiles.size > 0
         || this.pendingAssets.size > 0
         || this.fullAttachmentScanPending
         || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam);
@@ -1539,7 +1560,7 @@ export class SyncCoordinator {
     // next cycle commits that event-derived edit before checkout can
     // materialize remote data. Full worktree recovery is an explicit startup
     // boundary, not part of every incremental merge.
-    if (this.pendingFiles.size || this.pendingAssets.size || this.fullAttachmentScanPending || this.recoveryCommitPending) {
+    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || this.fullAttachmentScanPending || this.recoveryCommitPending) {
       return { conflicts: [], deferred: true };
     }
     this.startProgress("合并远端更改", 1);
@@ -1690,15 +1711,24 @@ export class SyncCoordinator {
    * status is the source of truth when those events may have been missed.
    */
   private async recoverLocalWorktree(git: GitRepository, vault: BinaryVault): Promise<boolean> {
-    const recovery = await git.recoverManagedWorktree();
-    for (const path of recovery.changedManagedPaths) this.pendingFiles.add(path);
-    this.recoveryCommitPending ||= recovery.hasChanges;
+    let recoveredPublicChanges = false;
+    if (!this.publicRecoveryCheckComplete) {
+      this.publicRecoveryCheckComplete = true;
+      const recovery = await git.recoverManagedWorktree();
+      if (recovery.hasChanges) {
+        await git.stageManagedChanges();
+        for (const path of recovery.changedManagedPaths) if (path.endsWith(".md")) this.pendingFiles.add(path);
+        this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+      }
+      recoveredPublicChanges = recovery.hasChanges;
+    }
+    this.recoveryCommitPending = false;
 
     if (!this.recoveryAttachmentCheckComplete) {
       this.recoveryAttachmentCheckComplete = true;
       if (await this.requiresAttachmentReconciliation(vault)) this.fullAttachmentScanPending = true;
     }
-    return recovery.hasChanges || this.fullAttachmentScanPending;
+    return recoveredPublicChanges || this.fullAttachmentScanPending;
   }
 
   /**
