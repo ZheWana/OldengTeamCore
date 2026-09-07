@@ -18,6 +18,10 @@ interface GitConflictState {
   remoteOid: string;
   files: string[];
   detectedAt: string;
+  /** Pull-first replay conflicts leave HEAD on the integrated remote commit. */
+  mode?: "branch-merge" | "index-replay";
+  headOid?: string;
+  transactionId?: string;
 }
 
 interface GitFileVersion {
@@ -65,6 +69,12 @@ export interface PullFirstStashAssessment {
   remoteChanged: boolean;
   canStash: boolean;
   reason?: string;
+}
+
+export interface TeamCoreReplayPlan {
+  remoteOid: string;
+  mergedOid?: string;
+  conflicts: string[];
 }
 
 export interface ConflictFileVersion {
@@ -340,6 +350,8 @@ export function createGitFs(vault: BinaryVault) {
 
 export class GitRepository {
   readonly fs;
+  /** Git trees are immutable; reuse security validation within one operation. */
+  private readonly validatedManagedTrees = new Map<string, { files: string[]; sharedPluginIds: string[] }>();
   constructor(
     private readonly vault: BinaryVault,
     private readonly settings: TeamCoreSettings,
@@ -427,10 +439,14 @@ export class GitRepository {
   }
 
   private async validateManagedTree(ref: string): Promise<{ files: string[]; sharedPluginIds: string[] }> {
-    const files = await git.listFiles({ fs: this.fs, dir: "", ref });
+    const oid = /^[0-9a-f]{40}$/i.test(ref)
+      ? ref.toLowerCase()
+      : await git.resolveRef({ fs: this.fs, dir: "", ref });
+    const cached = this.validatedManagedTrees.get(oid);
+    if (cached) return { files: [...cached.files], sharedPluginIds: [...cached.sharedPluginIds] };
+    const files = await git.listFiles({ fs: this.fs, dir: "", ref: oid });
     let sharedPluginIds: string[] = [];
     if (files.includes(".gitignore")) {
-      const oid = await git.resolveRef({ fs: this.fs, dir: "", ref });
       const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid, filepath: ".gitignore" });
       sharedPluginIds = readSharedPluginIdsFromGitignore(new TextDecoder().decode(blob), this.configDir);
     }
@@ -440,7 +456,9 @@ export class GitRepository {
       const remaining = forbidden.length > 5 ? ` 等 ${forbidden.length} 个文件` : "";
       throw new Error(`远端仓库包含禁止同步路径，已拒绝写入本地：${preview}${remaining}`);
     }
-    return { files, sharedPluginIds };
+    const result = { files: [...files], sharedPluginIds: [...sharedPluginIds] };
+    this.validatedManagedTrees.set(oid, result);
+    return { files: [...result.files], sharedPluginIds: [...result.sharedPluginIds] };
   }
 
   async remoteInfo(): Promise<GitRemoteInfo> {
@@ -524,7 +542,10 @@ export class GitRepository {
         || typeof value.localOid !== "string" || !/^[0-9a-f]{40}$/i.test(value.localOid)
         || typeof value.remoteOid !== "string" || !/^[0-9a-f]{40}$/i.test(value.remoteOid)
         || !Array.isArray(value.files) || !value.files.every((path) => typeof path === "string" && path.length > 0)
-        || typeof value.detectedAt !== "string") throw new Error("invalid shape");
+        || typeof value.detectedAt !== "string"
+        || (value.mode !== undefined && value.mode !== "branch-merge" && value.mode !== "index-replay")
+        || (value.headOid !== undefined && (typeof value.headOid !== "string" || !/^[0-9a-f]{40}$/i.test(value.headOid)))
+        || (value.transactionId !== undefined && (typeof value.transactionId !== "string" || !/^[0-9a-f]{24}$/i.test(value.transactionId)))) throw new Error("invalid shape");
       return value as GitConflictState;
     } catch (error) {
       throw new Error(`本地 Git 冲突状态记录损坏，已停止同步：${String(error)}`);
@@ -544,7 +565,8 @@ export class GitRepository {
     const state = await this.readConflictState();
     if (!state) throw new Error("当前没有待解决的同步冲突");
     const head = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
-    if (head !== state.localOid) throw new Error("冲突发生后本地提交已变化，请重新同步并重新打开冲突编辑器");
+    const expectedHead = state.mode === "index-replay" ? state.headOid : state.localOid;
+    if (!expectedHead || head !== expectedHead) throw new Error("冲突发生后本地提交已变化，请重新同步并重新打开冲突编辑器");
     return state;
   }
 
@@ -684,6 +706,38 @@ export class GitRepository {
     const mergedSharedPluginIds = gitignore
       ? readSharedPluginIdsFromGitignore(new TextDecoder().decode(gitignore), this.configDir)
       : [];
+    if (state.mode === "index-replay") {
+      const changedPaths: string[] = [];
+      for (const path of paths) {
+        const content = mergedFiles.get(path);
+        const remote = await this.readFileVersion(state.remoteOid, path);
+        const unchanged = content === undefined
+          ? remote === undefined
+          : remote !== undefined
+            && content.byteLength === remote.data.byteLength
+            && content.every((value, index) => value === remote.data[index]);
+        if (unchanged) continue;
+        if (!isManagedPath(path, this.configDir, mergedSharedPluginIds)) {
+          throw new Error(`冲突解决结果包含禁止同步路径：${path}`);
+        }
+        if (content === undefined) {
+          if (await this.vault.exists(path)) await this.vault.remove(path);
+          await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+        } else {
+          const data = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength) as ArrayBuffer;
+          await this.vault.write(path, data);
+          await git.add({ fs: this.fs, dir: "", filepath: path });
+        }
+        changedPaths.push(path);
+      }
+      await this.clearConflictState();
+      this.logger.debug("Resolved pull-first replay conflicts into the public index", {
+        transactionId: state.transactionId,
+        files: expected,
+        changedPaths
+      });
+      return state.remoteOid;
+    }
     const personalPluginFiles = await this.snapshotPersonalPluginFiles();
     const currentBranch = await git.currentBranch({ fs: this.fs, dir: "", fullname: false }).catch(() => undefined);
     const checkoutRef = currentBranch ?? DEFAULT_BRANCH;
@@ -925,9 +979,9 @@ export class GitRepository {
 
   /**
    * Checks whether a fetched remote can be merged while the current public
-   * index is temporarily stashed.  We only allow this when every path changed
-   * by both sides already has identical final Git content.  This makes the
-   * later stash application a restoration step, never an implicit overwrite.
+   * index is temporarily checkpointed. Same-path changes are allowed because
+   * the checkpoint is replayed with a real three-way merge; only unstaged
+   * worktree drift is rejected because it is not represented by the index.
    */
   async assessPullFirstStash(): Promise<PullFirstStashAssessment> {
     const local = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
@@ -937,15 +991,12 @@ export class GitRepository {
     if (!remotePaths.length) return { remoteChanged: false, canStash: false };
     const staged = await this.listPublicStagedChanges();
     if (!staged.length) return { remoteChanged: true, canStash: false, reason: "没有本地公共修改" };
+    const fastForward = await git.isDescendent({ fs: this.fs, dir: "", oid: remote, ancestor: local }).catch(() => false);
+    if (!fastForward) {
+      return { remoteChanged: true, canStash: false, reason: "本地与远端已产生提交分叉，先沿用现有提交级冲突流程" };
+    }
     if (await this.hasUnstagedPublicChanges()) {
       return { remoteChanged: true, canStash: false, reason: "存在尚未进入 Git 暂存区的公共修改" };
-    }
-    const stagedPaths = new Set(staged.map((change) => change.path));
-    for (const path of remotePaths) {
-      if (!stagedPaths.has(path)) continue;
-      if (!await this.indexMatchesTreePath(remote, path)) {
-        return { remoteChanged: true, canStash: false, reason: `本地与远端同时修改了 ${path}` };
-      }
     }
     return { remoteChanged: true, canStash: true };
   }
@@ -974,7 +1025,7 @@ export class GitRepository {
     await git.writeRef({ fs: this.fs, dir: "", ref: this.teamCoreStashRef(transactionId), value: oid, force: true });
     const base = await this.stashBaseOid(oid);
     const paths = await this.changedTreePaths(base, oid);
-    await this.materializeIndexTreePaths(base, paths);
+    await this.materializeIndexTreePaths(base, paths, oid);
     const verified = await this.findTeamCoreStash(transactionId, oid);
     if (!verified) throw new Error("创建同步暂存后无法验证临时引用，已停止继续同步");
     return verified;
@@ -1006,13 +1057,82 @@ export class GitRepository {
     return this.changedTreePaths(await this.stashBaseOid(stashOid), stashOid);
   }
 
+  /**
+   * Merge the local checkpoint commit into the already-integrated remote HEAD
+   * without moving the current branch. The returned commit is only a durable
+   * carrier for the resulting tree; it is never pushed as repository history.
+   */
+  async planTeamCoreStashReplay(transactionId: string, stashOid: string): Promise<TeamCoreReplayPlan> {
+    if (!(await this.findTeamCoreStash(transactionId, stashOid))) {
+      throw new Error("同步暂存已改变或不属于 Team Core，拒绝执行三方恢复");
+    }
+    const remoteOid = await this.headOid();
+    if (!remoteOid) throw new Error("无法读取远端合并后的本地 HEAD");
+    const currentBranch = await git.currentBranch({ fs: this.fs, dir: "", fullname: false }).catch(() => undefined);
+    const username = this.settings.gitUsername.trim() || "unknown";
+    const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
+    try {
+      const result = await git.merge({
+        fs: this.fs,
+        dir: "",
+        ours: currentBranch ? `refs/heads/${currentBranch}` : "HEAD",
+        theirs: this.teamCoreStashRef(transactionId),
+        fastForward: false,
+        noUpdateBranch: true,
+        abortOnConflict: true,
+        message: `Team Core replay ${transactionId}`,
+        author: { name: username, email },
+        committer: { name: username, email },
+        mergeDriver: (params) => teamCoreMergeDriver(params, this.configDir)
+      });
+      const mergedOid = result.oid ?? (result.alreadyMerged ? remoteOid : undefined);
+      if (!mergedOid) throw new Error("三方合并未生成可恢复的结果快照");
+      await this.validateManagedTree(mergedOid);
+      return { remoteOid, mergedOid, conflicts: [] };
+    } catch (error) {
+      const conflicts = conflictFilesFromError(error);
+      if (!conflicts.length) throw error;
+      await this.writeConflictState({
+        version: 1,
+        localOid: stashOid,
+        remoteOid,
+        headOid: remoteOid,
+        mode: "index-replay",
+        transactionId,
+        files: conflicts,
+        detectedAt: new Date().toISOString()
+      });
+      this.logger.warn("Pull-first checkpoint replay requires conflict resolution", { transactionId, files: conflicts });
+      return { remoteOid, conflicts };
+    }
+  }
+
+  /** Idempotently materialize a planned three-way tree as HEAD ↔ index changes. */
+  async applyTeamCoreMergedSnapshot(mergedOid: string): Promise<string[]> {
+    const head = await this.headOid();
+    if (!head) throw new Error("无法读取当前 HEAD，拒绝恢复三方合并结果");
+    await this.validateManagedTree(mergedOid);
+    const paths = await this.changedTreePaths(head, mergedOid);
+    await this.materializeIndexTreePaths(mergedOid, paths, head);
+    const complete = await Promise.all(paths.map((path) => this.indexMatchesTreePath(mergedOid, path)));
+    if (!complete.every(Boolean)) throw new Error("三方合并结果只恢复了一部分文件，已保留事务以便重新恢复");
+    return paths;
+  }
+
+  async isTeamCoreMergedSnapshotApplied(mergedOid: string): Promise<boolean> {
+    const head = await this.headOid();
+    if (!head) return false;
+    const paths = await this.changedTreePaths(head, mergedOid);
+    return Promise.all(paths.map((path) => this.indexMatchesTreePath(mergedOid, path))).then((values) => values.every(Boolean));
+  }
+
   async applyTeamCoreStash(transactionId: string, stashOid: string): Promise<void> {
     if (!(await this.findTeamCoreStash(transactionId, stashOid))) {
       throw new Error("同步暂存已改变或不属于 Team Core，已停止恢复以保护本地修改");
     }
     const base = await this.stashBaseOid(stashOid);
     const paths = await this.changedTreePaths(base, stashOid);
-    await this.materializeIndexTreePaths(stashOid, paths);
+    await this.materializeIndexTreePaths(stashOid, paths, base);
     if (!await this.isTeamCoreStashRestored(stashOid)) {
       throw new Error("同步暂存只恢复了一部分文件，已保留恢复点；请使用冲突编辑器或重新启动插件继续处理");
     }
@@ -1171,12 +1291,23 @@ export class GitRepository {
     return base;
   }
 
-  /** Materialize only known public paths from a Git tree and set their exact index entries. */
-  private async materializeIndexTreePaths(treeOid: string, paths: readonly string[]): Promise<void> {
-    const sharedPluginIds = await this.currentSharedPluginIds();
-    const tracked = new Set(await git.listFiles({ fs: this.fs, dir: "", ref: treeOid }));
+  /**
+   * Materialize only paths allowed by the source/target Git trees and set
+   * their exact index entries. The whitelist itself can change in the same
+   * replay, so worktree-derived plugin IDs are not authoritative here.
+   */
+  private async materializeIndexTreePaths(treeOid: string, paths: readonly string[], sourceTreeOid?: string): Promise<void> {
+    const targetTree = await this.validateManagedTree(treeOid);
+    const sourceTree = sourceTreeOid ? await this.validateManagedTree(sourceTreeOid) : undefined;
+    const tracked = new Set(targetTree.files);
     for (const path of [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort()) {
-      if (!isManagedPath(path, this.configDir, sharedPluginIds)) throw new Error(`同步暂存包含禁止同步路径：${path}`);
+      const targetManaged = isManagedPath(path, this.configDir, targetTree.sharedPluginIds);
+      const sourceManaged = sourceTree
+        ? isManagedPath(path, this.configDir, sourceTree.sharedPluginIds)
+        : false;
+      if (tracked.has(path) ? !targetManaged : !targetManaged && !sourceManaged) {
+        throw new Error(`同步暂存包含禁止同步路径：${path}`);
+      }
       if (tracked.has(path)) {
         await this.writeTreeFile(treeOid, path);
         await git.resetIndex({ fs: this.fs, dir: "", filepath: path, ref: treeOid });

@@ -1104,7 +1104,16 @@ export class SyncCoordinator {
       const previousSharedPluginIds = [...this.sharedPluginIds];
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const git = this.createRepository(vault);
-      await git.resolveConflicts(resolutions);
+      const transaction = this.settings().publicSyncTransaction;
+      if (transaction?.phase === "conflict" && transaction.stashOid) {
+        const paths = await git.teamCoreStashPaths(transaction.stashOid);
+        await this.withInternalManagedWrites(paths, () => git.resolveConflicts(resolutions));
+        await this.persistPublicSyncTransaction({ ...transaction, phase: "restored" });
+        await git.dropTeamCoreStash(transaction.id, transaction.stashOid);
+        await this.persistPublicSyncTransaction(undefined);
+      } else {
+        await git.resolveConflicts(resolutions);
+      }
       this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
       const enabledStateChanged = await this.applySharedPluginState(vault);
       this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
@@ -1507,12 +1516,7 @@ export class SyncCoordinator {
     }
   }
 
-  /**
-   * Fetch and, where it is provably safe, merge the remote before asking the
-   * user to confirm a local public-configuration change.  A native Git stash
-   * holds the indexed local delta, while data.json records the exact recovery
-   * phase in case Obsidian reloads or exits in the middle of the operation.
-   */
+  /** Fetch, integrate remote HEAD, then replay the local index by three-way merge. */
   private async pullRemoteBeforeLocalConfirmation(git: GitRepository, vault: BinaryVault, syncRunId: number): Promise<RemoteReconciliationResult> {
     const manifestBeforeRemote = await readManifest(vault);
     this.startProgress("拉取远端更改", 1);
@@ -1541,11 +1545,24 @@ export class SyncCoordinator {
       this.hasPublicStagedChanges = false;
       const reconciliation = await this.mergeFetchedRemote(git, vault, manifestBeforeRemote, true);
       if (reconciliation.conflicts.length || reconciliation.deferred) return reconciliation;
-      transaction = { ...transaction, phase: "remote-merged" };
+      const remoteOid = await git.headOid();
+      if (!remoteOid) throw new Error("拉取远端后无法读取本地 HEAD");
+      transaction = { ...transaction, phase: "remote-merged", remoteOid };
       await this.persistPublicSyncTransaction(transaction);
-      transaction = { ...transaction, phase: "restoring" };
+      const replay = await git.planTeamCoreStashReplay(transaction.id, stashOid);
+      if (replay.conflicts.length) {
+        transaction = { ...transaction, phase: "conflict", remoteOid: replay.remoteOid };
+        await this.persistPublicSyncTransaction(transaction);
+        return { conflicts: replay.conflicts, deferred: false };
+      }
+      if (!replay.mergedOid) throw new Error("三方恢复没有生成结果快照");
+      transaction = { ...transaction, phase: "restoring", remoteOid: replay.remoteOid, mergedOid: replay.mergedOid };
       await this.persistPublicSyncTransaction(transaction);
-      await this.withInternalManagedWrites(localPaths, () => git.applyTeamCoreStash(transaction.id, stashOid));
+      await this.withInternalManagedWrites(localPaths, () => git.applyTeamCoreMergedSnapshot(replay.mergedOid as string));
+      const sharedPluginIdsBeforeReplay = [...this.sharedPluginIds];
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const enabledStateChanged = await this.applySharedPluginState(vault);
+      this.recordSharedPluginChange(sharedPluginIdsBeforeReplay, this.sharedPluginIds, enabledStateChanged);
       transaction = { ...transaction, phase: "restored" };
       await this.persistPublicSyncTransaction(transaction);
       await git.dropTeamCoreStash(transaction.id, stashOid);
@@ -1561,12 +1578,7 @@ export class SyncCoordinator {
     }
   }
 
-  /**
-   * Restores an interrupted pull-first transaction before normal state
-   * detection starts. The restore is deliberately local-only: after a crash
-   * we first guarantee the user's local changes are back, then the next sync
-   * can safely resume its normal remote refresh.
-   */
+  /** Resume an interrupted pull-first transaction before normal state detection. */
   async recoverPublicSyncTransaction(): Promise<void> {
     await this.runExclusive(async () => {
       const transaction = this.settings().publicSyncTransaction;
@@ -1589,31 +1601,60 @@ export class SyncCoordinator {
         }
         throw new Error("检测到未完成同步事务，但对应的 Team Core 暂存不存在；已停止同步以保护本地修改");
       }
-      if (transaction.phase === "restoring") {
-        if (!await git.isTeamCoreStashRestored(stashOid)) {
-          throw new Error("上次同步在恢复本地修改时中断，且只恢复了部分内容；已保留暂存，请先处理冲突后再同步");
-        }
-      } else {
-        const currentHead = await git.headOid();
-        if (currentHead && currentHead !== transaction.baseOid) {
-          // A crash can occur after Git has advanced HEAD but before the
-          // reconciliation phase was persisted. Re-run the idempotent local
-          // materialization before restoring the stashed paths.
-          await this.reconcileMergedRemote(git, vault, createEmptyManifest());
-        }
-        await this.persistPublicSyncTransaction({ ...transaction, stashOid, phase: "restoring" });
-        const restorePaths = await git.teamCoreStashPaths(stashOid);
-        await this.withInternalManagedWrites(restorePaths, () => git.applyTeamCoreStash(transaction.id, stashOid));
-        if (!await git.isTeamCoreStashRestored(stashOid)) {
-          throw new Error("未完成同步事务只恢复了部分文件；已保留暂存，拒绝自动重复恢复");
-        }
+      if (transaction.phase === "conflict") {
+        const conflicts = await git.conflictedFiles();
+        if (!conflicts.length) throw new Error("同步事务记录为冲突状态，但冲突恢复记录不存在");
+        this.logger.warn("Interrupted pull-first transaction is waiting for conflict resolution", { transactionId: transaction.id, files: conflicts });
+        return;
       }
-      await this.persistPublicSyncTransaction({ ...transaction, stashOid, phase: "restored" });
+
+      let mergedOid = transaction.mergedOid;
+      const currentHead = await git.headOid();
+      if (!currentHead) throw new Error("无法读取未完成同步事务的当前 HEAD");
+      if (transaction.phase === "preparing" || transaction.phase === "stashed") {
+        if (currentHead === transaction.baseOid) {
+          // The remote merge never advanced HEAD. Restore the exact checkpoint
+          // and let the next normal cycle fetch again.
+          const restorePaths = await git.teamCoreStashPaths(stashOid);
+          await this.persistPublicSyncTransaction({ ...transaction, stashOid, phase: "restoring" });
+          await this.withInternalManagedWrites(restorePaths, () => git.applyTeamCoreStash(transaction.id, stashOid));
+          await this.persistPublicSyncTransaction({ ...transaction, stashOid, phase: "restored" });
+          await git.dropTeamCoreStash(transaction.id, stashOid);
+          await this.persistPublicSyncTransaction(undefined);
+          this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+          this.callbacks.onNotice("已恢复上次在拉取前暂存的本地修改；请再次同步以继续拉取远端。");
+          return;
+        }
+        // HEAD advanced before the phase write completed. Re-run the
+        // idempotent post-merge materialization and continue the replay.
+        await this.reconcileMergedRemote(git, vault, createEmptyManifest());
+      }
+      if (!mergedOid) {
+        const replay = await git.planTeamCoreStashReplay(transaction.id, stashOid);
+        if (replay.conflicts.length) {
+          await this.persistPublicSyncTransaction({ ...transaction, stashOid, remoteOid: replay.remoteOid, phase: "conflict" });
+          this.logger.warn("Recovered pull-first transaction now requires conflict resolution", { transactionId: transaction.id, files: replay.conflicts });
+          return;
+        }
+        if (!replay.mergedOid) throw new Error("恢复同步事务时没有生成三方结果快照");
+        mergedOid = replay.mergedOid;
+        await this.persistPublicSyncTransaction({ ...transaction, stashOid, remoteOid: replay.remoteOid, mergedOid, phase: "restoring" });
+      }
+      const restorePaths = await git.teamCoreStashPaths(stashOid);
+      await this.withInternalManagedWrites(restorePaths, () => git.applyTeamCoreMergedSnapshot(mergedOid));
+      if (!await git.isTeamCoreMergedSnapshotApplied(mergedOid)) {
+        throw new Error("未完成同步事务只恢复了部分三方合并结果；已保留快照，拒绝自动重复覆盖");
+      }
+      const sharedPluginIdsBeforeReplay = [...this.sharedPluginIds];
+      this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
+      const enabledStateChanged = await this.applySharedPluginState(vault);
+      this.recordSharedPluginChange(sharedPluginIdsBeforeReplay, this.sharedPluginIds, enabledStateChanged);
+      await this.persistPublicSyncTransaction({ ...transaction, stashOid, mergedOid, phase: "restored" });
       await git.dropTeamCoreStash(transaction.id, stashOid);
       await this.persistPublicSyncTransaction(undefined);
       this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
       this.logger.warn("Recovered interrupted pull-first transaction", { transactionId: transaction.id, phase: transaction.phase });
-      this.callbacks.onNotice("已恢复上次中断同步中的本地修改；远端更新将在下一次同步时继续处理。");
+      this.callbacks.onNotice("已继续完成上次中断的远端合并，并恢复本地待同步修改。");
     });
   }
 
@@ -1662,9 +1703,7 @@ export class SyncCoordinator {
       }
       await git.ensureRemote();
       const gitignoreChanged = await git.ensureGitignore();
-      const sharedPluginStateChanged = await this.syncSharedPluginStateBeforeCommit(vault);
       if (gitignoreChanged) await git.stageManagedEventPath(".gitignore");
-      if (sharedPluginStateChanged) await git.stageManagedEventPath(SHARED_PLUGIN_STATE_PATH);
       // A shared community plugin can update its own config directly and
       // bypass Obsidian's Vault events. Reconcile only its whitelisted folder
       // at the normal sync boundary; this is intentionally not a vault scan.
@@ -1681,6 +1720,12 @@ export class SyncCoordinator {
         this.enterConflict(earlyRemote.conflicts);
         return;
       }
+      // Only derive shared enablement after the fetched team state has been
+      // applied locally. Doing this before fetch turns a stale device's local
+      // plugin list into a false outgoing team configuration change.
+      const sharedPluginStateChanged = await this.syncSharedPluginStateBeforeCommit(vault);
+      if (sharedPluginStateChanged) await git.stageManagedEventPath(SHARED_PLUGIN_STATE_PATH);
+      this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
       if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
         for (const path of pendingNotes) this.pendingFiles.add(path);
         for (const path of pendingAssets) this.pendingAssets.add(path);

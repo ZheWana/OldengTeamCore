@@ -252,16 +252,20 @@ function normalizePublicSyncTransaction(value: unknown): PublicSyncTransaction |
   if (input.version !== 1
     || typeof input.id !== "string" || !/^[a-f0-9]{24}$/i.test(input.id)
     || typeof input.baseOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.baseOid)
-    || (phase !== "preparing" && phase !== "stashed" && phase !== "remote-merged" && phase !== "restoring" && phase !== "restored")
+    || (phase !== "preparing" && phase !== "stashed" && phase !== "remote-merged" && phase !== "restoring" && phase !== "conflict" && phase !== "restored")
     || typeof input.startedAt !== "string" || !Number.isFinite(Date.parse(input.startedAt))
-    || (input.stashOid !== undefined && (typeof input.stashOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.stashOid)))) return undefined;
+    || (input.stashOid !== undefined && (typeof input.stashOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.stashOid)))
+    || (input.remoteOid !== undefined && (typeof input.remoteOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.remoteOid)))
+    || (input.mergedOid !== undefined && (typeof input.mergedOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.mergedOid)))) return undefined;
   return {
     version: 1,
     id: input.id.toLowerCase(),
     baseOid: input.baseOid.toLowerCase(),
     phase,
     startedAt: input.startedAt,
-    ...(input.stashOid ? { stashOid: input.stashOid.toLowerCase() } : {})
+    ...(input.stashOid ? { stashOid: input.stashOid.toLowerCase() } : {}),
+    ...(input.remoteOid ? { remoteOid: input.remoteOid.toLowerCase() } : {}),
+    ...(input.mergedOid ? { mergedOid: input.mergedOid.toLowerCase() } : {})
   };
 }
 

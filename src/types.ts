@@ -129,9 +129,13 @@ export interface PublicSyncTransaction {
   /** HEAD when the temporary stash was created. */
   baseOid: string;
   /** Git's temporary-stash lifecycle; persisted before each non-idempotent step. */
-  phase: "preparing" | "stashed" | "remote-merged" | "restoring" | "restored";
+  phase: "preparing" | "stashed" | "remote-merged" | "restoring" | "conflict" | "restored";
   startedAt: string;
   stashOid?: string;
+  /** Fetched/integrated remote HEAD used as the three-way replay target. */
+  remoteOid?: string;
+  /** Durable, unreferenced merge commit whose tree is safe to materialize idempotently. */
+  mergedOid?: string;
 }
 
 export interface AssetManifestEntry {

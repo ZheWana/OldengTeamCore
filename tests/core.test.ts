@@ -422,6 +422,41 @@ describe("configuration bundles", () => {
     expect("assetRetention" in restored).toBe(false);
   });
 
+  it("preserves a valid interrupted pull-first replay transaction", () => {
+    const restored = mergeSettings({
+      publicSyncTransaction: {
+        version: 1,
+        id: "A".repeat(24),
+        baseOid: "B".repeat(40),
+        phase: "restoring",
+        startedAt: "2026-09-07T05:00:00.000Z",
+        stashOid: "C".repeat(40),
+        remoteOid: "D".repeat(40),
+        mergedOid: "E".repeat(40)
+      }
+    });
+    expect(restored.publicSyncTransaction).toEqual({
+      version: 1,
+      id: "a".repeat(24),
+      baseOid: "b".repeat(40),
+      phase: "restoring",
+      startedAt: "2026-09-07T05:00:00.000Z",
+      stashOid: "c".repeat(40),
+      remoteOid: "d".repeat(40),
+      mergedOid: "e".repeat(40)
+    });
+    expect(mergeSettings({
+      publicSyncTransaction: {
+        version: 1,
+        id: "a".repeat(24),
+        baseOid: "b".repeat(40),
+        phase: "restoring",
+        startedAt: "2026-09-07T05:00:00.000Z",
+        mergedOid: "not-an-oid"
+      }
+    }).publicSyncTransaction).toBeUndefined();
+  });
+
   it("preserves the automatic-sync choice and defaults legacy settings to enabled", () => {
     const source = settings({ autoSync: false });
     expect(importSettings(exportSettings(source), settings({ autoSync: true })).autoSync).toBe(true);
@@ -2143,11 +2178,14 @@ describe("Git repository adapter", () => {
       expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
       expect(decode(await vault.read("notes/remote.md"))).toBe("remote update\n");
       // A fresh adapter instance represents an Obsidian reload between the
-      // remote merge and local-change restoration.
+      // remote merge and local-change replay.
       const reloaded = new GitRepository(vault, settings(), logger, ".obsidian");
       expect(await reloaded.findTeamCoreStash(transactionId, stashOid)).toBe(stashOid);
-      await reloaded.applyTeamCoreStash(transactionId, stashOid);
-      expect(await reloaded.isTeamCoreStashRestored(stashOid)).toBe(true);
+      const replay = await reloaded.planTeamCoreStashReplay(transactionId, stashOid);
+      expect(replay.conflicts).toEqual([]);
+      expect(replay.mergedOid).toMatch(/^[0-9a-f]{40}$/);
+      await reloaded.applyTeamCoreMergedSnapshot(replay.mergedOid as string);
+      expect(await reloaded.isTeamCoreMergedSnapshotApplied(replay.mergedOid as string)).toBe(true);
       expect(decode(await vault.read("notes/local.md"))).toBe("local update\n");
       expect(await reloaded.listPublicStagedChanges()).toEqual([{ path: "notes/local.md", status: "modified" }]);
       await reloaded.dropTeamCoreStash(transactionId, stashOid);
@@ -2157,7 +2195,7 @@ describe("Git repository adapter", () => {
     }
   });
 
-  it("only permits pull-first when a same-path remote update already equals the staged local content", async () => {
+  it("collapses an identical same-path update after replaying it onto the fetched remote", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-pull-first-overlap-"));
     try {
       const vault = new NodeVault(root);
@@ -2178,14 +2216,127 @@ describe("Git repository adapter", () => {
       await repo.stageManagedEventPath("notes/same.md");
       await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
       expect(await repo.assessPullFirstStash()).toEqual({ remoteChanged: true, canStash: true });
+      const transactionId = "1123456789abcdef01234567";
+      const stashOid = await repo.createTeamCoreStash(transactionId);
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const replay = await repo.planTeamCoreStashReplay(transactionId, stashOid);
+      expect(replay.conflicts).toEqual([]);
+      await repo.applyTeamCoreMergedSnapshot(replay.mergedOid as string);
+      expect(await repo.listPublicStagedChanges()).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
-      await vault.write("notes/same.md", encode("local version\n"));
-      await repo.stageManagedEventPath("notes/same.md");
-      await expect(repo.assessPullFirstStash()).resolves.toMatchObject({
-        remoteChanged: true,
-        canStash: false,
-        reason: expect.stringContaining("same.md")
-      });
+  it("three-way replays non-overlapping edits to different lines of the same file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-pull-first-three-way-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/shared.md", encode("first\nmiddle\nlast\n"));
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write("notes/shared.md", encode("remote first\nmiddle\nlast\n"));
+      const remoteCommit = await repo.commit("Remote update");
+      if (!remoteCommit) throw new Error("Expected remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write("notes/shared.md", encode("first\nmiddle\nlocal last\n"));
+      await repo.stageManagedEventPath("notes/shared.md");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+
+      expect(await repo.assessPullFirstStash()).toEqual({ remoteChanged: true, canStash: true });
+      const transactionId = "2123456789abcdef01234567";
+      const stashOid = await repo.createTeamCoreStash(transactionId);
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const replay = await repo.planTeamCoreStashReplay(transactionId, stashOid);
+      expect(replay.conflicts).toEqual([]);
+      await repo.applyTeamCoreMergedSnapshot(replay.mergedOid as string);
+      expect(decode(await vault.read("notes/shared.md"))).toBe("remote first\nmiddle\nlocal last\n");
+      expect(await repo.listPublicStagedChanges()).toEqual([{ path: "notes/shared.md", status: "modified" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("routes a true same-line checkpoint replay conflict through the existing editor without creating a commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-pull-first-conflict-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/shared.md", encode("base\n"));
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write("notes/shared.md", encode("remote\n"));
+      const remoteCommit = await repo.commit("Remote update");
+      if (!remoteCommit) throw new Error("Expected remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write("notes/shared.md", encode("local\n"));
+      await repo.stageManagedEventPath("notes/shared.md");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+      const transactionId = "3123456789abcdef01234567";
+      const stashOid = await repo.createTeamCoreStash(transactionId);
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const headBeforeResolution = await repo.headOid();
+
+      const replay = await repo.planTeamCoreStashReplay(transactionId, stashOid);
+      expect(replay.conflicts).toEqual(["notes/shared.md"]);
+      const session = await repo.getConflictEditorSession();
+      expect(session.files).toEqual([{ path: "notes/shared.md", base: "base\n", local: "local\n", remote: "remote\n" }]);
+      expect(await repo.resolveConflicts([{ path: "notes/shared.md", content: "combined\n" }])).toBe(headBeforeResolution);
+      expect(await repo.headOid()).toBe(headBeforeResolution);
+      expect(decode(await vault.read("notes/shared.md"))).toBe("combined\n");
+      expect(await repo.listPublicStagedChanges()).toEqual([{ path: "notes/shared.md", status: "modified" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the merged tree whitelist while replaying simultaneous shared-plugin additions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-pull-first-plugin-whitelist-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      const baseIgnore = updateSharedPluginsInGitignore("assets/\n私人笔记/\n", ".obsidian", []);
+      await vault.write(".gitignore", encode(baseIgnore));
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write(".gitignore", encode(updateSharedPluginsInGitignore(baseIgnore, ".obsidian", ["calendar"])));
+      await vault.write(".obsidian/plugins/calendar/main.js", encode("calendar remote\n"));
+      const remoteCommit = await repo.commit("Add calendar");
+      if (!remoteCommit) throw new Error("Expected remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write(".gitignore", encode(updateSharedPluginsInGitignore(baseIgnore, ".obsidian", ["dataview"])));
+      await vault.write(".obsidian/plugins/dataview/main.js", encode("dataview local\n"));
+      await repo.stageManagedEventPath(".gitignore");
+      await repo.stageManagedEventPath(".obsidian/plugins/dataview/main.js");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+
+      const transactionId = "4123456789abcdef01234567";
+      const stashOid = await repo.createTeamCoreStash(transactionId);
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const replay = await repo.planTeamCoreStashReplay(transactionId, stashOid);
+      expect(replay.conflicts).toEqual([]);
+      await repo.applyTeamCoreMergedSnapshot(replay.mergedOid as string);
+
+      expect(readSharedPluginIdsFromGitignore(decode(await vault.read(".gitignore")), ".obsidian")).toEqual(["calendar", "dataview"]);
+      expect(decode(await vault.read(".obsidian/plugins/calendar/main.js"))).toBe("calendar remote\n");
+      expect(decode(await vault.read(".obsidian/plugins/dataview/main.js"))).toBe("dataview local\n");
+      expect((await repo.listPublicStagedChanges()).map((change) => change.path)).toEqual([
+        ".gitignore",
+        ".obsidian/plugins/dataview/main.js"
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
