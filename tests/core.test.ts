@@ -257,6 +257,18 @@ describe("diagnostic logging", () => {
     ])).toHaveLength(1);
   });
 
+  it("retains sync timing evidence when a full attachment import exceeds the diagnostic cap", () => {
+    const logger = new PluginLogger(() => false);
+    logger.debug("Git fetch completed", { durationMs: 10_000, remoteRefChanged: true });
+    for (let index = 0; index < 1_000; index += 1) {
+      logger.debug("Attachment download completed", { path: `assets/${index}.png`, durationMs: 1 });
+      logger.debug("Sync progress advanced", { phase: "下载远端附件", current: index + 1, total: 1_000 });
+    }
+    const exported = JSON.parse(logger.exportText()) as { entries: Array<{ message: string }> };
+    expect(exported.entries).toHaveLength(800);
+    expect(exported.entries.some((entry) => entry.message === "Git fetch completed")).toBe(true);
+  });
+
   it("serializes settings and diagnostics writes without losing either change", async () => {
     const writes: Record<string, unknown>[] = [];
     const store = new SerializedPluginData({ retained: "value", diagnosticLogs: ["old"] }, async (data) => {

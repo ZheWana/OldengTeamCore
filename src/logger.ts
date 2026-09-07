@@ -3,6 +3,17 @@ import type { Logger } from "./types";
 const SECRET_KEYS = /(password|secret|accesskey|authorization|signature|token|credential)/i;
 const MAX_LOG_ENTRIES = 800;
 const MAX_STRING_LENGTH = 2_000;
+const VERBOSE_TRANSFER_MESSAGES = new Set([
+  "Attachment download started",
+  "Attachment Vault write started",
+  "Attachment Vault write completed",
+  "Attachment download completed",
+  "S3 response received",
+  "S3 download hash verification started",
+  "S3 download hash verification completed",
+  "S3 download chunk completed",
+  "Public attachment WebDAV request"
+]);
 
 export type LogLevel = "debug" | "warn" | "error";
 
@@ -11,6 +22,21 @@ export interface LogEntry {
   level: LogLevel;
   message: string;
   details?: unknown;
+}
+
+/**
+ * A full remote import can involve thousands of attachment transport events.
+ * Keep the bounded diagnostic log useful by evicting those per-object traces
+ * before phase summaries, HTTP timings, warnings, and errors.
+ */
+function isVerboseTransferEntry(entry: LogEntry): boolean {
+  if (VERBOSE_TRANSFER_MESSAGES.has(entry.message)) return true;
+  if (/^(GET|HEAD|PUT|DELETE) S3 object$/.test(entry.message)) return true;
+  if (entry.message !== "Sync progress advanced") return false;
+  const phase = entry.details && typeof entry.details === "object" && "phase" in entry.details
+    ? (entry.details as { phase?: unknown }).phase
+    : undefined;
+  return typeof phase === "string" && phase.includes("附件");
 }
 
 function redact(value: unknown, key?: string): unknown {
@@ -87,7 +113,10 @@ export class PluginLogger implements Logger {
       ...(details === undefined ? {} : { details: redact(details) })
     };
     this.records.push(entry);
-    if (this.records.length > MAX_LOG_ENTRIES) this.records.splice(0, this.records.length - MAX_LOG_ENTRIES);
+    while (this.records.length > MAX_LOG_ENTRIES) {
+      const verboseIndex = this.records.findIndex(isVerboseTransferEntry);
+      this.records.splice(verboseIndex < 0 ? 0 : verboseIndex, 1);
+    }
     const consoleDetails = entry.details;
     if (this.enabled()) {
       if (level === "debug") console.debug(`[Oldeng Team Core] ${entry.message}`, consoleDetails);
