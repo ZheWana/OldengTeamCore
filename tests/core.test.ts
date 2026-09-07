@@ -3201,4 +3201,136 @@ describe("Git repository adapter", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("replays two-client local changes through a real Smart HTTP remote", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-two-client-replay-"));
+    const bare = join(root, "repo.git");
+    const seed = join(root, "seed");
+    const clientA = join(root, "client-a");
+    const clientB = join(root, "client-b");
+    let server: Awaited<ReturnType<typeof startGitHttpServer>> | undefined;
+    try {
+      await runGit(["init", "--bare", bare]);
+      await runGit(["symbolic-ref", "HEAD", "refs/heads/main"], bare);
+      await runGit(["config", "http.receivepack", "true"], bare);
+      await mkdir(seed);
+      await runGit(["init"], seed);
+      await runGit(["checkout", "-b", "main"], seed);
+      await runGit(["config", "user.name", "Seed"], seed);
+      await runGit(["config", "user.email", "seed@example.test"], seed);
+      await mkdir(join(seed, "notes"), { recursive: true });
+      await mkdir(join(seed, ".obsidian", "plugins", "calendar"), { recursive: true });
+      await writeFile(join(seed, "notes", "shared.md"), "first\nmiddle\nlast\n");
+      await writeFile(join(seed, "notes", "conflict.md"), "base\n");
+      await writeFile(join(seed, ".gitignore"), updateSharedPluginsInGitignore("assets/\n私人笔记/\n", ".obsidian", ["calendar"]));
+      await writeFile(join(seed, ".obsidian", "plugins", "calendar", "data.json"), "{\"version\":1}\n");
+      await runGit(["add", "."], seed);
+      await runGit(["commit", "-m", "Base"], seed);
+      await runGit(["remote", "add", "origin", bare], seed);
+      await runGit(["push", "origin", "main"], seed);
+
+      server = await startGitHttpServer(root, async () => undefined);
+      const vaultA = new NodeVault(clientA);
+      const vaultB = new NodeVault(clientB);
+      await vaultA.mkdir("");
+      await vaultB.mkdir("");
+      const repoA = new GitRepository(vaultA, settings({ gitUrl: server.url }), logger, ".obsidian");
+      const repoB = new GitRepository(vaultB, settings({ gitUrl: server.url }), logger, ".obsidian");
+      await repoA.clone();
+      await repoB.clone();
+
+      // A and B edit different hunks of the same Markdown file. A's normal
+      // pull-first flow must preserve both edits and push one ordinary commit.
+      await vaultB.write("notes/shared.md", encode("remote first\nmiddle\nlast\n"));
+      const bFirstLineCommit = await repoB.commit("B changes first line");
+      expect(bFirstLineCommit).toBeTruthy();
+      await repoB.push();
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(bFirstLineCommit);
+      await vaultA.write("notes/shared.md", encode("first\nmiddle\nlocal last\n"));
+      await repoA.stageManagedEventPath("notes/shared.md");
+      await repoA.fetch();
+      expect(await repoA.assessPullFirstStash()).toEqual({ remoteChanged: true, canStash: true });
+      const mergeTransaction = "5123456789abcdef01234567";
+      const mergeStash = await repoA.createTeamCoreStash(mergeTransaction);
+      expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const mergeReplay = await repoA.planTeamCoreStashReplay(mergeTransaction, mergeStash);
+      expect(mergeReplay.conflicts).toEqual([]);
+      await repoA.applyTeamCoreMergedSnapshot(mergeReplay.mergedOid as string);
+      expect(decode(await vaultA.read("notes/shared.md"))).toBe("remote first\nmiddle\nlocal last\n");
+      expect(await repoA.commitStaged("A replayed edit")).toBeTruthy();
+      await repoA.push();
+      expect(await runGit(["show", "main:notes/shared.md"], bare)).toBe("remote first\nmiddle\nlocal last");
+
+      // B updates a shared plugin and A has independently staged exactly the
+      // same bytes. Replaying A's checkpoint must leave no outgoing change.
+      await repoB.fetch();
+      expect(await repoB.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      await vaultB.write(".obsidian/plugins/calendar/data.json", encode("{\"version\":2}\n"));
+      expect(await repoB.stageSharedPluginWorktreeChanges()).toEqual([".obsidian/plugins/calendar/data.json"]);
+      const bCalendarCommit = await repoB.commitStaged("B updates calendar");
+      expect(bCalendarCommit).toBeTruthy();
+      await repoB.push();
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(bCalendarCommit);
+      await vaultA.write(".obsidian/plugins/calendar/data.json", encode("{\"version\":2}\n"));
+      await repoA.stageManagedEventPath(".obsidian/plugins/calendar/data.json");
+      await repoA.fetch();
+      expect(await git.resolveRef({ fs: repoA.fs, dir: "", ref: "refs/remotes/origin/main" })).toBe(bCalendarCommit);
+      const identicalTransaction = "6123456789abcdef01234567";
+      const identicalStash = await repoA.createTeamCoreStash(identicalTransaction);
+      expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const identicalReplay = await repoA.planTeamCoreStashReplay(identicalTransaction, identicalStash);
+      expect(identicalReplay.conflicts).toEqual([]);
+      await repoA.applyTeamCoreMergedSnapshot(identicalReplay.mergedOid as string);
+      expect(await repoA.listPublicStagedChanges()).toEqual([]);
+      expect(await runGit(["show", "main:.obsidian/plugins/calendar/data.json"], bare)).toBe("{\"version\":2}");
+
+      // This is the state presented to a user before a destructive/config
+      // confirmation: remote changes are already present, while local index
+      // work remains private until the user chooses to commit and push it.
+      await vaultB.write("notes/cancel-remote.md", encode("remote arrives\n"));
+      const bCancelCommit = await repoB.commit("B remote before confirmation");
+      expect(bCancelCommit).toBeTruthy();
+      await repoB.push();
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(bCancelCommit);
+      await vaultA.write("notes/cancel-local.md", encode("keep local\n"));
+      await repoA.stageManagedEventPath("notes/cancel-local.md");
+      await repoA.fetch();
+      const cancelTransaction = "7123456789abcdef01234567";
+      const cancelStash = await repoA.createTeamCoreStash(cancelTransaction);
+      expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const cancelReplay = await repoA.planTeamCoreStashReplay(cancelTransaction, cancelStash);
+      await repoA.applyTeamCoreMergedSnapshot(cancelReplay.mergedOid as string);
+      expect(decode(await vaultA.read("notes/cancel-remote.md"))).toBe("remote arrives\n");
+      expect(await repoA.listPublicStagedChanges()).toEqual([{ path: "notes/cancel-local.md", status: "added" }]);
+      await expect(runGit(["show", "main:notes/cancel-local.md"], bare)).rejects.toThrow();
+      await repoA.discardManagedPathChange("notes/cancel-local.md");
+
+      // Competing edits to one hunk must stop before any push and use the
+      // conflict editor to produce a new ordinary local index change.
+      await vaultB.write("notes/conflict.md", encode("remote\n"));
+      const bConflictCommit = await repoB.commit("B conflicts");
+      expect(bConflictCommit).toBeTruthy();
+      await repoB.push();
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(bConflictCommit);
+      await vaultA.write("notes/conflict.md", encode("local\n"));
+      await repoA.stageManagedEventPath("notes/conflict.md");
+      await repoA.fetch();
+      const conflictTransaction = "8123456789abcdef01234567";
+      const conflictStash = await repoA.createTeamCoreStash(conflictTransaction);
+      expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const conflictReplay = await repoA.planTeamCoreStashReplay(conflictTransaction, conflictStash);
+      expect(conflictReplay.conflicts).toEqual(["notes/conflict.md"]);
+      const editor = await repoA.getConflictEditorSession();
+      expect(editor.files).toEqual([{ path: "notes/conflict.md", base: "base\n", local: "local\n", remote: "remote\n" }]);
+      const remoteHead = await repoA.headOid();
+      expect(await repoA.resolveConflicts([{ path: "notes/conflict.md", content: "combined\n" }])).toBe(remoteHead);
+      expect(await repoA.commitStaged("A resolves conflict")).toBeTruthy();
+      await repoA.push();
+      expect(await runGit(["show", "main:notes/conflict.md"], bare)).toBe("combined");
+      expect(await runGit(["log", "--format=%s", "main"], bare)).not.toContain("Team Core replay");
+    } finally {
+      if (server) await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
