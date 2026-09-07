@@ -18,6 +18,24 @@ export class S3PermanentError extends Error {
   }
 }
 
+/**
+ * A non-success response returned by the object store.  Keep its structured
+ * fields so callers can distinguish a transient service refusal from an
+ * invalid attachment, without parsing a user-facing error string.
+ */
+export class S3HttpError extends Error {
+  constructor(
+    public readonly method: string,
+    public readonly key: string,
+    public readonly status: number,
+    public readonly serviceCode?: string,
+    public readonly requestId?: string
+  ) {
+    super(`${method} ${key} failed with HTTP ${status}${serviceCode ? ` (${serviceCode})` : ""}${requestId ? ` [request ${requestId}]` : ""}`);
+    this.name = "S3HttpError";
+  }
+}
+
 interface S3Response {
   status: number;
   headers: Record<string, string>;
@@ -370,7 +388,15 @@ export class S3Transport {
 
   private async httpError(method: string, key: string, response: S3Response): Promise<Error> {
     if (response.status === 413) return new S3PermanentError(`Attachment exceeds provider limit: ${key}`);
-    return new Error(`${method} ${key} failed with HTTP ${response.status}`);
+    // S3-compatible providers generally return a compact XML error document.
+    // Preserve only its stable diagnostic fields; response bodies can contain
+    // provider-specific details and must never be copied into exported logs.
+    const body = new TextDecoder().decode(response.arrayBuffer);
+    const serviceCode = xmlTagText(body, "Code");
+    const requestId = response.headers["x-amz-request-id"]
+      ?? response.headers["x-qiniu-request-id"]
+      ?? xmlTagText(body, "RequestId");
+    return new S3HttpError(method, key, response.status, serviceCode, requestId);
   }
 }
 

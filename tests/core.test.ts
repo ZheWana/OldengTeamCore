@@ -1984,6 +1984,55 @@ describe("remote attachment materialization", () => {
     expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "device-b", "device-a", "wangzhe")).toBe(false);
     expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", undefined, "device-a", "wangzhe")).toBe(true);
   });
+
+  it("defers one transient 403 during a full import and continues with later attachments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-materialize-"));
+    const first = new TextEncoder().encode("first attachment");
+    const second = new TextEncoder().encode("second attachment");
+    const firstHash = await sha256Hex(first);
+    const secondHash = await sha256Hex(second);
+    const attempts: string[] = [];
+    let firstForbidden = true;
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      const hash = url.pathname.match(/sha256\/([0-9a-f]{64})$/i)?.[1];
+      if (!hash) { response.writeHead(404); response.end(); return; }
+      attempts.push(hash);
+      if (hash === firstHash && firstForbidden) {
+        firstForbidden = false;
+        response.writeHead(403, { "content-type": "application/xml", "x-amz-request-id": "retry-once" });
+        response.end("<Error><Code>SlowDown</Code><RequestId>retry-once</RequestId></Error>");
+        return;
+      }
+      const data = hash === firstHash ? first : second;
+      response.writeHead(200, { "content-length": String(data.byteLength), "content-type": "application/octet-stream" });
+      response.end(data);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Unable to resolve attachment test server port");
+    try {
+      const vault = new NodeVault(root);
+      const currentSettings = settings({ s3Endpoint: `http://127.0.0.1:${address.port}` });
+      const coordinator = new SyncCoordinator(coordinatorTestApp(vault), () => currentSettings, {
+        onSnapshot() {}, onNotice() {}, onRestartRequired() {}, onPrivateSyncState() {}
+      }, logger);
+      const manifest = createEmptyManifest();
+      manifest.files[`assets/tc-sha256-${firstHash}.bin`] = { ...entry, sha256: firstHash, size: first.byteLength, mime: "application/octet-stream" };
+      manifest.files[`assets/tc-sha256-${secondHash}.bin`] = { ...entry, sha256: secondHash, size: second.byteLength, mime: "application/octet-stream" };
+
+      await (coordinator as unknown as {
+        materializeRemoteAttachments(before: ReturnType<typeof createEmptyManifest>, after: ReturnType<typeof createEmptyManifest>, options: { deferRetryableFailures: boolean; retryDelaysMs: readonly number[] }): Promise<void>;
+      }).materializeRemoteAttachments(createEmptyManifest(), manifest, { deferRetryableFailures: true, retryDelaysMs: [0] });
+
+      expect(attempts).toEqual([firstHash, secondHash, firstHash]);
+      expect(new Uint8Array(await vault.read(`assets/tc-sha256-${firstHash}.bin`))).toEqual(first);
+      expect(new Uint8Array(await vault.read(`assets/tc-sha256-${secondHash}.bin`))).toEqual(second);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("sync push reconciliation", () => {

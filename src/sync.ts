@@ -6,7 +6,7 @@ import { GitRepository, isPushReconciliationError, type ConflictEditorSession, t
 import { PluginLogger } from "./logger";
 import { assetObjectId, createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, validateManifest, writeManifest } from "./manifest";
 import { createAttachmentStore } from "./attachment-store";
-import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
+import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3HttpError, S3NotFoundError } from "./s3";
 import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
 import { mimeFromPath } from "./mime";
 import type { AssetManifest, AssetManifestEntry, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PendingPublicMove, PrivateSyncState, PublicSyncTransaction, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
@@ -16,6 +16,14 @@ import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPlu
 const MAX_PUSH_RECONCILIATION_RETRIES = 2;
 const SHARED_PLUGIN_POLL_INTERVAL_MS = 15_000;
 const SHARED_PLUGIN_FORCE_CONTENT_CHECK_EVERY = 20;
+/** Initial full imports should survive a short-lived object-store refusal. */
+const FULL_IMPORT_ATTACHMENT_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+/** Three distinct access denials are overwhelmingly a configuration issue, not one bad object. */
+const FULL_IMPORT_MAX_DISTINCT_403 = 3;
+
+function isVaultFile(value: unknown): value is TFile {
+  return typeof TFile === "function" && value instanceof TFile;
+}
 export interface SyncCallbacks {
   onSnapshot(snapshot: SyncSnapshot): void;
   onNotice(message: string): void;
@@ -77,6 +85,19 @@ interface AttachmentPlan {
   mime: string;
   data?: ArrayBuffer;
   requiresUpload: boolean;
+}
+
+interface AttachmentMaterializationOptions {
+  /** Continue a full import after a retryable object-store failure. */
+  deferRetryableFailures?: boolean;
+  /** Internal test seam; production uses bounded exponential backoff. */
+  retryDelaysMs?: readonly number[];
+}
+
+interface DeferredAttachmentDownload {
+  path: string;
+  entry: AssetManifestEntry;
+  error: unknown;
 }
 
 export interface MarkdownSnapshot {
@@ -1326,7 +1347,9 @@ export class SyncCoordinator {
   }
 
   private async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
-    while (this.running) await this.running;
+    // A queued Vault event waits for an active sync, but must not inherit that
+    // sync's error and be reported as an unrelated staging failure.
+    while (this.running) await this.running.catch(() => undefined);
     let result!: T;
     const task = operation().then((value) => { result = value; });
     const running = task.finally(() => {
@@ -1384,7 +1407,9 @@ export class SyncCoordinator {
       this.startProgress("检查远端附件", 1);
       const remoteManifest = await readManifest(vault);
       this.advanceProgress(MANIFEST_PATH);
-      await this.materializeRemoteAttachments(createEmptyManifest(), remoteManifest);
+      await this.materializeRemoteAttachments(createEmptyManifest(), remoteManifest, {
+        deferRetryableFailures: true
+      });
       this.startProgress("整理本地目录", 1);
       await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
       this.advanceProgress();
@@ -1399,6 +1424,7 @@ export class SyncCoordinator {
       if (sharedPluginChanged) this.notifyRestartRequired();
       return sharedPluginChanged;
     } catch (error) {
+      this.progress = undefined;
       this.lastError = error instanceof Error ? error.message : String(error);
       this.setState(this.isOffline(error) ? "offline" : "error");
       throw error;
@@ -1913,6 +1939,7 @@ export class SyncCoordinator {
       for (const path of pendingAssets) this.pendingAssets.add(path);
       if (forceFullAttachmentScan) this.fullAttachmentScanPending = true;
       this.recoveryCommitPending ||= recoveryCommitPending;
+      this.progress = undefined;
       this.lastError = error instanceof Error ? error.message : String(error);
       if (this.isOffline(error)) this.setState("offline");
       else {
@@ -2818,11 +2845,11 @@ export class SyncCoordinator {
     return changed;
   }
 
-  private async materializeRemoteAttachments(before: AssetManifest, after: AssetManifest): Promise<void> {
+  private async materializeRemoteAttachments(before: AssetManifest, after: AssetManifest, options: AttachmentMaterializationOptions = {}): Promise<void> {
     this.pruneRemoteAttachmentIssues(after);
     const entries = Object.entries(after.files).filter(([path, entry]) => {
       const previous = before.files[path];
-      const localFileExists = this.app.vault.getAbstractFileByPath(path) instanceof TFile;
+      const localFileExists = isVaultFile(this.app.vault.getAbstractFileByPath(path));
       return this.remoteAttachmentIssues.has(path) || shouldMaterializeRemoteAttachment(previous, entry, localFileExists);
     });
     if (!entries.length) {
@@ -2836,73 +2863,123 @@ export class SyncCoordinator {
     const installationId = this.settings().installationId;
     const startedAt = Date.now();
     const candidateBytes = entries.reduce((total, [, entry]) => total + entry.size, 0);
+    const retryDelays = options.retryDelaysMs ?? FULL_IMPORT_ATTACHMENT_RETRY_DELAYS_MS;
     let downloaded = 0;
     let downloadedBytes = 0;
     let alreadyPresent = 0;
     let protectedLocal = 0;
-    this.logger.debug("Remote attachment materialization planned", { candidates: entries.length, candidateBytes });
+    let deferredFailures = 0;
+    let retryRound = 0;
+    let pending = entries;
+    const distinct403Objects = new Set<string>();
+    this.logger.debug("Remote attachment materialization planned", {
+      candidates: entries.length,
+      candidateBytes,
+      deferredRetries: options.deferRetryableFailures === true
+    });
     this.startProgress("下载远端附件", entries.length);
-    for (const [path, entry] of entries) {
-      try {
-        const localStat = await vault.stat(path);
-        const localHashNameMatches = hashFromAssetPath(path) === entry.sha256 && localStat?.type === "file" && localStat.size === entry.size;
-        let matches = localHashNameMatches;
-        if (!matches && localStat?.type === "file" && entry.size <= S3_CHUNKED_DOWNLOAD_THRESHOLD) {
-          const local = await vault.read(path);
-          matches = await sha256Hex(local) === entry.sha256;
-        }
-        if (matches) {
-          alreadyPresent += 1;
-          this.remoteAttachmentIssues.delete(path);
-          this.advanceProgress(path);
-          continue;
-        }
-        if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, entry.uploadedFrom, installationId, username)) {
-          protectedLocal += 1;
-          this.remoteAttachmentIssues.set(path, `本地附件与远端清单不一致，已保留本地文件：${path}`);
-          this.logger.warn("Local attachment differs from same-user manifest entry", { path, hash: entry.sha256 });
-          this.advanceProgress(path);
-          continue;
-        }
-        const downloadStartedAt = Date.now();
-        this.logger.debug("Attachment download started", { path, hash: entry.sha256, expectedSize: entry.size });
-        if (entry.size > S3_CHUNKED_DOWNLOAD_THRESHOLD) {
-          const temporaryPath = `${this.app.vault.configDir}/plugins/team-core/.downloads/${entry.sha256}.part`;
-          if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
-          this.internalAssetWrites.add(path);
-          try {
-            await attachmentStore.downloadInChunks(entry.sha256, entry.size, (chunk) => vault.append(temporaryPath, chunk));
-            this.logger.debug("Attachment Vault write started", { path, size: entry.size });
-            await vault.rename(temporaryPath, path);
-          } finally {
-            this.internalAssetWrites.delete(path);
-            if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
-          }
-          this.logger.debug("Attachment Vault write completed", { path, size: entry.size, durationMs: Date.now() - downloadStartedAt });
-          this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: entry.size, durationMs: Date.now() - downloadStartedAt });
-        } else {
-          const data = await attachmentStore.download(entry.sha256);
-          if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
-          this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
-          await vault.write(path, data);
-          this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
-          this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
-        }
-        downloaded += 1;
-        downloadedBytes += entry.size;
-        this.remoteAttachmentIssues.delete(path);
-      } catch (error) {
-        if (error instanceof S3NotFoundError) {
-          this.remoteAttachmentIssues.set(path, `远端附件对象暂不可用：${path}（${entry.sha256}）`);
-          this.logger.warn("Remote attachment object is missing", { path, hash: entry.sha256 });
-          this.advanceProgress(path);
-          continue;
-        }
-        this.logger.error("Attachment download failed", { path, hash: entry.sha256, error: String(error) });
-        throw error;
+
+    const materializeOne = async (path: string, entry: AssetManifestEntry): Promise<void> => {
+      const localStat = await vault.stat(path);
+      const localHashNameMatches = hashFromAssetPath(path) === entry.sha256 && localStat?.type === "file" && localStat.size === entry.size;
+      let matches = localHashNameMatches;
+      if (!matches && localStat?.type === "file" && entry.size <= S3_CHUNKED_DOWNLOAD_THRESHOLD) {
+        const local = await vault.read(path);
+        matches = await sha256Hex(local) === entry.sha256;
       }
-      this.advanceProgress(path);
-      if (Platform.isMobile) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      if (matches) {
+        alreadyPresent += 1;
+        this.remoteAttachmentIssues.delete(path);
+        return;
+      }
+      if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, entry.uploadedFrom, installationId, username)) {
+        protectedLocal += 1;
+        this.remoteAttachmentIssues.set(path, `本地附件与远端清单不一致，已保留本地文件：${path}`);
+        this.logger.warn("Local attachment differs from same-user manifest entry", { path, hash: entry.sha256 });
+        return;
+      }
+      const downloadStartedAt = Date.now();
+      this.logger.debug("Attachment download started", { path, hash: entry.sha256, expectedSize: entry.size });
+      if (entry.size > S3_CHUNKED_DOWNLOAD_THRESHOLD) {
+        const temporaryPath = `${this.app.vault.configDir}/plugins/team-core/.downloads/${entry.sha256}.part`;
+        if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
+        this.internalAssetWrites.add(path);
+        try {
+          await attachmentStore.downloadInChunks(entry.sha256, entry.size, (chunk) => vault.append(temporaryPath, chunk));
+          this.logger.debug("Attachment Vault write started", { path, size: entry.size });
+          await vault.rename(temporaryPath, path);
+        } finally {
+          this.internalAssetWrites.delete(path);
+          if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
+        }
+        this.logger.debug("Attachment Vault write completed", { path, size: entry.size, durationMs: Date.now() - downloadStartedAt });
+        this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: entry.size, durationMs: Date.now() - downloadStartedAt });
+      } else {
+        const data = await attachmentStore.download(entry.sha256);
+        if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
+        this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
+        await vault.write(path, data);
+        this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
+        this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
+      }
+      downloaded += 1;
+      downloadedBytes += entry.size;
+      this.remoteAttachmentIssues.delete(path);
+    };
+
+    while (pending.length) {
+      const deferred: DeferredAttachmentDownload[] = [];
+      for (const [path, entry] of pending) {
+        try {
+          await materializeOne(path, entry);
+          this.advanceProgress(path);
+        } catch (error) {
+          if (error instanceof S3NotFoundError) {
+            this.remoteAttachmentIssues.set(path, `远端附件对象暂不可用：${path}（${entry.sha256}）`);
+            this.logger.warn("Remote attachment object is missing", { path, hash: entry.sha256 });
+            this.advanceProgress(path);
+            continue;
+          }
+          if (!options.deferRetryableFailures || !this.isRetryableAttachmentDownloadError(error)) {
+            this.logger.error("Attachment download failed", { path, hash: entry.sha256, error: String(error) });
+            throw error;
+          }
+          deferred.push({ path, entry, error });
+          deferredFailures += 1;
+          if (error instanceof S3HttpError && error.status === 403) {
+            distinct403Objects.add(entry.sha256);
+            if (distinct403Objects.size >= FULL_IMPORT_MAX_DISTINCT_403) {
+              throw new Error(`对象存储连续拒绝读取 ${distinct403Objects.size} 个不同附件（HTTP 403）；已停止导入，请检查附件存储访问配置后重试。`);
+            }
+          }
+          this.logger.warn("Attachment download deferred", {
+            path,
+            hash: entry.sha256,
+            attempt: retryRound + 1,
+            error: String(error),
+            status: error instanceof S3HttpError ? error.status : undefined,
+            serviceCode: error instanceof S3HttpError ? error.serviceCode : undefined,
+            requestId: error instanceof S3HttpError ? error.requestId : undefined
+          });
+        }
+        if (Platform?.isMobile) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      }
+      if (!deferred.length) break;
+      if (retryRound >= retryDelays.length) {
+        for (const { path, entry, error } of deferred) {
+          this.remoteAttachmentIssues.set(path, `远端附件下载暂未完成：${path}（${entry.sha256}；已重试 ${retryRound} 次）`);
+          this.logger.error("Attachment download retries exhausted", { path, hash: entry.sha256, attempts: retryRound + 1, error: String(error) });
+          this.advanceProgress(path);
+        }
+        break;
+      }
+      const delayMs = retryDelays[retryRound];
+      retryRound += 1;
+      this.updateProgress("等待重试远端附件", this.progress?.current ?? 0, entries.length, `${deferred.length} 个附件将在 ${Math.ceil(delayMs / 1000)} 秒后重试`);
+      this.logger.debug("Attachment retry round scheduled", { round: retryRound, delayMs, deferred: deferred.length });
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      this.updateProgress("下载远端附件", this.progress?.current ?? 0, entries.length, `第 ${retryRound + 1} 轮`);
+      pending = deferred.map(({ path, entry }) => [path, entry]);
     }
     this.logger.debug("Remote attachment materialization completed", {
       durationMs: Date.now() - startedAt,
@@ -2911,8 +2988,17 @@ export class SyncCoordinator {
       downloaded,
       downloadedBytes,
       alreadyPresent,
-      protectedLocal
+      protectedLocal,
+      deferredFailures,
+      retryRounds: retryRound,
+      unresolved: this.remoteAttachmentIssues.size
     });
+  }
+
+  private isRetryableAttachmentDownloadError(error: unknown): boolean {
+    if (error instanceof S3HttpError) return [403, 408, 429, 500, 502, 503, 504].includes(error.status);
+    if (error instanceof S3NotFoundError) return false;
+    return this.isOffline(error);
   }
 
   /** Git may be up to date while attachment bytes are still temporarily unavailable. */
