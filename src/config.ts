@@ -166,9 +166,8 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     attachmentWebdavUrl: typeof input.attachmentWebdavUrl === "string" ? input.attachmentWebdavUrl : DEFAULT_SETTINGS.attachmentWebdavUrl,
     attachmentWebdavUsername: typeof input.attachmentWebdavUsername === "string" ? input.attachmentWebdavUsername : DEFAULT_SETTINGS.attachmentWebdavUsername,
     attachmentWebdavPassword: typeof input.attachmentWebdavPassword === "string" ? input.attachmentWebdavPassword : DEFAULT_SETTINGS.attachmentWebdavPassword,
-    // Existing local data keeps its prior save-debounce value as the new
-    // quiet window. The retired periodic interval intentionally has no
-    // replacement: automatic sync is now activity-driven only.
+    // Existing local data keeps its prior save-debounce value as the shared
+    // quiet window for both activity-driven sync and passive remote refresh.
     autoSyncIdleMs: typeof input.autoSyncIdleMs === "number"
       ? input.autoSyncIdleMs
       : typeof (input as { debounceMs?: unknown }).debounceMs === "number"
@@ -191,8 +190,7 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     installationId: normalizeInstallationId(input.installationId),
     pendingDeletionPaths: Array.isArray(input.pendingDeletionPaths) ? input.pendingDeletionPaths : DEFAULT_SETTINGS.pendingDeletionPaths,
     pendingDeletionFolders: Array.isArray(input.pendingDeletionFolders) ? input.pendingDeletionFolders : DEFAULT_SETTINGS.pendingDeletionFolders,
-    pendingPublicMoves: Array.isArray(input.pendingPublicMoves) ? input.pendingPublicMoves : DEFAULT_SETTINGS.pendingPublicMoves,
-    assetRetention: Array.isArray(input.assetRetention) ? input.assetRetention : DEFAULT_SETTINGS.assetRetention
+    pendingPublicMoves: Array.isArray(input.pendingPublicMoves) ? input.pendingPublicMoves : DEFAULT_SETTINGS.pendingPublicMoves
   });
 }
 
@@ -265,14 +263,7 @@ function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
     pendingDeletionFolders: Array.isArray(input.pendingDeletionFolders)
       ? [...new Set(input.pendingDeletionFolders.filter((path): path is string => typeof path === "string").map(normalizeVaultPath).filter(Boolean))].sort()
       : [],
-    pendingPublicMoves: normalizePendingPublicMoves(input.pendingPublicMoves),
-    assetRetention: Array.isArray(input.assetRetention)
-      ? input.assetRetention.filter((item): item is { sha256: string; size: number; markedAt: string } => Boolean(item && typeof item === "object"
-        && typeof (item as { sha256?: unknown }).sha256 === "string" && /^[0-9a-f]{64}$/i.test((item as { sha256: string }).sha256)
-        && Number.isSafeInteger((item as { size?: unknown }).size) && (item as { size: number }).size >= 0
-        && typeof (item as { markedAt?: unknown }).markedAt === "string" && !Number.isNaN(Date.parse((item as { markedAt: string }).markedAt))))
-        .map((item) => ({ sha256: item.sha256.toLowerCase(), size: item.size, markedAt: new Date(item.markedAt).toISOString() }))
-      : []
+    pendingPublicMoves: normalizePendingPublicMoves(input.pendingPublicMoves)
   };
   try {
     return { ...merged, authorDisplayMappings: normalizeAuthorDisplayMappings(input.authorDisplayMappings) };

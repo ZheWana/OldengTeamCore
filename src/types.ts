@@ -72,8 +72,6 @@ export interface TeamCoreSettings {
   pendingDeletionFolders: string[];
   /** Public Vault rename events awaiting an explicit sync-impact acknowledgement. */
   pendingPublicMoves: PendingPublicMove[];
-  /** Content-addressed public objects awaiting delayed garbage collection. */
-  assetRetention: AssetRetentionRecord[];
 }
 
 export const DEFAULT_SETTINGS: TeamCoreSettings = {
@@ -109,8 +107,7 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   installationId: "",
   pendingDeletionPaths: [],
   pendingDeletionFolders: [],
-  pendingPublicMoves: [],
-  assetRetention: []
+  pendingPublicMoves: []
 };
 
 export interface PendingPublicMove {
@@ -131,6 +128,12 @@ export interface AssetManifestEntry {
 export interface AssetManifest {
   version: 1;
   files: Record<string, AssetManifestEntry>;
+  /**
+   * Shared deletion tombstones for content-addressed attachment objects.
+   * These belong to the Git-tracked manifest rather than plugin-local state,
+   * so every member uses the same 30-day recovery window.
+   */
+  retired: Record<string, AssetRetentionRecord>;
 }
 
 export interface AssetRetentionRecord {

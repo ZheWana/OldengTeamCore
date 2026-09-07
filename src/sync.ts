@@ -4,12 +4,12 @@ import { FILE_AUTHORS_PATH, MANIFEST_PATH, DEFAULT_BRANCH, PRIVATE_FOLDER } from
 import { sha256Hex } from "./crypto";
 import { GitRepository, isPushReconciliationError, type ConflictEditorSession, type ConflictResolution, type PublicWorktreeChange } from "./git";
 import { PluginLogger } from "./logger";
-import { createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, validateManifest, writeManifest } from "./manifest";
+import { assetObjectId, createEmptyManifest, readManifest, removeManifestEntry, updateManifestEntry, validateManifest, writeManifest } from "./manifest";
 import { createAttachmentStore } from "./attachment-store";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
 import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
 import { mimeFromPath } from "./mime";
-import type { AssetManifest, AssetManifestEntry, AssetRetentionRecord, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PendingPublicMove, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
+import type { AssetManifest, AssetManifestEntry, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PendingPublicMove, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, readVaultInChunks, rewriteAssetReferences, VAULT_TRANSFER_CHUNK_SIZE, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
@@ -26,7 +26,6 @@ export interface SyncCallbacks {
   onPendingPublicMoves?(moves: PendingPublicMove[]): void | Promise<void>;
   confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<RemoteDeletionDecision>;
   confirmPublicConfigurationChanges?(changes: readonly PublicWorktreeChange[]): Promise<boolean>;
-  onAssetRetention?(records: AssetRetentionRecord[]): void | Promise<void>;
 }
 
 export interface ConnectionInfo {
@@ -391,8 +390,8 @@ export class SyncCoordinator {
   private pendingDraftPublications = new Map<symbol, { file: TFile; originalPath: string }>();
   private pendingNotePrivatizations = new Map<symbol, { file: TFile; originalPath: string }>();
   private internalCommunityPluginWriteDepth = 0;
+  /** One recurring quiet-window timer for public and private automatic sync. */
   private debounceTimer: number | undefined;
-  private privateDebounceTimer: number | undefined;
   private running: Promise<void> | undefined;
   private lastError = "";
   private lastSyncAt: number | undefined;
@@ -439,21 +438,13 @@ export class SyncCoordinator {
     const pollGeneration = ++this.sharedPluginPollGeneration;
     void this.initializeSharedPluginPoll(pollGeneration);
     this.sharedPluginPollTimer = window.setInterval(() => void this.pollSharedPluginChanges(false, pollGeneration), SHARED_PLUGIN_POLL_INTERVAL_MS);
-    if (!settings.autoSync) return;
-    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && settings.privateSyncEnabled && settings.privateSyncWithTeam)) {
-      this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().autoSyncIdleMs);
-    }
-    if (this.privateSyncDirty && settings.privateSyncEnabled && !settings.privateSyncWithTeam) {
-      this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.autoSyncIdleMs);
-    }
+    if (settings.autoSync) this.armAutomaticSyncTimer();
   }
 
   stop(): void {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
-    if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
     if (this.sharedPluginPollTimer !== undefined) window.clearInterval(this.sharedPluginPollTimer);
     this.debounceTimer = undefined;
-    this.privateDebounceTimer = undefined;
     this.sharedPluginPollTimer = undefined;
     this.sharedPluginFingerprint = undefined;
     this.sharedPluginPollCount = 0;
@@ -813,6 +804,15 @@ export class SyncCoordinator {
   private scheduleSync(): void {
     const generation = ++this.publicStateCheckGeneration;
     void this.refreshPublicEventState(generation);
+    this.armAutomaticSyncTimer();
+  }
+
+  /**
+   * The same user-facing quiet window controls both local auto-push and
+   * passive remote refresh. Every local activity restarts it; after a run it
+   * is armed again, so an idle Vault still periodically fetches teammate work.
+   */
+  private armAutomaticSyncTimer(): void {
     if (!this.settings().autoSync) return;
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = window.setTimeout(() => void this.flushDebounce(), this.settings().autoSyncIdleMs);
@@ -852,9 +852,7 @@ export class SyncCoordinator {
       return;
     }
     if (this.state !== "conflict") this.setState("local-changes");
-    if (!settings.autoSync) return;
-    if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
-    this.privateDebounceTimer = window.setTimeout(() => void this.flushPrivateDebounce(), settings.autoSyncIdleMs);
+    this.armAutomaticSyncTimer();
   }
 
   private privateRelativePath(path: string): string {
@@ -902,14 +900,18 @@ export class SyncCoordinator {
   async flushDebounce(): Promise<void> {
     if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = undefined;
-    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || (this.privateSyncDirty && this.settings().privateSyncWithTeam)) await this.runCycle(true);
-  }
-
-  private async flushPrivateDebounce(): Promise<void> {
-    if (this.privateDebounceTimer !== undefined) window.clearTimeout(this.privateDebounceTimer);
-    this.privateDebounceTimer = undefined;
-    if (this.privateSyncDirty && this.settings().privateSyncEnabled && !this.settings().privateSyncWithTeam) {
-      await this.syncPrivateNotes();
+    if (!this.settings().autoSync) return;
+    try {
+      // A public cycle always fetches and merges first. With no local changes
+      // it is therefore a cheap remote-refresh pass; with local changes it
+      // remains the existing complete bidirectional synchronization.
+      await this.runCycle(true);
+      if (this.settings().privateSyncEnabled && !this.settings().privateSyncWithTeam) {
+        await this.syncPrivateNotes();
+      }
+    } finally {
+      // An edit arriving while the cycle runs already armed a fresher window.
+      if (this.debounceTimer === undefined) this.armAutomaticSyncTimer();
     }
   }
 
@@ -1335,7 +1337,7 @@ export class SyncCoordinator {
     this.debounceTimer = undefined;
     this.setState("syncing");
     this.startProgress(force ? "等待重新同步" : "等待远端导入", 1);
-    return this.runExclusive(() => this.executeCloneRemote(force));
+    return this.runExclusive(() => this.executeCloneRemote(force)).finally(() => this.armAutomaticSyncTimer());
   }
 
   private async executeCloneRemote(force: boolean): Promise<boolean> {
@@ -1705,6 +1707,7 @@ export class SyncCoordinator {
       this.logger.error("Synchronization failed", { error: this.lastError });
     } finally {
       if (this.activeSyncRunId === syncRunId) this.activeSyncRunId = previousSyncRunId;
+      if (this.debounceTimer === undefined) this.armAutomaticSyncTimer();
     }
   }
 
@@ -1724,7 +1727,18 @@ export class SyncCoordinator {
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     const enabledStateChanged = await this.applySharedPluginState(vault);
     this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
-    await this.materializeRemoteAttachments(manifestBeforeRemote, await readManifest(vault));
+    let manifestAfterRemote = await readManifest(vault);
+    // New clients normally write the tombstone in the same deletion commit.
+    // This fallback also protects attachments deleted by an older client or by
+    // a direct Git change once a current client receives that commit.
+    const retainedManifest = this.recordRetiredAttachments(manifestBeforeRemote, manifestAfterRemote, true);
+    if (JSON.stringify(retainedManifest) !== JSON.stringify(manifestAfterRemote)) {
+      await writeManifest(vault, retainedManifest);
+      await git.stageManagedEventPath(MANIFEST_PATH);
+      this.hasPublicStagedChanges = true;
+      manifestAfterRemote = retainedManifest;
+    }
+    await this.materializeRemoteAttachments(manifestBeforeRemote, manifestAfterRemote);
     await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
     return { conflicts: [], deferred: false };
   }
@@ -1959,7 +1973,7 @@ export class SyncCoordinator {
         const currentManifest = await readManifest(vault);
         let nextManifest = shouldRestoreManifest ? headManifest : currentManifest;
         if (shouldRestoreManifest) restored.add(MANIFEST_PATH);
-        const materializationBefore: AssetManifest = { version: nextManifest.version, files: { ...nextManifest.files } };
+        const materializationBefore: AssetManifest = { version: nextManifest.version, files: { ...nextManifest.files }, retired: { ...nextManifest.retired } };
         for (const path of assetPaths) {
           const entry = headManifest.files[path];
           if (!entry) {
@@ -2005,7 +2019,7 @@ export class SyncCoordinator {
     this.logger.debug("Attachment candidates selected", { count: candidates.size, fullScan: forceFullScan, pendingAssets: pendingAssets.size, pendingNotes: pendingNotes.size });
     if (!candidates.size) {
       const manifestMissing = !(await vault.exists(MANIFEST_PATH));
-      await this.recordRetiredAttachments(manifest, next);
+      next = this.recordRetiredAttachments(manifest, next);
       if (next !== manifest || manifestMissing) await writeManifest(vault, next);
       return next !== manifest || manifestMissing;
     }
@@ -2106,45 +2120,50 @@ export class SyncCoordinator {
       }
     }
     const linksChanged = await this.rewriteLinksForRenames(renames);
+    next = this.recordRetiredAttachments(manifest, next);
     const manifestChanged = JSON.stringify(next) !== JSON.stringify(manifest);
-    await this.recordRetiredAttachments(manifest, next);
     if (manifestChanged) await writeManifest(vault, next);
     return manifestChanged || linksChanged;
   }
 
-  private async recordRetiredAttachments(before: AssetManifest, after: AssetManifest): Promise<void> {
-    const referenced = new Set(Object.values(after.files).map((entry) => `${entry.sha256}:${entry.size}`));
+  /** Update shared object tombstones after the last live reference is removed. */
+  private recordRetiredAttachments(before: AssetManifest, after: AssetManifest, preserveRemoteRetirements = false): AssetManifest {
+    const referencedBefore = new Set(Object.values(before.files).map(assetObjectId));
+    const referencedAfter = new Set(Object.values(after.files).map(assetObjectId));
     const now = new Date().toISOString();
-    const existing = this.settings().assetRetention ?? [];
-    const additions = Object.values(before.files)
-      .filter((entry) => !referenced.has(`${entry.sha256}:${entry.size}`))
-      .map((entry) => ({ sha256: entry.sha256, size: entry.size, markedAt: now } satisfies AssetRetentionRecord));
-    const merged = new Map(existing.map((entry) => [`${entry.sha256}:${entry.size}`, entry]));
-    for (const entry of additions) if (!merged.has(`${entry.sha256}:${entry.size}`)) merged.set(`${entry.sha256}:${entry.size}`, entry);
-    const next = [...merged.values()].sort((left, right) => left.markedAt.localeCompare(right.markedAt));
-    if (JSON.stringify(next) !== JSON.stringify(existing)) {
-      this.settings().assetRetention = next;
-      await this.callbacks.onAssetRetention?.(next);
+    const retired = { ...after.retired };
+    // A live reference revives the object and cancels any prior retirement.
+    for (const id of referencedAfter) delete retired[id];
+    // If an object had been revived and is deleted again, it receives a new
+    // full recovery window rather than inheriting an old tombstone timestamp.
+    for (const id of referencedBefore) {
+      if (!referencedAfter.has(id) && !(preserveRemoteRetirements && after.retired[id])) delete retired[id];
     }
+    for (const entry of Object.values(before.files)) {
+      const id = assetObjectId(entry);
+      if (!referencedAfter.has(id) && !(preserveRemoteRetirements && retired[id])) {
+        retired[id] = { sha256: entry.sha256, size: entry.size, markedAt: now };
+      }
+    }
+    const sorted = Object.fromEntries(Object.entries(retired).sort(([left], [right]) => left.localeCompare(right)));
+    if (JSON.stringify(sorted) === JSON.stringify(after.retired)) return after;
+    return { version: after.version, files: after.files, retired: sorted };
   }
 
   private async collectExpiredAttachmentRetention(vault: BinaryVault): Promise<void> {
-    const records = this.settings().assetRetention ?? [];
-    if (!records.length) return;
     const manifest = await readManifest(vault);
-    const referenced = new Set(Object.values(manifest.files).map((entry) => `${entry.sha256}:${entry.size}`));
+    const records = Object.values(manifest.retired);
+    if (!records.length) return;
+    const referenced = new Set(Object.values(manifest.files).map(assetObjectId));
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    const expired = records.filter((entry) => Date.parse(entry.markedAt) <= cutoff && !referenced.has(`${entry.sha256}:${entry.size}`));
+    const expired = records.filter((entry) => Date.parse(entry.markedAt) <= cutoff && !referenced.has(assetObjectId(entry)));
     if (!expired.length) return;
-      const store = createAttachmentStore(this.settings(), this.logger);
-    const git = this.createRepository(vault);
-    const historical = await git.historicalAttachmentObjects();
-    const collectible = expired.filter((entry) => !historical.has("*") && !historical.has(`${entry.sha256}:${entry.size}`));
-    for (const entry of collectible) await store.removeObject(entry.sha256);
-    const next = records.filter((entry) => !collectible.includes(entry));
-    this.settings().assetRetention = next;
-    await this.callbacks.onAssetRetention?.(next);
-    this.logger.debug("Expired public attachment retention records collected", { count: collectible.length, protectedByHistory: expired.length - collectible.length });
+    const store = createAttachmentStore(this.settings(), this.logger);
+    for (const entry of expired) await store.removeObject(entry.sha256);
+    // Keep the distributed tombstone as an audit record. A repeated delete is
+    // idempotent, while a later live reference removes it and starts a fresh
+    // 30-day window on its next deletion.
+    this.logger.debug("Expired public attachment retention records collected", { count: expired.length });
   }
 
   private async collectAttachmentCandidates(pendingNotes: ReadonlySet<string>, pendingAssets: ReadonlySet<string>, fullScan: boolean): Promise<Set<string>> {

@@ -1529,7 +1529,7 @@ export class TeamCoreSettingTab extends PluginSettingTab {
     input.value = String(Math.round(this.teamPlugin.teamCoreSettings.autoSyncIdleMs / 1_000));
     sentence.appendText("秒后同步");
     setting.settingEl.createDiv({
-      text: "任意公共修改都会重置倒计时；独立私人笔记同步使用同一等待时间。不会在无本地修改时主动拉取远端；手动同步不等待。",
+      text: "任意公共或私人修改都会重置倒计时。到时有本地修改时执行完整双向同步；没有本地修改时仅拉取远端更新。手动同步不等待。",
       cls: "team-core-auto-sync-window-desc"
     });
     input.addEventListener("change", () => {

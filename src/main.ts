@@ -41,6 +41,12 @@ export default class TeamCorePlugin extends Plugin {
     const storedData: unknown = await this.loadData() as unknown;
     this.persistentData = new SerializedPluginData(storedData, (data) => this.saveData(data));
     this.teamCoreSettings = mergeSettings(storedData);
+    // Attachment retirement is shared through .team/assets-manifest.json.
+    // Discard the former local-only queue rather than letting a device-specific
+    // timestamp continue to influence shared object cleanup.
+    if (storedData && typeof storedData === "object" && !Array.isArray(storedData) && "assetRetention" in storedData) {
+      await this.persistentData.remove(["assetRetention"]);
+    }
     if (!this.teamCoreSettings.installationId) {
       this.teamCoreSettings.installationId = createInstallationId();
       await this.persistentData.update({ installationId: this.teamCoreSettings.installationId });
@@ -82,11 +88,7 @@ export default class TeamCorePlugin extends Plugin {
         await this.saveSettings();
       },
       confirmRemoteDeletions: (paths) => this.confirmRemoteDeletions(paths),
-      confirmPublicConfigurationChanges: (changes) => this.confirmPublicConfigurationChanges(changes),
-      onAssetRetention: async (records) => {
-        this.teamCoreSettings.assetRetention = records;
-        await this.saveSettings();
-      }
+      confirmPublicConfigurationChanges: (changes) => this.confirmPublicConfigurationChanges(changes)
     }, this.logger);
     this.authorService = this.createFileAuthorService();
     this.addSettingTab(new TeamCoreSettingTab(this.app, this));

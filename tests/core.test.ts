@@ -245,6 +245,15 @@ describe("diagnostic logging", () => {
     ]);
     expect(writes.at(-1)).toEqual({ retained: "value", diagnosticLogs: ["new"], gitUrl: "https://git.example.test/updated.git", autoSync: true });
   });
+
+  it("removes retired local-only plugin fields without discarding unrelated data", async () => {
+    const writes: Record<string, unknown>[] = [];
+    const store = new SerializedPluginData({ gitUsername: "alice", assetRetention: [{ obsolete: true }], diagnosticLogs: ["keep"] }, async (data) => {
+      writes.push(data);
+    });
+    await store.remove(["assetRetention"]);
+    expect(writes).toEqual([{ gitUsername: "alice", diagnosticLogs: ["keep"] }]);
+  });
 });
 
 async function applyFiles(vault: NodeVault, changes: Record<string, string | null>): Promise<void> {
@@ -400,7 +409,7 @@ describe("configuration bundles", () => {
     expect("futureRuntimeCache" in mergeSettings(polluted)).toBe(false);
   });
 
-  it("restores local attachment retention and safety records from plugin data", () => {
+  it("keeps attachment recovery metadata out of plugin-local data", () => {
     const restored = mergeSettings({
       pendingDeletionPaths: ["notes/obsolete.md"],
       pendingDeletionFolders: ["notes"],
@@ -410,7 +419,7 @@ describe("configuration bundles", () => {
     expect(restored.pendingDeletionPaths).toEqual(["notes/obsolete.md"]);
     expect(restored.pendingDeletionFolders).toEqual(["notes"]);
     expect(restored.pendingPublicMoves).toEqual([{ from: "notes/a.md", to: "archive/a.md" }]);
-    expect(restored.assetRetention).toEqual([{ sha256: "a".repeat(64), size: 42, markedAt: "2026-09-06T00:00:00.000Z" }]);
+    expect("assetRetention" in restored).toBe(false);
   });
 
   it("preserves the automatic-sync choice and defaults legacy settings to enabled", () => {
@@ -1289,6 +1298,43 @@ describe("manifest and vault path rules", () => {
     const serialized = serializeManifest(manifest);
     expect(serialized.indexOf("assets/a.png")).toBeLessThan(serialized.indexOf("assets/z.pdf"));
     expect(validateManifest(createEmptyManifest())).toEqual(createEmptyManifest());
+  });
+
+  it("stores attachment retirement windows in the shared manifest and merges them safely", () => {
+    const retired = { sha256: "c".repeat(64), size: 42, markedAt: "2026-09-06T00:00:00.000Z" };
+    const legacy = validateManifest({ version: 1, files: {} });
+    expect(legacy.retired).toEqual({});
+
+    const ours = validateManifest({ version: 1, files: {}, retired: { [`${retired.sha256}:${retired.size}`]: retired } });
+    const theirs = validateManifest({
+      version: 1,
+      files: {
+        "assets/remote.png": {
+          sha256: "d".repeat(64),
+          size: 5,
+          mime: "image/png",
+          uploadedAt: "2026-09-06T00:00:00.000Z",
+          uploadedBy: "bob"
+        }
+      }
+    });
+    const merged = mergeAssetManifests(legacy, ours, theirs);
+    expect(merged?.retired).toEqual({ [`${retired.sha256}:${retired.size}`]: retired });
+
+    const revived = validateManifest({
+      version: 1,
+      files: {
+        "assets/revived.pdf": {
+          sha256: retired.sha256,
+          size: retired.size,
+          mime: "application/pdf",
+          uploadedAt: "2026-09-07T00:00:00.000Z",
+          uploadedBy: "alice"
+        }
+      },
+      retired: { [`${retired.sha256}:${retired.size}`]: retired }
+    });
+    expect(mergeAssetManifests(ours, revived, ours)?.retired).toEqual({});
   });
 
   it("rejects non-asset paths and invalid hashes", () => {
