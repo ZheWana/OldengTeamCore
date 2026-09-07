@@ -240,29 +240,71 @@ async function* responseBody(data: ArrayBuffer): AsyncIterableIterator<Uint8Arra
   yield new Uint8Array(data);
 }
 
-const http = {
-  async request(input: GitHttpRequest): Promise<GitHttpResponse> {
-    const body = await collectGitBody(input.body);
-    const request: RequestUrlParam = {
-      url: input.url,
-      method: input.method ?? "GET",
-      headers: input.headers,
-      body,
-      throw: false
-    };
-    const response = await requestUrl(request);
-    const headers: Record<string, string> = {};
-    for (const [name, value] of Object.entries(response.headers ?? {})) headers[name.toLowerCase()] = String(value);
-    return {
-      url: input.url,
-      method: input.method,
-      statusCode: response.status,
-      statusMessage: `HTTP ${response.status}`,
-      headers,
-      body: responseBody(response.arrayBuffer)
-    };
+function gitHttpEndpoint(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith("/info/refs")) return parsed.searchParams.get("service") ?? "info/refs";
+    if (parsed.pathname.endsWith("/git-upload-pack")) return "git-upload-pack";
+    if (parsed.pathname.endsWith("/git-receive-pack")) return "git-receive-pack";
+    return "other";
+  } catch {
+    return "unknown";
   }
-};
+}
+
+/**
+ * Obsidian's requestUrl gives us the complete Smart HTTP response before
+ * isomorphic-git parses it. Record only protocol metadata so diagnostics can
+ * distinguish server/transfer time from local pack and tree processing without
+ * ever retaining a repository URL or authentication material.
+ */
+function createGitHttp(logger: Logger) {
+  return {
+    async request(input: GitHttpRequest): Promise<GitHttpResponse> {
+      const startedAt = Date.now();
+      const endpoint = gitHttpEndpoint(input.url);
+      let body: ArrayBuffer | undefined;
+      try {
+        body = await collectGitBody(input.body);
+        const request: RequestUrlParam = {
+          url: input.url,
+          method: input.method ?? "GET",
+          headers: input.headers,
+          body,
+          throw: false
+        };
+        const response = await requestUrl(request);
+        const headers: Record<string, string> = {};
+        for (const [name, value] of Object.entries(response.headers ?? {})) headers[name.toLowerCase()] = String(value);
+        logger.debug("Git HTTP request completed", {
+          endpoint,
+          method: input.method ?? "GET",
+          status: response.status,
+          requestBytes: body?.byteLength ?? 0,
+          responseBytes: response.arrayBuffer.byteLength,
+          durationMs: Date.now() - startedAt
+        });
+        return {
+          url: input.url,
+          method: input.method,
+          statusCode: response.status,
+          statusMessage: `HTTP ${response.status}`,
+          headers,
+          body: responseBody(response.arrayBuffer)
+        };
+      } catch (error) {
+        logger.warn("Git HTTP request failed", {
+          endpoint,
+          method: input.method ?? "GET",
+          requestBytes: body?.byteLength ?? 0,
+          durationMs: Date.now() - startedAt,
+          error: String(error)
+        });
+        throw error;
+      }
+    }
+  };
+}
 
 class GitFsError extends Error {
   constructor(message: string, public readonly code: string) {
@@ -350,6 +392,7 @@ export function createGitFs(vault: BinaryVault) {
 
 export class GitRepository {
   readonly fs;
+  private readonly http: ReturnType<typeof createGitHttp>;
   /** Git trees are immutable; reuse security validation within one operation. */
   private readonly validatedManagedTrees = new Map<string, { files: string[]; sharedPluginIds: string[] }>();
   constructor(
@@ -360,6 +403,7 @@ export class GitRepository {
     private readonly sharedPluginIds: readonly string[] = []
   ) {
     this.fs = createGitFs(vault);
+    this.http = createGitHttp(logger);
   }
 
   private auth() {
@@ -368,7 +412,7 @@ export class GitRepository {
 
   private async gitOptions() {
     const credentials = this.auth();
-    return { fs: this.fs, dir: "", http, onAuth: credentials ? () => credentials : undefined };
+    return { fs: this.fs, dir: "", http: this.http, onAuth: credentials ? () => credentials : undefined };
   }
 
   async exists(): Promise<boolean> {
@@ -465,7 +509,7 @@ export class GitRepository {
     const gitUrl = normalizeGitUrl(this.settings.gitUrl);
     if (!gitUrl) throw new Error("Git URL is not configured");
     const credentials = this.auth();
-    const info = await git.getRemoteInfo({ url: gitUrl, http, onAuth: credentials ? () => credentials : undefined });
+    const info = await git.getRemoteInfo({ url: gitUrl, http: this.http, onAuth: credentials ? () => credentials : undefined });
     return normalizeRemoteInfo(info);
   }
 
@@ -1168,8 +1212,28 @@ export class GitRepository {
   }
 
   async fetch(): Promise<void> {
+    const startedAt = Date.now();
     await this.ensureRemote();
-    await git.fetch({ ...(await this.gitOptions()), remote: "origin", ref: DEFAULT_BRANCH, singleBranch: true, prune: false });
+    const preparedAt = Date.now();
+    const remoteRef = `refs/remotes/origin/${DEFAULT_BRANCH}`;
+    const before = await git.resolveRef({ fs: this.fs, dir: "", ref: remoteRef }).catch(() => undefined);
+    let lastProgress: Pick<GitProgressEvent, "phase" | "loaded" | "total"> | undefined;
+    await git.fetch({
+      ...(await this.gitOptions()),
+      remote: "origin",
+      ref: DEFAULT_BRANCH,
+      singleBranch: true,
+      prune: false,
+      onProgress: (event) => { lastProgress = { phase: event.phase, loaded: event.loaded, total: event.total }; }
+    });
+    const after = await git.resolveRef({ fs: this.fs, dir: "", ref: remoteRef }).catch(() => undefined);
+    this.logger.debug("Git fetch completed", {
+      durationMs: Date.now() - startedAt,
+      repositoryPreparationMs: preparedAt - startedAt,
+      transferAndPackProcessingMs: Date.now() - preparedAt,
+      remoteRefChanged: before !== after,
+      ...(lastProgress ? { progress: lastProgress } : {})
+    });
   }
 
   async mergeRemote(): Promise<{ merged: boolean; conflicts: string[] }> {

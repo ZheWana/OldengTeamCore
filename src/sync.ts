@@ -1522,7 +1522,15 @@ export class SyncCoordinator {
     this.startProgress("拉取远端更改", 1);
     await git.fetch();
     this.advanceProgress();
+    const assessmentStartedAt = Date.now();
     const assessment = await git.assessPullFirstStash();
+    this.logger.debug("Fetched remote change assessment completed", {
+      syncRunId,
+      durationMs: Date.now() - assessmentStartedAt,
+      remoteChanged: assessment.remoteChanged,
+      canCheckpointLocalIndex: assessment.canStash,
+      ...(assessment.reason ? { reason: assessment.reason } : {})
+    });
     if (!assessment.remoteChanged) return { conflicts: [], deferred: false };
     if (!assessment.canStash) {
       if (assessment.reason && assessment.reason !== "没有本地公共修改") {
@@ -1928,8 +1936,20 @@ export class SyncCoordinator {
     }
     this.startProgress("合并远端更改", 1);
     const previousSharedPluginIds = [...this.sharedPluginIds];
+    const changedPathsStartedAt = Date.now();
     const remoteWritePaths = await git.remoteChangedPaths();
+    this.logger.debug("Remote changed paths calculated", {
+      durationMs: Date.now() - changedPathsStartedAt,
+      count: remoteWritePaths.length
+    });
+    const mergeStartedAt = Date.now();
     const merge = await this.withInternalManagedWrites(remoteWritePaths, () => git.mergeRemote());
+    this.logger.debug("Git remote merge completed", {
+      durationMs: Date.now() - mergeStartedAt,
+      merged: merge.merged,
+      conflicts: merge.conflicts.length,
+      materializedPathCount: remoteWritePaths.length
+    });
     this.advanceProgress();
     if (merge.conflicts.length) return { conflicts: merge.conflicts, deferred: false };
     await this.reconcileMergedRemote(git, vault, manifestBeforeRemote, previousSharedPluginIds);
@@ -1938,9 +1958,12 @@ export class SyncCoordinator {
 
   /** Complete the local side effects of a successful Git remote merge. */
   private async reconcileMergedRemote(git: GitRepository, vault: BinaryVault, manifestBeforeRemote: AssetManifest, previousSharedPluginIds = [...this.sharedPluginIds]): Promise<void> {
+    const reconciliationStartedAt = Date.now();
+    const sharedPluginStartedAt = Date.now();
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     const enabledStateChanged = await this.applySharedPluginState(vault);
     this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
+    const manifestStartedAt = Date.now();
     let manifestAfterRemote = await readManifest(vault);
     // New clients normally write the tombstone in the same deletion commit.
     // This fallback also protects attachments deleted by an older client or by
@@ -1952,8 +1975,18 @@ export class SyncCoordinator {
       this.hasPublicStagedChanges = true;
       manifestAfterRemote = retainedManifest;
     }
+    const attachmentsStartedAt = Date.now();
     await this.materializeRemoteAttachments(manifestBeforeRemote, manifestAfterRemote);
+    const pruneStartedAt = Date.now();
     await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
+    this.logger.debug("Remote merge reconciliation completed", {
+      durationMs: Date.now() - reconciliationStartedAt,
+      sharedPluginStateMs: manifestStartedAt - sharedPluginStartedAt,
+      manifestAndRetentionMs: attachmentsStartedAt - manifestStartedAt,
+      attachmentMaterializationMs: pruneStartedAt - attachmentsStartedAt,
+      pruneEmptyFoldersMs: Date.now() - pruneStartedAt,
+      remoteManifestFiles: Object.keys(manifestAfterRemote.files).length
+    });
   }
 
   private async executePrivateNotesSync(vault: BinaryVault): Promise<void> {
@@ -2792,12 +2825,22 @@ export class SyncCoordinator {
       const localFileExists = this.app.vault.getAbstractFileByPath(path) instanceof TFile;
       return this.remoteAttachmentIssues.has(path) || shouldMaterializeRemoteAttachment(previous, entry, localFileExists);
     });
-    if (!entries.length) return;
+    if (!entries.length) {
+      this.logger.debug("Remote attachment materialization skipped", { candidates: 0 });
+      return;
+    }
     const vault = this.createVault();
     const attachmentStore = createAttachmentStore(this.settings(), this.logger);
     if (!attachmentStore.enabled()) throw new Error("公共附件对象存储配置不完整");
     const username = this.settings().gitUsername.trim() || "unknown";
     const installationId = this.settings().installationId;
+    const startedAt = Date.now();
+    const candidateBytes = entries.reduce((total, [, entry]) => total + entry.size, 0);
+    let downloaded = 0;
+    let downloadedBytes = 0;
+    let alreadyPresent = 0;
+    let protectedLocal = 0;
+    this.logger.debug("Remote attachment materialization planned", { candidates: entries.length, candidateBytes });
     this.startProgress("下载远端附件", entries.length);
     for (const [path, entry] of entries) {
       try {
@@ -2809,11 +2852,13 @@ export class SyncCoordinator {
           matches = await sha256Hex(local) === entry.sha256;
         }
         if (matches) {
+          alreadyPresent += 1;
           this.remoteAttachmentIssues.delete(path);
           this.advanceProgress(path);
           continue;
         }
         if (shouldProtectMismatchedLocalAttachment(localStat?.type === "file", entry.uploadedBy, entry.uploadedFrom, installationId, username)) {
+          protectedLocal += 1;
           this.remoteAttachmentIssues.set(path, `本地附件与远端清单不一致，已保留本地文件：${path}`);
           this.logger.warn("Local attachment differs from same-user manifest entry", { path, hash: entry.sha256 });
           this.advanceProgress(path);
@@ -2843,6 +2888,8 @@ export class SyncCoordinator {
           this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
           this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
         }
+        downloaded += 1;
+        downloadedBytes += entry.size;
         this.remoteAttachmentIssues.delete(path);
       } catch (error) {
         if (error instanceof S3NotFoundError) {
@@ -2857,6 +2904,15 @@ export class SyncCoordinator {
       this.advanceProgress(path);
       if (Platform.isMobile) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
     }
+    this.logger.debug("Remote attachment materialization completed", {
+      durationMs: Date.now() - startedAt,
+      candidates: entries.length,
+      candidateBytes,
+      downloaded,
+      downloadedBytes,
+      alreadyPresent,
+      protectedLocal
+    });
   }
 
   /** Git may be up to date while attachment bytes are still temporarily unavailable. */
