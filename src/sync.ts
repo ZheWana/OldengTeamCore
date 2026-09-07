@@ -2160,9 +2160,14 @@ export class SyncCoordinator {
     if (!expired.length) return;
     const store = createAttachmentStore(this.settings(), this.logger);
     for (const entry of expired) await store.removeObject(entry.sha256);
-    // Keep the distributed tombstone as an audit record. A repeated delete is
-    // idempotent, while a later live reference removes it and starts a fresh
-    // 30-day window on its next deletion.
+    const retired = { ...manifest.retired };
+    for (const entry of expired) delete retired[assetObjectId(entry)];
+    await writeManifest(vault, { version: manifest.version, files: manifest.files, retired });
+    const git = this.createRepository(vault);
+    await git.stageManagedEventPath(MANIFEST_PATH);
+    this.hasPublicStagedChanges = true;
+    // Persist the completed collection so every device stops considering this
+    // object eligible for another cleanup request.
     this.logger.debug("Expired public attachment retention records collected", { count: expired.length });
   }
 
