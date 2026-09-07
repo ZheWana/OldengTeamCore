@@ -9,7 +9,7 @@ import { createAttachmentStore } from "./attachment-store";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3NotFoundError } from "./s3";
 import { PrivateNotesSynchronizer, type PrivateSyncResult } from "./private-sync";
 import { mimeFromPath } from "./mime";
-import type { AssetManifest, AssetManifestEntry, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PendingPublicMove, PrivateSyncState, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
+import type { AssetManifest, AssetManifestEntry, LocalChangeCategory, LocalChangeItem, LocalChangeSnapshot, LocalChangeStatus, Logger, PendingPublicMove, PrivateSyncState, PublicSyncTransaction, SyncProgress, SyncSnapshot, SyncState, TeamCoreSettings } from "./types";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, createVaultAdapter, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, readVaultInChunks, rewriteAssetReferences, VAULT_TRANSFER_CHUNK_SIZE, type BinaryVault } from "./vault";
 import { applySharedPluginState as applySharedPluginStateToVault, isCommunityPluginStatePath, readCommunityPluginIds, readSharedPluginIds, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, writeSharedPluginIds, writeSharedPluginState } from "./shared-plugins";
 
@@ -24,6 +24,7 @@ export interface SyncCallbacks {
   onPendingDeletionPaths?(paths: string[]): void | Promise<void>;
   onPendingDeletionFolders?(folders: string[]): void | Promise<void>;
   onPendingPublicMoves?(moves: PendingPublicMove[]): void | Promise<void>;
+  onPublicSyncTransaction?(transaction: PublicSyncTransaction | undefined): void | Promise<void>;
   confirmRemoteDeletions?(groups: RemoteDeletionGroups): Promise<RemoteDeletionDecision>;
   confirmPublicConfigurationChanges?(changes: readonly PublicWorktreeChange[]): Promise<boolean>;
 }
@@ -385,6 +386,8 @@ export class SyncCoordinator {
   private privateStatePersistence: Promise<void> = Promise.resolve();
   private internalMarkdownWrites = new Set<string>();
   private internalAssetWrites = new Set<string>();
+  /** Exact public paths written by a Team Core Git transaction, not user edits. */
+  private internalManagedWrites = new Set<string>();
   private internalDraftNoteMoves = new Set<string>();
   private fileMoveRevisions = new WeakMap<TFile, number>();
   private pendingDraftPublications = new Map<symbol, { file: TFile; originalPath: string }>();
@@ -509,6 +512,7 @@ export class SyncCoordinator {
 
   markFileChanged(file: TFile): void {
     const path = normalizeVaultPath(file.path);
+    if (this.internalManagedWrites.delete(path)) return;
     if (this.internalAssetWrites.delete(path)) return;
     if (isPrivatePath(path)) {
       if (!shouldTrackPrivateSyncEvent(this.settings())) return;
@@ -546,6 +550,7 @@ export class SyncCoordinator {
 
   markFileDeleted(file: TFile): void {
     const path = normalizeVaultPath(file.path);
+    if (this.internalManagedWrites.delete(path)) return;
     this.forgetPendingPublicMoves(path);
     if (path === MANIFEST_PATH) {
       this.fullAttachmentScanPending = true;
@@ -644,6 +649,11 @@ export class SyncCoordinator {
   markFileRenamed(file: TFile, oldPath: string): void {
     const previous = normalizeVaultPath(oldPath);
     const current = normalizeVaultPath(file.path);
+    if (this.internalManagedWrites.has(previous) || this.internalManagedWrites.has(current)) {
+      this.internalManagedWrites.delete(previous);
+      this.internalManagedWrites.delete(current);
+      return;
+    }
     const moveRevision = (this.fileMoveRevisions.get(file) ?? 0) + 1;
     this.fileMoveRevisions.set(file, moveRevision);
     if (this.internalDraftNoteMoves.has(previous) || this.internalDraftNoteMoves.has(current)) {
@@ -1461,6 +1471,152 @@ export class SyncCoordinator {
     }
   }
 
+  /** Persisted before each non-idempotent pull-first transaction step. */
+  private async persistPublicSyncTransaction(transaction: PublicSyncTransaction | undefined): Promise<void> {
+    this.settings().publicSyncTransaction = transaction;
+    await this.callbacks.onPublicSyncTransaction?.(transaction);
+  }
+
+  private createPublicSyncTransaction(baseOid: string): PublicSyncTransaction {
+    const bytes = new Uint8Array(12);
+    crypto.getRandomValues(bytes);
+    return {
+      version: 1,
+      id: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      baseOid,
+      phase: "preparing",
+      startedAt: new Date().toISOString()
+    };
+  }
+
+  /**
+   * Vault events are asynchronous even for our own Git tree materialization.
+   * Mark only the exact affected public paths so they cannot be re-staged as
+   * user edits while the transaction temporarily moves them through HEAD.
+   */
+  private async withInternalManagedWrites<T>(paths: readonly string[], operation: () => Promise<T>): Promise<T> {
+    const marked = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))];
+    for (const path of marked) this.internalManagedWrites.add(path);
+    try {
+      return await operation();
+    } finally {
+      // Obsidian normally dispatches adapter events before the write promise
+      // resolves. Remove any unmatched markers immediately so a subsequent
+      // real user edit is never swallowed.
+      for (const path of marked) this.internalManagedWrites.delete(path);
+    }
+  }
+
+  /**
+   * Fetch and, where it is provably safe, merge the remote before asking the
+   * user to confirm a local public-configuration change.  A native Git stash
+   * holds the indexed local delta, while data.json records the exact recovery
+   * phase in case Obsidian reloads or exits in the middle of the operation.
+   */
+  private async pullRemoteBeforeLocalConfirmation(git: GitRepository, vault: BinaryVault, syncRunId: number): Promise<RemoteReconciliationResult> {
+    const manifestBeforeRemote = await readManifest(vault);
+    this.startProgress("拉取远端更改", 1);
+    await git.fetch();
+    this.advanceProgress();
+    const assessment = await git.assessPullFirstStash();
+    if (!assessment.remoteChanged) return { conflicts: [], deferred: false };
+    if (!assessment.canStash) {
+      if (assessment.reason && assessment.reason !== "没有本地公共修改") {
+        this.logger.debug("Pull-first transaction deferred to regular Git flow", { syncRunId, reason: assessment.reason });
+      }
+      // A clean local index can still merge now; only overlapping local work
+      // stays on the established commit-first path below.
+      if (!await git.hasStagedPublicChanges()) return this.mergeFetchedRemote(git, vault, manifestBeforeRemote);
+      return { conflicts: [], deferred: false };
+    }
+    const baseOid = await git.headOid();
+    if (!baseOid) return { conflicts: [], deferred: false };
+    let transaction = this.createPublicSyncTransaction(baseOid);
+    await this.persistPublicSyncTransaction(transaction);
+    try {
+      const localPaths = (await git.listPublicStagedChanges()).map((change) => change.path);
+      const stashOid = await this.withInternalManagedWrites(localPaths, () => git.createTeamCoreStash(transaction.id));
+      transaction = { ...transaction, phase: "stashed", stashOid };
+      await this.persistPublicSyncTransaction(transaction);
+      this.hasPublicStagedChanges = false;
+      const reconciliation = await this.mergeFetchedRemote(git, vault, manifestBeforeRemote, true);
+      if (reconciliation.conflicts.length || reconciliation.deferred) return reconciliation;
+      transaction = { ...transaction, phase: "remote-merged" };
+      await this.persistPublicSyncTransaction(transaction);
+      transaction = { ...transaction, phase: "restoring" };
+      await this.persistPublicSyncTransaction(transaction);
+      await this.withInternalManagedWrites(localPaths, () => git.applyTeamCoreStash(transaction.id, stashOid));
+      transaction = { ...transaction, phase: "restored" };
+      await this.persistPublicSyncTransaction(transaction);
+      await git.dropTeamCoreStash(transaction.id, stashOid);
+      await this.persistPublicSyncTransaction(undefined);
+      this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+      this.logger.debug("Pull-first transaction restored local index", { syncRunId, transactionId: transaction.id, stashOid });
+      return { conflicts: [], deferred: false };
+    } catch (error) {
+      // Do not clear the persisted checkpoint. Startup recovery can still
+      // inspect the Team Core-owned stash and restore the original local work.
+      this.logger.error("Pull-first transaction interrupted", { syncRunId, transactionId: transaction.id, phase: transaction.phase, error: String(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * Restores an interrupted pull-first transaction before normal state
+   * detection starts. The restore is deliberately local-only: after a crash
+   * we first guarantee the user's local changes are back, then the next sync
+   * can safely resume its normal remote refresh.
+   */
+  async recoverPublicSyncTransaction(): Promise<void> {
+    await this.runExclusive(async () => {
+      const transaction = this.settings().publicSyncTransaction;
+      if (!transaction) return;
+      const vault = this.createVault();
+      const git = this.createRepository(vault);
+      if (!(await git.exists())) {
+        this.logger.warn("Pending pull-first transaction retained because the local Git repository is unavailable", { transactionId: transaction.id, phase: transaction.phase });
+        return;
+      }
+      const stashOid = await git.findTeamCoreStash(transaction.id, transaction.stashOid);
+      if (!stashOid) {
+        if (transaction.phase === "preparing") {
+          await this.persistPublicSyncTransaction(undefined);
+          return;
+        }
+        if (transaction.phase === "restored") {
+          await this.persistPublicSyncTransaction(undefined);
+          return;
+        }
+        throw new Error("检测到未完成同步事务，但对应的 Team Core 暂存不存在；已停止同步以保护本地修改");
+      }
+      if (transaction.phase === "restoring") {
+        if (!await git.isTeamCoreStashRestored(stashOid)) {
+          throw new Error("上次同步在恢复本地修改时中断，且只恢复了部分内容；已保留暂存，请先处理冲突后再同步");
+        }
+      } else {
+        const currentHead = await git.headOid();
+        if (currentHead && currentHead !== transaction.baseOid) {
+          // A crash can occur after Git has advanced HEAD but before the
+          // reconciliation phase was persisted. Re-run the idempotent local
+          // materialization before restoring the stashed paths.
+          await this.reconcileMergedRemote(git, vault, createEmptyManifest());
+        }
+        await this.persistPublicSyncTransaction({ ...transaction, stashOid, phase: "restoring" });
+        const restorePaths = await git.teamCoreStashPaths(stashOid);
+        await this.withInternalManagedWrites(restorePaths, () => git.applyTeamCoreStash(transaction.id, stashOid));
+        if (!await git.isTeamCoreStashRestored(stashOid)) {
+          throw new Error("未完成同步事务只恢复了部分文件；已保留暂存，拒绝自动重复恢复");
+        }
+      }
+      await this.persistPublicSyncTransaction({ ...transaction, stashOid, phase: "restored" });
+      await git.dropTeamCoreStash(transaction.id, stashOid);
+      await this.persistPublicSyncTransaction(undefined);
+      this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+      this.logger.warn("Recovered interrupted pull-first transaction", { transactionId: transaction.id, phase: transaction.phase });
+      this.callbacks.onNotice("已恢复上次中断同步中的本地修改；远端更新将在下一次同步时继续处理。");
+    });
+  }
+
   private async executeCycle(): Promise<void> {
     const syncRunId = ++this.syncRunSequence;
     const previousSyncRunId = this.activeSyncRunId;
@@ -1518,6 +1674,12 @@ export class SyncCoordinator {
           syncRunId,
           paths: directSharedPluginChanges
         });
+      }
+      this.hasPublicStagedChanges = await git.hasStagedPublicChanges();
+      const earlyRemote = await this.pullRemoteBeforeLocalConfirmation(git, vault, syncRunId);
+      if (earlyRemote.conflicts.length) {
+        this.enterConflict(earlyRemote.conflicts);
+        return;
       }
       if (this.pendingDraftPublications.size || this.pendingNotePrivatizations.size) {
         for (const path of pendingNotes) this.pendingFiles.add(path);
@@ -1711,19 +1873,26 @@ export class SyncCoordinator {
     }
   }
 
-  private async mergeFetchedRemote(git: GitRepository, vault: BinaryVault, manifestBeforeRemote: AssetManifest): Promise<RemoteReconciliationResult> {
+  private async mergeFetchedRemote(git: GitRepository, vault: BinaryVault, manifestBeforeRemote: AssetManifest, allowStashedLocalSignals = false): Promise<RemoteReconciliationResult> {
     // A note may be edited while fetch is in flight. Defer the merge so the
     // next cycle commits that event-derived edit before checkout can
     // materialize remote data. Full worktree recovery is an explicit startup
     // boundary, not part of every incremental merge.
-    if (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || this.fullAttachmentScanPending || this.recoveryCommitPending) {
+    if (!allowStashedLocalSignals && (this.hasPublicStagedChanges || this.pendingFiles.size || this.pendingAssets.size || this.fullAttachmentScanPending || this.recoveryCommitPending)) {
       return { conflicts: [], deferred: true };
     }
     this.startProgress("合并远端更改", 1);
     const previousSharedPluginIds = [...this.sharedPluginIds];
-    const merge = await git.mergeRemote();
+    const remoteWritePaths = await git.remoteChangedPaths();
+    const merge = await this.withInternalManagedWrites(remoteWritePaths, () => git.mergeRemote());
     this.advanceProgress();
     if (merge.conflicts.length) return { conflicts: merge.conflicts, deferred: false };
+    await this.reconcileMergedRemote(git, vault, manifestBeforeRemote, previousSharedPluginIds);
+    return { conflicts: [], deferred: false };
+  }
+
+  /** Complete the local side effects of a successful Git remote merge. */
+  private async reconcileMergedRemote(git: GitRepository, vault: BinaryVault, manifestBeforeRemote: AssetManifest, previousSharedPluginIds = [...this.sharedPluginIds]): Promise<void> {
     this.sharedPluginIds = await readSharedPluginIds(vault, this.app.vault.configDir);
     const enabledStateChanged = await this.applySharedPluginState(vault);
     this.recordSharedPluginChange(previousSharedPluginIds, this.sharedPluginIds, enabledStateChanged);
@@ -1740,7 +1909,6 @@ export class SyncCoordinator {
     }
     await this.materializeRemoteAttachments(manifestBeforeRemote, manifestAfterRemote);
     await pruneEmptyManagedFolders(vault, this.app.vault.configDir);
-    return { conflicts: [], deferred: false };
   }
 
   private async executePrivateNotesSync(vault: BinaryVault): Promise<void> {

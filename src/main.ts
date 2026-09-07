@@ -87,6 +87,10 @@ export default class TeamCorePlugin extends Plugin {
         this.teamCoreSettings.pendingPublicMoves = moves;
         await this.saveSettings();
       },
+      onPublicSyncTransaction: async (transaction) => {
+        this.teamCoreSettings.publicSyncTransaction = transaction;
+        await this.saveSettings();
+      },
       confirmRemoteDeletions: (paths) => this.confirmRemoteDeletions(paths),
       confirmPublicConfigurationChanges: (changes) => this.confirmPublicConfigurationChanges(changes)
     }, this.logger);
@@ -156,6 +160,7 @@ export default class TeamCorePlugin extends Plugin {
         if (file instanceof TFile) this.coordinator.markFileChanged(file);
       }));
       void this.coordinator.prepareLocalVault()
+        .then(() => this.coordinator.recoverPublicSyncTransaction())
         .then(() => this.coordinator.refreshState())
         .catch((error) => new Notice(`无法创建“私人笔记”文件夹：${error instanceof Error ? error.message : String(error)}`))
         .finally(() => this.coordinator.start());

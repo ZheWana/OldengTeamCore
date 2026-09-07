@@ -1,4 +1,4 @@
-import type { PrivateSyncEntry, PrivateSyncState, TeamCoreSettings } from "./types";
+import type { PrivateSyncEntry, PrivateSyncState, PublicSyncTransaction, TeamCoreSettings } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { base64UrlDecodeBytes, base64UrlEncodeBytes } from "./crypto";
 import { normalizeAuthorDisplayMappings } from "./author-display";
@@ -190,7 +190,8 @@ export function mergeSettings(data: unknown): TeamCoreSettings {
     installationId: normalizeInstallationId(input.installationId),
     pendingDeletionPaths: Array.isArray(input.pendingDeletionPaths) ? input.pendingDeletionPaths : DEFAULT_SETTINGS.pendingDeletionPaths,
     pendingDeletionFolders: Array.isArray(input.pendingDeletionFolders) ? input.pendingDeletionFolders : DEFAULT_SETTINGS.pendingDeletionFolders,
-    pendingPublicMoves: Array.isArray(input.pendingPublicMoves) ? input.pendingPublicMoves : DEFAULT_SETTINGS.pendingPublicMoves
+    pendingPublicMoves: Array.isArray(input.pendingPublicMoves) ? input.pendingPublicMoves : DEFAULT_SETTINGS.pendingPublicMoves,
+    publicSyncTransaction: normalizePublicSyncTransaction(input.publicSyncTransaction)
   });
 }
 
@@ -244,6 +245,26 @@ function normalizePendingPublicMoves(value: unknown): TeamCoreSettings["pendingP
   return [...moves.values()].sort((left, right) => left.from.localeCompare(right.from));
 }
 
+function normalizePublicSyncTransaction(value: unknown): PublicSyncTransaction | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Partial<PublicSyncTransaction>;
+  const phase = input.phase;
+  if (input.version !== 1
+    || typeof input.id !== "string" || !/^[a-f0-9]{24}$/i.test(input.id)
+    || typeof input.baseOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.baseOid)
+    || (phase !== "preparing" && phase !== "stashed" && phase !== "remote-merged" && phase !== "restoring" && phase !== "restored")
+    || typeof input.startedAt !== "string" || !Number.isFinite(Date.parse(input.startedAt))
+    || (input.stashOid !== undefined && (typeof input.stashOid !== "string" || !/^[a-f0-9]{40}$/i.test(input.stashOid)))) return undefined;
+  return {
+    version: 1,
+    id: input.id.toLowerCase(),
+    baseOid: input.baseOid.toLowerCase(),
+    phase,
+    startedAt: input.startedAt,
+    ...(input.stashOid ? { stashOid: input.stashOid.toLowerCase() } : {})
+  };
+}
+
 function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
   const merged: TeamCoreSettings = {
     ...DEFAULT_SETTINGS,
@@ -263,7 +284,8 @@ function normalizeSettings(input: TeamCoreSettings): TeamCoreSettings {
     pendingDeletionFolders: Array.isArray(input.pendingDeletionFolders)
       ? [...new Set(input.pendingDeletionFolders.filter((path): path is string => typeof path === "string").map(normalizeVaultPath).filter(Boolean))].sort()
       : [],
-    pendingPublicMoves: normalizePendingPublicMoves(input.pendingPublicMoves)
+    pendingPublicMoves: normalizePendingPublicMoves(input.pendingPublicMoves),
+    publicSyncTransaction: normalizePublicSyncTransaction(input.publicSyncTransaction)
   };
   try {
     return { ...merged, authorDisplayMappings: normalizeAuthorDisplayMappings(input.authorDisplayMappings) };

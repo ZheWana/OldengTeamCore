@@ -2115,6 +2115,82 @@ describe("Git repository adapter", () => {
     }
   });
 
+  it("parks a safe staged change, merges remote work, and restores the local index", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-pull-first-stash-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/local.md", encode("base\n"));
+      await vault.write("notes/remote.md", encode("base\n"));
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write("notes/remote.md", encode("remote update\n"));
+      const remoteCommit = await repo.commit("Remote update");
+      if (!remoteCommit) throw new Error("Expected remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write("notes/local.md", encode("local update\n"));
+      await repo.stageManagedEventPath("notes/local.md");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+
+      expect(await repo.assessPullFirstStash()).toEqual({ remoteChanged: true, canStash: true });
+      const transactionId = "0123456789abcdef01234567";
+      const stashOid = await repo.createTeamCoreStash(transactionId);
+      expect(await repo.listPublicStagedChanges()).toEqual([]);
+      expect(await repo.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      expect(decode(await vault.read("notes/remote.md"))).toBe("remote update\n");
+      // A fresh adapter instance represents an Obsidian reload between the
+      // remote merge and local-change restoration.
+      const reloaded = new GitRepository(vault, settings(), logger, ".obsidian");
+      expect(await reloaded.findTeamCoreStash(transactionId, stashOid)).toBe(stashOid);
+      await reloaded.applyTeamCoreStash(transactionId, stashOid);
+      expect(await reloaded.isTeamCoreStashRestored(stashOid)).toBe(true);
+      expect(decode(await vault.read("notes/local.md"))).toBe("local update\n");
+      expect(await reloaded.listPublicStagedChanges()).toEqual([{ path: "notes/local.md", status: "modified" }]);
+      await reloaded.dropTeamCoreStash(transactionId, stashOid);
+      await expect(reloaded.findTeamCoreStash(transactionId, stashOid)).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("only permits pull-first when a same-path remote update already equals the staged local content", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-pull-first-overlap-"));
+    try {
+      const vault = new NodeVault(root);
+      const repo = new GitRepository(vault, settings(), logger, ".obsidian");
+      await repo.init();
+      await vault.write("notes/same.md", encode("version 1\n"));
+      await repo.commit("Base");
+      await git.branch({ fs: repo.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "remote" });
+      await vault.write("notes/same.md", encode("version 2\n"));
+      await repo.stageManagedEventPath("notes/same.md");
+      const remoteCommit = await repo.commitStaged("Plugin update");
+      if (!remoteCommit) throw new Error("Expected remote commit");
+
+      await git.checkout({ fs: repo.fs, dir: "", ref: "main" });
+      await vault.write("notes/same.md", encode("version 2\n"));
+      await repo.stageManagedEventPath("notes/same.md");
+      await git.writeRef({ fs: repo.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+      expect(await repo.assessPullFirstStash()).toEqual({ remoteChanged: true, canStash: true });
+
+      await vault.write("notes/same.md", encode("local version\n"));
+      await repo.stageManagedEventPath("notes/same.md");
+      await expect(repo.assessPullFirstStash()).resolves.toMatchObject({
+        remoteChanged: true,
+        canStash: false,
+        reason: expect.stringContaining("same.md")
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not read personal plugin files for a remote Markdown-only merge", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-fast-personal-plugin-merge-"));
     try {

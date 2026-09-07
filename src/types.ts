@@ -72,6 +72,13 @@ export interface TeamCoreSettings {
   pendingDeletionFolders: string[];
   /** Public Vault rename events awaiting an explicit sync-impact acknowledgement. */
   pendingPublicMoves: PendingPublicMove[];
+  /**
+   * Local-only checkpoint for the pull-first public synchronization transaction.
+   * It deliberately references a Git stash rather than carrying note bytes in
+   * data.json, so an interrupted operation can be recovered without copying
+   * the knowledge base into plugin settings.
+   */
+  publicSyncTransaction?: PublicSyncTransaction;
 }
 
 export const DEFAULT_SETTINGS: TeamCoreSettings = {
@@ -107,12 +114,24 @@ export const DEFAULT_SETTINGS: TeamCoreSettings = {
   installationId: "",
   pendingDeletionPaths: [],
   pendingDeletionFolders: [],
-  pendingPublicMoves: []
+  pendingPublicMoves: [],
+  publicSyncTransaction: undefined
 };
 
 export interface PendingPublicMove {
   from: string;
   to: string;
+}
+
+export interface PublicSyncTransaction {
+  version: 1;
+  id: string;
+  /** HEAD when the temporary stash was created. */
+  baseOid: string;
+  /** Git's temporary-stash lifecycle; persisted before each non-idempotent step. */
+  phase: "preparing" | "stashed" | "remote-merged" | "restoring" | "restored";
+  startedAt: string;
+  stashOid?: string;
 }
 
 export interface AssetManifestEntry {

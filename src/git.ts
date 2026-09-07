@@ -60,6 +60,13 @@ export interface PublicWorktreeChange {
   status: "added" | "modified" | "deleted";
 }
 
+/** Whether the current index can safely be parked while fetched remote work is merged. */
+export interface PullFirstStashAssessment {
+  remoteChanged: boolean;
+  canStash: boolean;
+  reason?: string;
+}
+
 export interface ConflictFileVersion {
   path: string;
   base?: string;
@@ -447,6 +454,11 @@ export class GitRepository {
   async remoteUrl(): Promise<string | undefined> {
     const value: unknown = await git.getConfig({ fs: this.fs, dir: "", path: "remote.origin.url" }).catch(() => undefined);
     return typeof value === "string" ? value : undefined;
+  }
+
+  /** Current local HEAD, exposed for durable synchronization checkpoints. */
+  async headOid(): Promise<string | undefined> {
+    return git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
   }
 
   /** Read one file from the current local HEAD without touching the worktree. */
@@ -911,6 +923,108 @@ export class GitRepository {
     return (await this.listPublicStagedChanges()).length > 0;
   }
 
+  /**
+   * Checks whether a fetched remote can be merged while the current public
+   * index is temporarily stashed.  We only allow this when every path changed
+   * by both sides already has identical final Git content.  This makes the
+   * later stash application a restoration step, never an implicit overwrite.
+   */
+  async assessPullFirstStash(): Promise<PullFirstStashAssessment> {
+    const local = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    const remote = await git.resolveRef({ fs: this.fs, dir: "", ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }).catch(() => undefined);
+    if (!local || !remote || local === remote) return { remoteChanged: false, canStash: false };
+    const remotePaths = await this.changedTreePaths(local, remote);
+    if (!remotePaths.length) return { remoteChanged: false, canStash: false };
+    const staged = await this.listPublicStagedChanges();
+    if (!staged.length) return { remoteChanged: true, canStash: false, reason: "没有本地公共修改" };
+    if (await this.hasUnstagedPublicChanges()) {
+      return { remoteChanged: true, canStash: false, reason: "存在尚未进入 Git 暂存区的公共修改" };
+    }
+    const stagedPaths = new Set(staged.map((change) => change.path));
+    for (const path of remotePaths) {
+      if (!stagedPaths.has(path)) continue;
+      if (!await this.indexMatchesTreePath(remote, path)) {
+        return { remoteChanged: true, canStash: false, reason: `本地与远端同时修改了 ${path}` };
+      }
+    }
+    return { remoteChanged: true, canStash: true };
+  }
+
+  /** Paths a fetched remote would materialize into the managed worktree. */
+  async remoteChangedPaths(): Promise<string[]> {
+    const local = await git.resolveRef({ fs: this.fs, dir: "", ref: "HEAD" }).catch(() => undefined);
+    const remote = await git.resolveRef({ fs: this.fs, dir: "", ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }).catch(() => undefined);
+    if (!local || !remote || local === remote) return [];
+    return this.changedTreePaths(local, remote);
+  }
+
+  /** Create a single-use Team Core checkpoint without touching refs/stash or its reflog. */
+  async createTeamCoreStash(transactionId: string): Promise<string> {
+    if (!/^[a-f0-9]{24}$/i.test(transactionId)) throw new Error("同步暂存事务标识无效");
+    // isomorphic-git's stash implementation reads identity from .git/config
+    // (unlike our normal commit wrapper, which passes it per call). We use
+    // `create` only: push/apply rely on a reflog path that is not portable
+    // across Obsidian's filesystem adapters.
+    const username = this.settings.gitUsername.trim() || "unknown";
+    const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
+    await git.setConfig({ fs: this.fs, dir: "", path: "user.name", value: username });
+    await git.setConfig({ fs: this.fs, dir: "", path: "user.email", value: email });
+    const oid = await git.stash({ fs: this.fs, dir: "", op: "create", message: `Team Core sync ${transactionId}` });
+    if (typeof oid !== "string" || !/^[a-f0-9]{40}$/i.test(oid)) throw new Error("创建同步暂存失败，未生成有效的 Git 快照");
+    await git.writeRef({ fs: this.fs, dir: "", ref: this.teamCoreStashRef(transactionId), value: oid, force: true });
+    const base = await this.stashBaseOid(oid);
+    const paths = await this.changedTreePaths(base, oid);
+    await this.materializeIndexTreePaths(base, paths);
+    const verified = await this.findTeamCoreStash(transactionId, oid);
+    if (!verified) throw new Error("创建同步暂存后无法验证临时引用，已停止继续同步");
+    return verified;
+  }
+
+  async findTeamCoreStash(transactionId: string, expectedOid?: string): Promise<string | undefined> {
+    const oid = await git.resolveRef({ fs: this.fs, dir: "", ref: this.teamCoreStashRef(transactionId) }).catch(() => undefined);
+    if (!oid || (expectedOid && oid !== expectedOid)) return undefined;
+    const commit = await git.readCommit({ fs: this.fs, dir: "", oid }).catch(() => undefined);
+    const message = commit?.commit.message ?? "";
+    return message.startsWith(`Team Core sync ${transactionId}:`) ? oid : undefined;
+  }
+
+  /**
+   * A recovery probe for the narrow interruption window after stash apply.
+   * The transaction is considered restored only if all paths contained by the
+   * stash have reached its final index tree; partial application stays
+   * recoverable and is never applied a second time automatically.
+   */
+  async isTeamCoreStashRestored(stashOid: string): Promise<boolean> {
+    const stash = await git.readCommit({ fs: this.fs, dir: "", oid: stashOid });
+    const baseOid = stash.commit.parent?.[0];
+    if (!baseOid) return false;
+    const paths = await this.changedTreePaths(baseOid, stashOid);
+    return Promise.all(paths.map((path) => this.indexMatchesTreePath(stashOid, path))).then((values) => values.every(Boolean));
+  }
+
+  async teamCoreStashPaths(stashOid: string): Promise<string[]> {
+    return this.changedTreePaths(await this.stashBaseOid(stashOid), stashOid);
+  }
+
+  async applyTeamCoreStash(transactionId: string, stashOid: string): Promise<void> {
+    if (!(await this.findTeamCoreStash(transactionId, stashOid))) {
+      throw new Error("同步暂存已改变或不属于 Team Core，已停止恢复以保护本地修改");
+    }
+    const base = await this.stashBaseOid(stashOid);
+    const paths = await this.changedTreePaths(base, stashOid);
+    await this.materializeIndexTreePaths(stashOid, paths);
+    if (!await this.isTeamCoreStashRestored(stashOid)) {
+      throw new Error("同步暂存只恢复了一部分文件，已保留恢复点；请使用冲突编辑器或重新启动插件继续处理");
+    }
+  }
+
+  async dropTeamCoreStash(transactionId: string, stashOid: string): Promise<void> {
+    if (!(await this.findTeamCoreStash(transactionId, stashOid))) {
+      throw new Error("同步暂存已改变或不属于 Team Core，拒绝删除");
+    }
+    await git.deleteRef({ fs: this.fs, dir: "", ref: this.teamCoreStashRef(transactionId) });
+  }
+
   /** Commit the existing managed index delta without re-reading the worktree. */
   async commitStaged(message: string): Promise<string | undefined> {
     await this.repairIndexBoundary();
@@ -1019,10 +1133,66 @@ export class GitRepository {
           if (previous && current && await previous.oid() === await current.oid()) return null;
           return undefined;
         }
-        return await previous?.oid() === await current?.oid() ? undefined : normalizeVaultPath(path);
+        return previous && current && await previous.oid() === await current.oid() && await previous.mode() === await current.mode()
+          ? undefined
+          : normalizeVaultPath(path);
       }
     }) as string[] | undefined) ?? [];
     return changed.map(normalizeVaultPath).sort();
+  }
+
+  private async indexMatchesTreePath(treeOid: string, targetPath: string): Promise<boolean> {
+    let matches = false;
+    await walk({
+      fs: this.fs,
+      dir: "",
+      trees: [STAGE(), TREE({ ref: treeOid })],
+      map: async (path, [stage, tree]) => {
+        if (normalizeVaultPath(path) !== normalizeVaultPath(targetPath)) return undefined;
+        if (!stage || !tree) {
+          matches = !stage && !tree;
+          return undefined;
+        }
+        matches = await stage.oid() === await tree.oid() && await stage.mode() === await tree.mode();
+        return undefined;
+      }
+    });
+    return matches;
+  }
+
+  private teamCoreStashRef(transactionId: string): string {
+    return `refs/team-core/sync/${transactionId}`;
+  }
+
+  private async stashBaseOid(stashOid: string): Promise<string> {
+    const stash = await git.readCommit({ fs: this.fs, dir: "", oid: stashOid });
+    const base = stash.commit.parent?.[0];
+    if (!base) throw new Error("同步暂存缺少基线提交，无法安全恢复");
+    return base;
+  }
+
+  /** Materialize only known public paths from a Git tree and set their exact index entries. */
+  private async materializeIndexTreePaths(treeOid: string, paths: readonly string[]): Promise<void> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const tracked = new Set(await git.listFiles({ fs: this.fs, dir: "", ref: treeOid }));
+    for (const path of [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort()) {
+      if (!isManagedPath(path, this.configDir, sharedPluginIds)) throw new Error(`同步暂存包含禁止同步路径：${path}`);
+      if (tracked.has(path)) {
+        await this.writeTreeFile(treeOid, path);
+        await git.resetIndex({ fs: this.fs, dir: "", filepath: path, ref: treeOid });
+      } else {
+        if (await this.vault.exists(path)) await this.vault.remove(path);
+        await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
+      }
+    }
+  }
+
+  private async hasUnstagedPublicChanges(): Promise<boolean> {
+    const sharedPluginIds = await this.currentSharedPluginIds();
+    const matrix = await this.publicStatusMatrix();
+    return matrix.some(([path, _head, workdir, stage]) => (
+      isManagedPath(path, this.configDir, sharedPluginIds) && workdir !== stage
+    ));
   }
 
   /**
