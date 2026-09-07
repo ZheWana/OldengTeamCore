@@ -3467,6 +3467,7 @@ describe("Git repository adapter", () => {
       ]]);
       expect(deletionPrompts).toEqual([]);
       expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(baseHead);
+      expect(coordinator.snapshot()).toMatchObject({ state: "local-changes", progress: undefined });
 
       await repository.discardManagedPathChange(".gitignore");
       await repository.discardManagedPathChange(".obsidian/plugins/calendar/data.json");
@@ -3485,6 +3486,7 @@ describe("Git repository adapter", () => {
       }]);
       expect(configPrompts).toHaveLength(1);
       expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(baseHead);
+      expect(coordinator.snapshot()).toMatchObject({ state: "local-changes", progress: undefined });
     } finally {
       if (server) await server.close();
       await rm(root, { recursive: true, force: true });

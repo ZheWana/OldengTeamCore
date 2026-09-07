@@ -1789,7 +1789,7 @@ export class SyncCoordinator {
         if (!decision.confirmed) {
           for (const path of pendingNotes) this.pendingFiles.add(path);
           for (const path of pendingAssets) this.pendingAssets.add(path);
-          this.setState("local-changes");
+          this.cancelPendingSynchronization("remote deletion confirmation was declined");
           return;
         }
         if (decision.restorePaths.length) {
@@ -1824,7 +1824,7 @@ export class SyncCoordinator {
         if (!confirmed) {
           for (const path of pendingNotes) this.pendingFiles.add(path);
           for (const path of pendingAssets) this.pendingAssets.add(path);
-          this.setState("local-changes");
+          this.cancelPendingSynchronization("public configuration confirmation was declined");
           return;
         }
       }
@@ -2105,6 +2105,24 @@ export class SyncCoordinator {
     // A no-op/deferred cycle must settle directly on "synced"; otherwise the
     // status bar can remain stuck at "待同步" until the next plugin reload.
     void this.refreshState();
+  }
+
+  /**
+   * A confirmation dialog can be reached after remote attachments were
+   * materialized. Cancelling must therefore clear that completed/interrupted
+   * progress before returning to the pending-local-change state; otherwise
+   * the status bar misleadingly keeps showing the previous download counter.
+   */
+  private cancelPendingSynchronization(reason: string): void {
+    this.progress = undefined;
+    this.lastError = "";
+    this.logger.debug("Synchronization cancelled by confirmation dialog", {
+      syncRunId: this.activeSyncRunId,
+      reason,
+      pendingFiles: this.pendingFiles.size,
+      pendingAssets: this.pendingAssets.size
+    });
+    this.setState("local-changes");
   }
 
   /**
