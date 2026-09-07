@@ -3246,6 +3246,7 @@ describe("Git repository adapter", () => {
       await mkdir(join(seed, ".obsidian", "plugins", "calendar"), { recursive: true });
       await writeFile(join(seed, "notes", "shared.md"), "first\nmiddle\nlast\n");
       await writeFile(join(seed, "notes", "conflict.md"), "base\n");
+      await writeFile(join(seed, "notes", "delete-conflict.md"), "base\n");
       await writeFile(join(seed, ".gitignore"), updateSharedPluginsInGitignore("assets/\n私人笔记/\n", ".obsidian", ["calendar"]));
       await writeFile(join(seed, ".obsidian", "plugins", "calendar", "data.json"), "{\"version\":1}\n");
       await runGit(["add", "."], seed);
@@ -3371,6 +3372,34 @@ describe("Git repository adapter", () => {
       await repoA.push();
       expect(await runGit(["show", "main:notes/conflict.md"], bare)).toBe("combined");
       expect(await runGit(["log", "--format=%s", "main"], bare)).not.toContain("Team Core replay");
+
+      // A deletes a tracked note while B edits it remotely. This is a
+      // modify/delete conflict, so it must stop before deletion confirmation
+      // or push. Closing the editor leaves the checkpoint and remote version
+      // intact until the user explicitly chooses delete or keep/edit remote.
+      await repoB.fetch();
+      expect(await repoB.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      await vaultB.write("notes/delete-conflict.md", encode("remote edit\n"));
+      const bModifyBeforeDelete = await repoB.commit("B edits note A deleted");
+      expect(bModifyBeforeDelete).toBeTruthy();
+      await repoB.push();
+      await vaultA.remove("notes/delete-conflict.md");
+      await repoA.stageManagedEventPath("notes/delete-conflict.md");
+      await repoA.fetch();
+      const deleteConflictTransaction = "a123456789abcdef01234567";
+      const deleteConflictStash = await repoA.createTeamCoreStash(deleteConflictTransaction);
+      expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const deleteConflictReplay = await repoA.planTeamCoreStashReplay(deleteConflictTransaction, deleteConflictStash);
+      expect(deleteConflictReplay.conflicts).toEqual(["notes/delete-conflict.md"]);
+      expect((await repoA.getConflictEditorSession()).files).toEqual([{
+        path: "notes/delete-conflict.md",
+        base: "base\n",
+        local: undefined,
+        remote: "remote edit\n"
+      }]);
+      expect(await repoA.findTeamCoreStash(deleteConflictTransaction, deleteConflictStash)).toBe(deleteConflictStash);
+      expect(await runGit(["show", "main:notes/delete-conflict.md"], bare)).toBe("remote edit");
+      expect(await repoA.conflictedFiles()).toEqual(["notes/delete-conflict.md"]);
     } finally {
       if (server) await server.close();
       await rm(root, { recursive: true, force: true });
