@@ -3284,6 +3284,25 @@ describe("Git repository adapter", () => {
       expect(await repoA.listPublicStagedChanges()).toEqual([]);
       expect(await runGit(["show", "main:.obsidian/plugins/calendar/data.json"], bare)).toBe("{\"version\":2}");
 
+      // The same collapse rule applies to ordinary Markdown, not just to
+      // plugin configuration: both clients create the same new article, B
+      // pushes first, and A must not create a duplicate commit after fetch.
+      await vaultB.write("notes/identical.md", encode("same article\n"));
+      const bIdenticalNoteCommit = await repoB.commit("B adds shared note");
+      expect(bIdenticalNoteCommit).toBeTruthy();
+      await repoB.push();
+      await vaultA.write("notes/identical.md", encode("same article\n"));
+      await repoA.stageManagedEventPath("notes/identical.md");
+      await repoA.fetch();
+      const identicalNoteTransaction = "7123456789abcdef01234567";
+      const identicalNoteStash = await repoA.createTeamCoreStash(identicalNoteTransaction);
+      expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
+      const identicalNoteReplay = await repoA.planTeamCoreStashReplay(identicalNoteTransaction, identicalNoteStash);
+      expect(identicalNoteReplay.conflicts).toEqual([]);
+      await repoA.applyTeamCoreMergedSnapshot(identicalNoteReplay.mergedOid as string);
+      expect(await repoA.listPublicStagedChanges()).toEqual([]);
+      expect(await runGit(["show", "main:notes/identical.md"], bare)).toBe("same article");
+
       // This is the state presented to a user before a destructive/config
       // confirmation: remote changes are already present, while local index
       // work remains private until the user chooses to commit and push it.
@@ -3295,7 +3314,7 @@ describe("Git repository adapter", () => {
       await vaultA.write("notes/cancel-local.md", encode("keep local\n"));
       await repoA.stageManagedEventPath("notes/cancel-local.md");
       await repoA.fetch();
-      const cancelTransaction = "7123456789abcdef01234567";
+      const cancelTransaction = "8123456789abcdef01234567";
       const cancelStash = await repoA.createTeamCoreStash(cancelTransaction);
       expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
       const cancelReplay = await repoA.planTeamCoreStashReplay(cancelTransaction, cancelStash);
@@ -3315,7 +3334,7 @@ describe("Git repository adapter", () => {
       await vaultA.write("notes/conflict.md", encode("local\n"));
       await repoA.stageManagedEventPath("notes/conflict.md");
       await repoA.fetch();
-      const conflictTransaction = "8123456789abcdef01234567";
+      const conflictTransaction = "9123456789abcdef01234567";
       const conflictStash = await repoA.createTeamCoreStash(conflictTransaction);
       expect(await repoA.mergeRemote()).toEqual({ merged: true, conflicts: [] });
       const conflictReplay = await repoA.planTeamCoreStashReplay(conflictTransaction, conflictStash);
