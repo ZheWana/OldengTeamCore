@@ -249,7 +249,10 @@ export class S3Transport {
     let offset = 0;
     while (offset < expectedSize) {
       const end = Math.min(offset + chunkSize, expectedSize) - 1;
-      const response = await this.request("GET", key, undefined, undefined, {}, { range: `bytes=${offset}-${end}` });
+      // `Range` is optional in SigV4. Obsidian's native request bridge may
+      // normalize this transport header, so keeping it outside SignedHeaders
+      // avoids a signature mismatch while preserving byte-range semantics.
+      const response = await this.request("GET", key, undefined, undefined, {}, { range: `bytes=${offset}-${end}` }, ["range"]);
       if (response.status === 404) throw new S3NotFoundError(key);
       if (response.status < 200 || response.status >= 300) throw await this.httpError("GET", key, response);
       if (response.status !== 206) throw new S3PermanentError(`S3 range request was not honored for ${key}`);
@@ -344,7 +347,7 @@ export class S3Transport {
     await this.deleteObject(this.objectKey(hash));
   }
 
-  private async request(method: string, key: string, body?: ArrayBuffer, contentType?: string, query: Record<string, string> = {}, extraHeaders: Record<string, string> = {}): Promise<S3Response> {
+  private async request(method: string, key: string, body?: ArrayBuffer, contentType?: string, query: Record<string, string> = {}, extraHeaders: Record<string, string> = {}, unsignedHeaders: readonly string[] = []): Promise<S3Response> {
     if (!this.enabled()) throw new Error("S3 settings are incomplete");
     const canonicalQuery = Object.entries(query)
       .map(([name, value]) => [encodeQuery(name), encodeQuery(value)] as const)
@@ -363,7 +366,8 @@ export class S3Transport {
     };
     if (contentType) headers["content-type"] = contentType;
     for (const [name, value] of Object.entries(extraHeaders)) headers[name.toLowerCase()] = value;
-    const signedHeaderNames = Object.keys(headers).sort();
+    const excludedFromSignature = new Set(unsignedHeaders.map((name) => name.toLowerCase()));
+    const signedHeaderNames = Object.keys(headers).filter((name) => !excludedFromSignature.has(name)).sort();
     const canonicalHeaders = signedHeaderNames.map((name) => `${name}:${headers[name].trim()}\n`).join("");
     const canonicalRequest = [method, parsed.pathname, canonicalQuery, canonicalHeaders, signedHeaderNames.join(";"), payloadHash].join("\n");
     const scope = `${stamp.short}/${this.settings.s3Region}/s3/aws4_request`;

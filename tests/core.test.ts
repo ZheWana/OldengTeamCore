@@ -1690,6 +1690,7 @@ describe("S3 transport", () => {
     const data = new TextEncoder().encode("0123456789abcdefghijklmnopqrstuv");
     const hash = await sha256Hex(data);
     const ranges: string[] = [];
+    const authorizationHeaders: string[] = [];
     const server = createServer((request, response) => {
       if (request.method === "HEAD") {
         response.writeHead(200, { "content-length": String(data.byteLength) });
@@ -1698,6 +1699,7 @@ describe("S3 transport", () => {
       }
       const range = /^bytes=(\d+)-(\d+)$/.exec(request.headers.range ?? "");
       if (!range) { response.writeHead(416); response.end(); return; }
+      authorizationHeaders.push(String(request.headers.authorization ?? ""));
       const start = Number(range[1]);
       const end = Number(range[2]);
       ranges.push(`${start}-${end}`);
@@ -1715,6 +1717,8 @@ describe("S3 transport", () => {
       const transport = new S3Transport(settings({ s3Endpoint: `http://127.0.0.1:${address.port}` }), logger);
       await transport.downloadInChunks(hash, data.byteLength, async (chunk) => { chunks.push(new Uint8Array(chunk)); }, 8);
       expect(ranges).toEqual(["0-7", "8-15", "16-23", "24-31"]);
+      expect(authorizationHeaders).toHaveLength(4);
+      expect(authorizationHeaders.every((value) => !/SignedHeaders=[^,]*range/.test(value))).toBe(true);
       expect(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))).toEqual(Buffer.from(data));
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
