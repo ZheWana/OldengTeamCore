@@ -13,7 +13,7 @@ import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateMa
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
 import { createAttachmentStore } from "../src/attachment-store";
 import { createPrivateRemote, PrivateNotesSynchronizer, type PrivateSyncRemote } from "../src/private-sync";
-import { classifyPrivateLocalChange, classifyPublicFolderDeletionPaths, classifyPublicLocalChange, groupRemoteDeletionPaths, isPublicPluginConfigurationPath, mergePendingPublicMove, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, takePendingPaths } from "../src/sync";
+import { classifyPrivateLocalChange, classifyPublicFolderDeletionPaths, classifyPublicLocalChange, groupRemoteDeletionPaths, isPublicPluginConfigurationPath, mergePendingPublicMove, planPrivateDraftPublication, planPublicNotePrivatization, pushWithNonFastForwardRetry, shouldCommitManagedChanges, shouldMaterializeRemoteAttachment, shouldNormalizeMovedAttachment, shouldProtectMismatchedLocalAttachment, shouldPublishPrivateDraftRename, shouldTrackPrivateSyncEvent, shouldTrackVaultEvent, SyncCoordinator, takePendingPaths, type RemoteDeletionGroups } from "../src/sync";
 import { assetPathForHash, collectMarkdownReferences, collectPrivateAttachmentReferences, ensureAssetsExcluded, hashFromAssetPath, isAssetPath, isConfigPath, isHiddenAssetsFolderPath, isImageAttachmentPath, isManagedPath, isPrivateAssetPath, isPrivatePath, isRootAssetsPath, isTrashPath, legacyHashFromAssetPath, listRemoteOverwriteFiles, normalizeVaultPath, pastedImageExtension, pastedImageTargetPath, planFastRemoteReset, pruneEmptyManagedFolders, rewriteAssetReferences } from "../src/vault";
 import { applySharedPluginState, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, readSharedPluginIdsFromGitignore, readSharedPluginState, serializeSharedPluginState, updateSharedPluginsInGitignore, writeSharedPluginState } from "../src/shared-plugins";
 import { DEFAULT_SETTINGS, type Logger, type TeamCoreSettings } from "../src/types";
@@ -187,6 +187,30 @@ class NodeVault implements BinaryVault {
   rename(path: string, newPath: string): Promise<void> {
     return rename(this.resolve(path), this.resolve(newPath));
   }
+}
+
+function coordinatorTestApp(vault: NodeVault): App {
+  const adapter = {
+    readBinary: (path: string) => vault.read(path),
+    writeBinary: (path: string, data: ArrayBuffer) => vault.write(path, data),
+    appendBinary: (path: string, data: ArrayBuffer) => vault.append(path, data),
+    exists: (path: string) => vault.exists(path),
+    stat: (path: string) => vault.stat(path),
+    list: (path: string) => vault.list(path),
+    mkdir: (path: string) => vault.mkdir(path),
+    remove: (path: string) => vault.remove(path),
+    rmdir: (path: string, _recursive?: boolean) => vault.rmdir(path),
+    rename: (path: string, newPath: string) => vault.rename(path, newPath),
+    getResourcePath: () => ""
+  };
+  return {
+    vault: {
+      adapter,
+      configDir: ".obsidian",
+      getAbstractFileByPath: () => null,
+      getFiles: () => []
+    }
+  } as unknown as App;
 }
 
 class CountingVault extends NodeVault {
@@ -3347,6 +3371,91 @@ describe("Git repository adapter", () => {
       await repoA.push();
       expect(await runGit(["show", "main:notes/conflict.md"], bare)).toBe("combined");
       expect(await runGit(["log", "--format=%s", "main"], bare)).not.toContain("Team Core replay");
+    } finally {
+      if (server) await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("asks the coordinator's distinct confirmation callbacks before public configuration or bulk content changes are pushed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-confirmation-callbacks-"));
+    const bare = join(root, "repo.git");
+    const seed = join(root, "seed");
+    const client = join(root, "client");
+    let server: Awaited<ReturnType<typeof startGitHttpServer>> | undefined;
+    try {
+      await runGit(["init", "--bare", bare]);
+      await runGit(["symbolic-ref", "HEAD", "refs/heads/main"], bare);
+      await runGit(["config", "http.receivepack", "true"], bare);
+      await mkdir(seed);
+      await runGit(["init"], seed);
+      await runGit(["checkout", "-b", "main"], seed);
+      await runGit(["config", "user.name", "Seed"], seed);
+      await runGit(["config", "user.email", "seed@example.test"], seed);
+      await mkdir(join(seed, "notes"), { recursive: true });
+      await mkdir(join(seed, ".team"), { recursive: true });
+      await mkdir(join(seed, ".obsidian", "plugins", "calendar"), { recursive: true });
+      for (let index = 1; index <= 4; index += 1) await writeFile(join(seed, "notes", `delete-${index}.md`), `delete ${index}\n`);
+      await writeFile(join(seed, ".gitignore"), updateSharedPluginsInGitignore("assets/\n私人笔记/\n", ".obsidian", ["calendar"]));
+      await writeFile(join(seed, ".team", "shared-plugins.json"), serializeSharedPluginState([]));
+      await writeFile(join(seed, ".obsidian", "plugins", "calendar", "data.json"), "{\"version\":1}\n");
+      await runGit(["add", "."], seed);
+      await runGit(["commit", "-m", "Base"], seed);
+      const baseHead = await runGit(["rev-parse", "HEAD"], seed);
+      await runGit(["remote", "add", "origin", bare], seed);
+      await runGit(["push", "origin", "main"], seed);
+
+      server = await startGitHttpServer(root, async () => undefined);
+      const vault = new NodeVault(client);
+      await vault.mkdir("");
+      const currentSettings = settings({ gitUrl: server.url, autoSync: false });
+      const configPrompts: PublicWorktreeChange[][] = [];
+      const deletionPrompts: RemoteDeletionGroups[] = [];
+      const coordinator = new SyncCoordinator(coordinatorTestApp(vault), () => currentSettings, {
+        onSnapshot() {},
+        onNotice() {},
+        onRestartRequired() {},
+        onPrivateSyncState: async (state) => { currentSettings.privateSyncState = state; },
+        confirmPublicConfigurationChanges: async (changes) => {
+          configPrompts.push([...changes]);
+          return false;
+        },
+        confirmRemoteDeletions: async (groups) => {
+          deletionPrompts.push(groups);
+          return { confirmed: false, restorePaths: [] };
+        }
+      }, logger);
+      const repository = new GitRepository(vault, currentSettings, logger, ".obsidian");
+      await repository.clone();
+      await coordinator.refreshState();
+
+      await vault.write(".obsidian/plugins/calendar/data.json", encode("{\"version\":2}\n"));
+      coordinator.markManagedPathChanged(".obsidian/plugins/calendar/data.json");
+      await coordinator.runManual();
+      expect(configPrompts).toEqual([[
+        { path: ".gitignore", status: "modified" },
+        { path: ".obsidian/plugins/calendar/data.json", status: "modified" }
+      ]]);
+      expect(deletionPrompts).toEqual([]);
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(baseHead);
+
+      await repository.discardManagedPathChange(".gitignore");
+      await repository.discardManagedPathChange(".obsidian/plugins/calendar/data.json");
+      await coordinator.refreshState();
+      for (let index = 1; index <= 4; index += 1) {
+        const path = `notes/delete-${index}.md`;
+        await vault.remove(path);
+        coordinator.markManagedPathChanged(path);
+      }
+      await coordinator.runManual();
+      expect(deletionPrompts).toEqual([{
+        knowledgePaths: ["notes/delete-1.md", "notes/delete-2.md", "notes/delete-3.md", "notes/delete-4.md"],
+        configurationPaths: [],
+        folders: [],
+        moves: []
+      }]);
+      expect(configPrompts).toHaveLength(1);
+      expect(await runGit(["rev-parse", "refs/heads/main"], bare)).toBe(baseHead);
     } finally {
       if (server) await server.close();
       await rm(root, { recursive: true, force: true });
