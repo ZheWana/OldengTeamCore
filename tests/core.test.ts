@@ -2118,7 +2118,9 @@ describe("Git repository adapter", () => {
       await repo.stageManagedEventPath("notes/plan.md");
       expect(await repo.listPublicStagedChanges()).toEqual([{ path: "notes/plan.md", status: "modified" }]);
       expect(await repo.hasStagedPublicChanges()).toBe(true);
-      await repo.commitStaged("Update vault");
+      const commit = await repo.commitStaged((changes) => `Update vault: ${changes.length} files`);
+      if (!commit) throw new Error("Expected staged commit");
+      expect((await git.readCommit({ fs: repo.fs, dir: "", oid: commit })).commit.message).toBe("Update vault: 1 files\n");
       expect(await repo.listPublicStagedChanges()).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -2649,6 +2651,38 @@ describe("Git repository adapter", () => {
       expect((await secondAuthor.fileAuthorsIndex()).has("私人笔记/秘密.md")).toBe(false);
       expect(await secondAuthor.fileAuthors("notes/missing.md")).toEqual([]);
       expect(await secondAuthor.logSince(Date.now() - 60_000)).toHaveLength(3);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not attribute remote document content to the user who created a merge commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-merge-authors-"));
+    try {
+      const vault = new NodeVault(root);
+      const alice = new GitRepository(vault, settings({ gitUsername: "Alice" }), logger, ".obsidian");
+      await alice.init();
+      await vault.write("notes/shared.md", encode("base\n"));
+      await alice.commit("Base");
+      await git.branch({ fs: alice.fs, dir: "", ref: "remote" });
+
+      await git.checkout({ fs: alice.fs, dir: "", ref: "remote" });
+      await vault.write("notes/shared.md", encode("written by bob\n"));
+      const bob = new GitRepository(vault, settings({ gitUsername: "Bob" }), logger, ".obsidian");
+      const remoteCommit = await bob.commit("Bob edits shared note");
+      if (!remoteCommit) throw new Error("Expected remote commit");
+
+      await git.checkout({ fs: alice.fs, dir: "", ref: "main" });
+      await vault.write("notes/local.md", encode("written by carol\n"));
+      const carol = new GitRepository(vault, settings({ gitUsername: "Carol" }), logger, ".obsidian");
+      await carol.commit("Carol adds another note");
+      await git.writeRef({ fs: alice.fs, dir: "", ref: "refs/remotes/origin/main", value: remoteCommit, force: true });
+      await expect(carol.mergeRemote()).resolves.toEqual({ merged: true, conflicts: [] });
+
+      const head = await git.resolveRef({ fs: alice.fs, dir: "", ref: "HEAD" });
+      expect((await git.readCommit({ fs: alice.fs, dir: "", oid: head })).commit.parent).toHaveLength(2);
+      expect(await carol.fileAuthors("notes/shared.md")).toEqual(["Alice", "Bob"]);
+      expect((await carol.fileAuthorsIndex()).get("notes/shared.md")).toEqual(["Bob", "Alice"]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

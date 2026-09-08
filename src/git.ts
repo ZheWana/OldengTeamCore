@@ -1190,13 +1190,19 @@ export class GitRepository {
   }
 
   /** Commit the existing managed index delta without re-reading the worktree. */
-  async commitStaged(message: string): Promise<string | undefined> {
+  /**
+   * Build the message from the repaired, final index when the caller wants to
+   * describe a file count. Event queues are only scheduling hints and can be
+   * coalesced, rewritten, or eliminated by a remote replay.
+   */
+  async commitStaged(message: string | ((changes: readonly PublicWorktreeChange[]) => string)): Promise<string | undefined> {
     await this.repairIndexBoundary();
     const changed = await this.listPublicStagedChanges();
     if (!changed.length) return undefined;
     const username = this.settings.gitUsername.trim() || "unknown";
     const email = `${username.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}@knowledgebase.local`;
-    const oid = await git.commit({ fs: this.fs, dir: "", message, author: { name: username, email }, committer: { name: username, email } });
+    const resolvedMessage = typeof message === "function" ? message(changed) : message;
+    const oid = await git.commit({ fs: this.fs, dir: "", message: resolvedMessage, author: { name: username, email }, committer: { name: username, email } });
     this.logger.debug("Created Git commit from staged public changes", { oid, files: changed.map((change) => change.path) });
     return oid;
   }
@@ -1650,6 +1656,10 @@ export class GitRepository {
     });
     const authors = new Set<string>();
     for (const entry of entries.reverse()) {
+      // A merge commit records who integrated two histories, not who wrote
+      // every path inherited from its second parent. The source commits remain
+      // in this file's history and are the only valid content attribution.
+      if (entry.commit.parent.length > 1) continue;
       const author = entry.commit.author.name.trim();
       if (author) authors.add(author);
     }
@@ -1680,6 +1690,13 @@ export class GitRepository {
     const cache = {};
     const configDirectory = normalizeVaultPath(this.configDir);
     for (const [index, entry] of commits.entries()) {
+      // Compare only ordinary content commits. A merge's first-parent diff can
+      // contain many remote files while its author is merely the synchronizing
+      // device, which would otherwise pollute per-document author statistics.
+      if (entry.commit.parent.length > 1) {
+        onProgress?.(index + 1, commits.length);
+        continue;
+      }
       const author = entry.commit.author.name.trim();
       if (author) {
         const parent = entry.commit.parent[0] ?? EMPTY_TREE_OID;

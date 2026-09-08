@@ -1934,7 +1934,7 @@ export class SyncCoordinator {
       }
       if (await git.hasStagedPublicChanges()) {
         this.startProgress("提交本地更改", 1);
-        await git.commitStaged(`Update vault`);
+        await git.commitStaged((changes) => `Update vault: ${changes.length} files`);
         this.hasPublicStagedChanges = false;
         this.advanceProgress();
       }
