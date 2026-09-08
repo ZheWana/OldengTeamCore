@@ -20,6 +20,12 @@ const SHARED_PLUGIN_FORCE_CONTENT_CHECK_EVERY = 20;
 const FULL_IMPORT_ATTACHMENT_RETRY_DELAYS_MS = [1_000, 3_000] as const;
 /** Three distinct access denials are overwhelmingly a configuration issue, not one bad object. */
 const FULL_IMPORT_MAX_DISTINCT_403 = 3;
+/**
+ * Obsidian may emit a modified event shortly after a vault.rename/write has
+ * resolved. Keep one short-lived proof of a just-materialized remote object,
+ * so that delayed event is not mistaken for a user edit and re-synchronized.
+ */
+const SETTLED_REMOTE_ATTACHMENT_EVENT_TTL_MS = 10_000;
 
 function isVaultFile(value: unknown): value is TFile {
   return typeof TFile === "function" && value instanceof TFile;
@@ -98,6 +104,14 @@ interface DeferredAttachmentDownload {
   path: string;
   entry: AssetManifestEntry;
   error: unknown;
+}
+
+interface SettledRemoteAttachmentWrite {
+  sha256: string;
+  size: number;
+  expiresAt: number;
+  /** A rename event is normally consumed immediately; allow one later change event. */
+  remainingEvents: number;
 }
 
 export interface MarkdownSnapshot {
@@ -407,6 +421,8 @@ export class SyncCoordinator {
   private privateStatePersistence: Promise<void> = Promise.resolve();
   private internalMarkdownWrites = new Set<string>();
   private internalAssetWrites = new Set<string>();
+  /** Successful remote attachment writes awaiting one delayed Vault event. */
+  private settledRemoteAttachmentWrites = new Map<string, SettledRemoteAttachmentWrite>();
   /** Exact public paths written by a Team Core Git transaction, not user edits. */
   private internalManagedWrites = new Set<string>();
   private internalDraftNoteMoves = new Set<string>();
@@ -535,6 +551,7 @@ export class SyncCoordinator {
     const path = normalizeVaultPath(file.path);
     if (this.internalManagedWrites.delete(path)) return;
     if (this.internalAssetWrites.delete(path)) return;
+    if (this.consumeSettledRemoteAttachmentWrite(path, file.stat.size)) return;
     if (isPrivatePath(path)) {
       if (!shouldTrackPrivateSyncEvent(this.settings())) return;
       this.queuePrivatePaths([this.privateRelativePath(path)]);
@@ -560,6 +577,50 @@ export class SyncCoordinator {
     // is staged immediately and never inferred from this queue.
     if (path.endsWith(".md")) this.pendingFiles.add(path);
     this.stagePublicEvent(path);
+  }
+
+  private rememberSettledRemoteAttachmentWrite(path: string, entry: AssetManifestEntry): void {
+    const normalized = normalizeVaultPath(path);
+    if (!normalized) return;
+    const now = Date.now();
+    this.pruneSettledRemoteAttachmentWrites(now);
+    this.settledRemoteAttachmentWrites.set(normalized, {
+      sha256: entry.sha256,
+      size: entry.size,
+      expiresAt: now + SETTLED_REMOTE_ATTACHMENT_EVENT_TTL_MS,
+      remainingEvents: 1
+    });
+  }
+
+  /**
+   * A delayed event is safe to ignore only for the canonical, content-addressed
+   * destination and expected byte size. Any mismatch immediately gives control
+   * back to the normal local-change path.
+   */
+  private consumeSettledRemoteAttachmentWrite(path: string, size: number): boolean {
+    const normalized = normalizeVaultPath(path);
+    const now = Date.now();
+    this.pruneSettledRemoteAttachmentWrites(now);
+    const write = this.settledRemoteAttachmentWrites.get(normalized);
+    if (!write) return false;
+    if (size !== write.size || hashFromAssetPath(normalized) !== write.sha256) {
+      this.settledRemoteAttachmentWrites.delete(normalized);
+      return false;
+    }
+    write.remainingEvents -= 1;
+    if (write.remainingEvents <= 0) this.settledRemoteAttachmentWrites.delete(normalized);
+    this.logger.debug("Ignored delayed Vault event for materialized remote attachment", {
+      path: normalized,
+      size,
+      remainingEvents: Math.max(0, write.remainingEvents)
+    });
+    return true;
+  }
+
+  private pruneSettledRemoteAttachmentWrites(now = Date.now()): void {
+    for (const [path, write] of this.settledRemoteAttachmentWrites) {
+      if (write.expiresAt <= now) this.settledRemoteAttachmentWrites.delete(path);
+    }
   }
 
   markManagedPathChanged(path: string): void {
@@ -2908,6 +2969,7 @@ export class SyncCoordinator {
           await attachmentStore.downloadInChunks(entry.sha256, entry.size, (chunk) => vault.append(temporaryPath, chunk));
           this.logger.debug("Attachment Vault write started", { path, size: entry.size });
           await vault.rename(temporaryPath, path);
+          this.rememberSettledRemoteAttachmentWrite(path, entry);
         } finally {
           this.internalAssetWrites.delete(path);
           if (await vault.exists(temporaryPath)) await vault.remove(temporaryPath);
@@ -2918,7 +2980,13 @@ export class SyncCoordinator {
         const data = await attachmentStore.download(entry.sha256);
         if (data.byteLength !== entry.size) throw new Error(`附件大小校验失败：${path}`);
         this.logger.debug("Attachment Vault write started", { path, size: data.byteLength });
-        await vault.write(path, data);
+        this.internalAssetWrites.add(path);
+        try {
+          await vault.write(path, data);
+          this.rememberSettledRemoteAttachmentWrite(path, entry);
+        } finally {
+          this.internalAssetWrites.delete(path);
+        }
         this.logger.debug("Attachment Vault write completed", { path, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
         this.logger.debug("Attachment download completed", { path, hash: entry.sha256, size: data.byteLength, durationMs: Date.now() - downloadStartedAt });
       }

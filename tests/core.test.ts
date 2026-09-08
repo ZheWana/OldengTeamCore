@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Vault } from "obsidian";
+import type { TFile, Vault } from "obsidian";
 import { mkdtemp, mkdir, open, readdir, readFile, rm, stat, rename, writeFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -1987,6 +1987,26 @@ describe("remote attachment materialization", () => {
     expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "device-a", "device-a", "wangzhe")).toBe(true);
     expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", "device-b", "device-a", "wangzhe")).toBe(false);
     expect(shouldProtectMismatchedLocalAttachment(true, "wangzhe", undefined, "device-a", "wangzhe")).toBe(true);
+  });
+
+  it("does not requeue a delayed Vault event from a materialized remote attachment", () => {
+    const currentSettings = settings({ autoSync: false });
+    const coordinator = new SyncCoordinator(coordinatorTestApp({} as NodeVault), () => currentSettings, {
+      onSnapshot() {}, onNotice() {}, onRestartRequired() {}, onPrivateSyncState() {}
+    }, logger);
+    const path = `assets/tc-sha256-${entry.sha256}.png`;
+    (coordinator as unknown as {
+      rememberSettledRemoteAttachmentWrite(path: string, entry: typeof entry): void;
+      pendingAssets: Set<string>;
+    }).rememberSettledRemoteAttachmentWrite(path, entry);
+
+    // Obsidian can deliver this after vault.rename/write has already resolved.
+    coordinator.markFileChanged({ path, stat: { size: entry.size } } as TFile);
+    expect((coordinator as unknown as { pendingAssets: Set<string> }).pendingAssets).toEqual(new Set());
+
+    // The short-lived record is consumed once; a later real edit still queues.
+    coordinator.markFileChanged({ path, stat: { size: entry.size } } as TFile);
+    expect((coordinator as unknown as { pendingAssets: Set<string> }).pendingAssets).toEqual(new Set([path]));
   });
 
   it("defers one transient 403 during a full import and continues with later attachments", async () => {
