@@ -2688,6 +2688,33 @@ describe("Git repository adapter", () => {
     }
   });
 
+  it("attributes a document to the merger when a conflict resolution creates new content", async () => {
+    const root = await mkdtemp(join(tmpdir(), "team-core-merge-resolution-author-"));
+    try {
+      const { vault, repo, localCommit, remoteCommit } = await createDivergence(
+        root,
+        { "notes/shared.md": "base\n" },
+        { "notes/shared.md": "local version\n" },
+        { "notes/shared.md": "remote version\n" }
+      );
+      await vault.write("notes/shared.md", encode("merged by carol\n"));
+      await git.add({ fs: repo.fs, dir: "", filepath: "notes/shared.md" });
+      const mergeCommit = await git.commit({
+        fs: repo.fs,
+        dir: "",
+        message: "Carol resolves conflict",
+        parent: [localCommit, remoteCommit],
+        author: { name: "Carol", email: "carol@example.test" },
+        committer: { name: "Carol", email: "carol@example.test" }
+      });
+      expect((await git.readCommit({ fs: repo.fs, dir: "", oid: mergeCommit })).commit.parent).toHaveLength(2);
+      expect(await repo.fileAuthors("notes/shared.md")).toEqual(["Alice.Example", "Carol"]);
+      expect((await repo.fileAuthorsIndex()).get("notes/shared.md")).toEqual(["Carol", "Alice.Example"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("summarizes document, shared-plugin, and attachment changes without exposing implementation paths", async () => {
     const root = await mkdtemp(join(tmpdir(), "team-core-commit-changes-"));
     try {

@@ -1656,10 +1656,12 @@ export class GitRepository {
     });
     const authors = new Set<string>();
     for (const entry of entries.reverse()) {
-      // A merge commit records who integrated two histories, not who wrote
-      // every path inherited from its second parent. The source commits remain
-      // in this file's history and are the only valid content attribution.
-      if (entry.commit.parent.length > 1) continue;
+      // A merge records who integrated histories, not necessarily who wrote
+      // each path inherited from a parent. Retain it only if the resulting
+      // blob differs from every parent: that is a genuine conflict-resolution
+      // or manual merge edit by the merger.
+      if (entry.commit.parent.length > 1
+        && !await this.mergeIntroducesPathContent(entry.oid, entry.commit.parent, filepath)) continue;
       const author = entry.commit.author.name.trim();
       if (author) authors.add(author);
     }
@@ -1690,31 +1692,29 @@ export class GitRepository {
     const cache = {};
     const configDirectory = normalizeVaultPath(this.configDir);
     for (const [index, entry] of commits.entries()) {
-      // Compare only ordinary content commits. A merge's first-parent diff can
-      // contain many remote files while its author is merely the synchronizing
-      // device, which would otherwise pollute per-document author statistics.
-      if (entry.commit.parent.length > 1) {
-        onProgress?.(index + 1, commits.length);
-        continue;
-      }
       const author = entry.commit.author.name.trim();
       if (author) {
-        const parent = entry.commit.parent[0] ?? EMPTY_TREE_OID;
         const changed = await walk({
           fs: this.fs,
           dir: "",
-          trees: [TREE({ ref: entry.oid }), TREE({ ref: parent })],
+          trees: [TREE({ ref: entry.oid }), ...entry.commit.parent.map((oid) => TREE({ ref: oid }))],
           cache,
-          map: async (filepath, [current, previous]) => {
-            const entry = current ?? previous;
-            if (!entry) return undefined;
-            if (await entry.type() === "tree") {
+          map: async (filepath, [current, ...parents]) => {
+            const treeEntry = current ?? parents.find(Boolean);
+            if (!treeEntry) return undefined;
+            if (await treeEntry.type() === "tree") {
               return filepath === "assets" || filepath === configDirectory || filepath === "私人笔记" || filepath === ".trash" ? null : undefined;
             }
             if (!filepath.endsWith(".md") || filepath.startsWith(".team/")) return undefined;
             const currentOid = current ? await current.oid() : undefined;
-            const previousOid = previous ? await previous.oid() : undefined;
-            return currentOid === previousOid ? undefined : filepath;
+            const parentOids = await Promise.all(parents.map(async (candidate) => candidate ? candidate.oid() : undefined));
+            if (entry.commit.parent.length > 1) {
+              // The path was inherited unchanged from at least one parent:
+              // this merge did not author it. A new blob relative to every
+              // parent is a deliberate merge-resolution contribution.
+              return currentOid && !parentOids.includes(currentOid) ? filepath : undefined;
+            }
+            return currentOid === parentOids[0] ? undefined : filepath;
           }
         }) as string[];
         for (const path of changed) {
@@ -1726,6 +1726,15 @@ export class GitRepository {
       onProgress?.(index + 1, commits.length);
     }
     return new Map([...authorsByPath.entries()].map(([path, authors]) => [path, [...authors]]));
+  }
+
+  private async mergeIntroducesPathContent(oid: string, parents: readonly string[], filepath: string): Promise<boolean> {
+    const current = await git.readBlob({ fs: this.fs, dir: "", oid, filepath }).then((result) => result.oid).catch(() => undefined);
+    if (!current) return false;
+    const parentOids = await Promise.all(parents.map((parent) => (
+      git.readBlob({ fs: this.fs, dir: "", oid: parent, filepath }).then((result) => result.oid).catch(() => undefined)
+    )));
+    return !parentOids.includes(current);
   }
 
   async hasUncommittedChanges(): Promise<boolean> {
