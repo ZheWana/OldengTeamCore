@@ -31,6 +31,8 @@ export default class TeamCorePlugin extends Plugin {
   private logger!: PluginLogger;
   private conflictEditor: ConflictEditorModal | undefined;
   private mobileSyncProgress: MobileSyncProgressModal | undefined;
+  /** Delay mobile modal opening past the status-bar touch event. */
+  private mobileSyncProgressOpenTimer: number | undefined;
   private openingConflictEditor = false;
   private authorService!: FileAuthorService;
   private lastAuthorRefreshAt: number | undefined;
@@ -177,6 +179,8 @@ export default class TeamCorePlugin extends Plugin {
     this.conflictEditor = undefined;
     this.mobileSyncProgress?.close();
     this.mobileSyncProgress = undefined;
+    if (this.mobileSyncProgressOpenTimer !== undefined) window.clearTimeout(this.mobileSyncProgressOpenTimer);
+    this.mobileSyncProgressOpenTimer = undefined;
     this.coordinator?.stop();
   }
 
@@ -368,16 +372,27 @@ export default class TeamCorePlugin extends Plugin {
   private updateMobileSyncProgress(snapshot: SyncSnapshot): void {
     if (!Platform.isMobile) return;
     if (snapshot.state === "syncing") {
-      if (!this.mobileSyncProgress) {
-        this.mobileSyncProgress = new MobileSyncProgressModal(this.app, snapshot, () => {
-          this.mobileSyncProgress = undefined;
-        });
-        this.mobileSyncProgress.open();
-      } else {
+      if (this.mobileSyncProgress) {
         this.mobileSyncProgress.setSnapshot(snapshot);
+      } else if (this.mobileSyncProgressOpenTimer === undefined) {
+        // On phones, opening a modal within the same touch turn that clicked
+        // the status bar lets that touch reach the modal backdrop and close it
+        // immediately. Yield once so the initiating touch has fully settled.
+        this.mobileSyncProgressOpenTimer = window.setTimeout(() => {
+          this.mobileSyncProgressOpenTimer = undefined;
+          if (this.latestSnapshot.state !== "syncing" || this.mobileSyncProgress) return;
+          let modal: MobileSyncProgressModal;
+          modal = new MobileSyncProgressModal(this.app, this.latestSnapshot, () => {
+            if (this.mobileSyncProgress === modal) this.mobileSyncProgress = undefined;
+          });
+          this.mobileSyncProgress = modal;
+          modal.open();
+        }, 0);
       }
       return;
     }
+    if (this.mobileSyncProgressOpenTimer !== undefined) window.clearTimeout(this.mobileSyncProgressOpenTimer);
+    this.mobileSyncProgressOpenTimer = undefined;
     if (this.mobileSyncProgress) {
       this.mobileSyncProgress.close();
       this.mobileSyncProgress = undefined;
