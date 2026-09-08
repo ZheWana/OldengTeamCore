@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.27 - 2026-09-08
+
+- Rework public synchronization into a durable pull-first transaction: safely fetch and integrate remote changes, replay local staged work with three-way merging, then request destructive/configuration confirmation and push. Identical remote changes no longer create duplicate commits; real conflicts continue in the conflict editor.
+- Make full attachment imports resilient to temporary object-store failures, add bounded retry and access-denial diagnostics, and fix ranged S3 downloads in environments that normalize `Range` headers.
+- Avoid a redundant attachment synchronization cycle when Obsidian emits a delayed event for a just-downloaded remote attachment.
+- Keep the mobile synchronization-progress modal open after tapping the status bar.
+- Generate `Update vault: N files` from the final Git index, and attribute document authors through merges precisely: inherited parent content is not assigned to the merger, while a genuine manual conflict-resolution result is.
+- Add detailed, redacted timing diagnostics for Git fetch, remote diff assessment, merge, and attachment materialization.
+
 ## 0.1.21 - 2026-08-30
 
 - Add a protected Git author display-name manager with case-insensitive local mappings, consistent author rendering across titles/history/statistics/status, and configuration-string import/export support. Mappings do not rewrite Git history or server accounts.
