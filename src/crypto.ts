@@ -1,5 +1,15 @@
 const encoder = new TextEncoder();
 
+/**
+ * Return an owned ArrayBuffer for APIs that reject SharedArrayBuffer-backed
+ * typed arrays. The copy also isolates the result from later source changes.
+ */
+export function copyToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
 export function bytesToHex(bytes: ArrayBuffer | Uint8Array): string {
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   return Array.from(view, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -14,13 +24,13 @@ export function hexToBytes(hex: string): Uint8Array {
 
 export async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<string> {
   const bytes = typeof data === "string" ? encoder.encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data);
-  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const buffer = copyToArrayBuffer(bytes);
   return bytesToHex(await crypto.subtle.digest("SHA-256", buffer));
 }
 
 export async function hmacSha256(key: ArrayBuffer | Uint8Array | string, data: string): Promise<ArrayBuffer> {
   const keyBytes = typeof key === "string" ? encoder.encode(key) : key instanceof Uint8Array ? key : new Uint8Array(key);
-  const keyData = keyBytes.buffer.slice(keyBytes.byteOffset, keyBytes.byteOffset + keyBytes.byteLength) as ArrayBuffer;
+  const keyData = copyToArrayBuffer(keyBytes);
   const cryptoKey = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return crypto.subtle.sign("HMAC", cryptoKey, encoder.encode(data));
 }

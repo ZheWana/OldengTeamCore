@@ -7,6 +7,7 @@ import { DEFAULT_BRANCH, FILE_AUTHORS_PATH, MANIFEST_PATH, PRIVATE_FOLDER } from
 import { mergeAssetManifests, serializeManifest, validateManifest } from "./manifest";
 import { isPotentialPluginPath, isSharedPluginPath, mergeSharedPluginIds, mergeSharedPluginState, parseSharedPluginState, pluginIdFromPath, readSharedPluginIds, readSharedPluginIdsFromGitignore, readSharedPluginState, SHARED_PLUGIN_STATE_PATH, serializeSharedPluginState, stripSharedPluginsFromGitignore, updateSharedPluginsInGitignore, writeSharedPluginIds } from "./shared-plugins";
 import { mergeFileAuthorRegistries, parseFileAuthorRegistry, serializeFileAuthorRegistry } from "./file-authors";
+import { copyToArrayBuffer } from "./crypto";
 
 const CONFLICT_STATE_PATH = ".git/team-core-conflict.json";
 const LINEBREAKS = /^.*(\r?\n|$)/gm;
@@ -223,7 +224,7 @@ function teamCoreMergeDriver(params: MergeDriverParams, configDir: string): { cl
 async function collectGitBody(body: GitHttpRequest["body"]): Promise<ArrayBuffer | undefined> {
   if (!body) return undefined;
   if (body instanceof ArrayBuffer) return body;
-  if (body instanceof Uint8Array) return body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
+  if (body instanceof Uint8Array) return copyToArrayBuffer(body);
   const chunks: Uint8Array[] = [];
   for await (const chunk of body) chunks.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
   const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
@@ -334,7 +335,7 @@ export function createGitFs(vault: BinaryVault) {
   };
   const write = async (path: string, data: string | Uint8Array | ArrayBuffer): Promise<void> => {
     const value = typeof data === "string" ? new TextEncoder().encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data);
-    await vault.write(cleanPath(path), value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer);
+    await vault.write(cleanPath(path), copyToArrayBuffer(value));
   };
   return {
     promises: {
@@ -531,7 +532,7 @@ export class GitRepository {
     if (!head) return undefined;
     try {
       const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid: head, filepath });
-      return blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+      return copyToArrayBuffer(blob);
     } catch {
       return undefined;
     }
@@ -768,7 +769,7 @@ export class GitRepository {
           if (await this.vault.exists(path)) await this.vault.remove(path);
           await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
         } else {
-          const data = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength) as ArrayBuffer;
+          const data = copyToArrayBuffer(content);
           await this.vault.write(path, data);
           await git.add({ fs: this.fs, dir: "", filepath: path });
         }
@@ -798,7 +799,7 @@ export class GitRepository {
           await git.remove({ fs: this.fs, dir: "", filepath: path }).catch(() => undefined);
           continue;
         }
-        const data = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength) as ArrayBuffer;
+        const data = copyToArrayBuffer(content);
         await this.vault.write(path, data);
         await git.add({ fs: this.fs, dir: "", filepath: path });
       }
@@ -1417,7 +1418,7 @@ export class GitRepository {
 
   private async writeTreeFile(oid: string, path: string): Promise<void> {
     const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid, filepath: path });
-    const data = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+    const data = copyToArrayBuffer(blob);
     await this.vault.write(path, data);
   }
 
@@ -1460,7 +1461,7 @@ export class GitRepository {
     for (const path of files) {
       if (!isSharedPluginPath(path, this.configDir, sharedPluginIds)) continue;
       const { blob } = await git.readBlob({ fs: this.fs, dir: "", oid: head, filepath: path });
-      const data = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+      const data = copyToArrayBuffer(blob);
       const current = await this.vault.read(path).catch(() => undefined);
       if (current && current.byteLength === data.byteLength) {
         const expected = new Uint8Array(data);

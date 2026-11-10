@@ -5,7 +5,11 @@ import path from "node:path";
 const require = createRequire(import.meta.url);
 const packagePath = require.resolve("obsidian-plugin-validator/package.json");
 const cliPath = path.join(path.dirname(packagePath), "bin", "cli.mjs");
-const result = spawnSync(process.execPath, [cliPath, "."], {
+// `lint:code` is the canonical source gate: it runs the Obsidian recommended
+// rules with this project's current TypeScript compiler and full type data.
+// The packaged validator remains responsible for Obsidian manifest/submission
+// checks, without repeating source lint through its separately bundled stack.
+const result = spawnSync(process.execPath, [cliPath, ".", "--no-lint"], {
   cwd: process.cwd(),
   encoding: "utf8",
   env: { ...process.env, NO_COLOR: "1" }

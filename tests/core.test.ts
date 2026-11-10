@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { exportPrivateSettings, exportSettings, importPrivateSettings, importSettings, mergeSettings } from "../src/config";
-import { base64UrlDecode, base64UrlEncode, base64UrlEncodeBytes, sha256Hex } from "../src/crypto";
+import { base64UrlDecode, base64UrlEncode, base64UrlEncodeBytes, copyToArrayBuffer, sha256Hex } from "../src/crypto";
 import { conflictFilesFromError, GitRepository, isNonFastForwardPushError, isPushReconciliationError, normalizeGitUrl, normalizeRemoteInfo } from "../src/git";
 import { createEmptyManifest, mergeAssetManifests, serializeManifest, validateManifest } from "../src/manifest";
 import { S3_CHUNKED_DOWNLOAD_THRESHOLD, S3_DOWNLOAD_CHUNK_SIZE, S3Transport } from "../src/s3";
@@ -1125,6 +1125,13 @@ describe("crypto helpers", () => {
     expect(encoded).not.toMatch(/[+/=]/);
     expect(base64UrlDecode(encoded)).toBe("团队 / team");
   });
+
+  it("copies only the addressed bytes into an owned ArrayBuffer", () => {
+    const source = new Uint8Array([1, 2, 3, 4]);
+    const copied = copyToArrayBuffer(source.subarray(1, 3));
+    source[1] = 9;
+    expect([...new Uint8Array(copied)]).toEqual([2, 3]);
+  });
 });
 
 describe("file author assignments", () => {
@@ -1483,6 +1490,7 @@ describe("manifest and vault path rules", () => {
     expect(mergeSharedPluginIds(["calendar"], ["calendar", "dataview"], ["calendar", "templater-obsidian"])).toEqual(["calendar", "dataview", "templater-obsidian"]);
     expect(mergeSharedPluginIds(["calendar"], [], ["calendar"])).toEqual([]);
     expect(parseSharedPluginState(serializeSharedPluginState(["calendar"]))).toEqual(["calendar"]);
+    expect(() => parseSharedPluginState('{"version":1,"enabled":["calendar",3]}')).toThrow("插件 ID 数组");
     expect(mergeSharedPluginState(["calendar"], ["calendar", "dataview"], ["calendar", "templater-obsidian"])).toBe(serializeSharedPluginState(["calendar", "dataview", "templater-obsidian"]));
   });
 

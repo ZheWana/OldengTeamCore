@@ -115,8 +115,10 @@ export function mergeSharedPluginIds(base: readonly string[], ours: readonly str
 }
 
 function parsePluginIdArray(value: unknown, label: string): string[] {
-  if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) throw new Error(`${label} 格式无效：应为插件 ID 数组`);
-  return [...new Set(value)];
+  if (!Array.isArray(value)) throw new Error(`${label} 格式无效：应为插件 ID 数组`);
+  const ids = value.filter((id): id is string => typeof id === "string");
+  if (ids.length !== value.length) throw new Error(`${label} 格式无效：应为插件 ID 数组`);
+  return [...new Set(ids)];
 }
 
 export function parseSharedPluginState(content: string): string[] {

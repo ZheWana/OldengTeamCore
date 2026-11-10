@@ -2,7 +2,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": { "@/*": ["src/*"] },
-    "typeRoots": ["node_modules/@types", "node_modules/obsidian"],
+    "types": [],
     "inlineSourceMap": true,
     "inlineSources": true,
     "module": "ESNext",

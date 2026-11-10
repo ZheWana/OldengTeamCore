@@ -3,7 +3,7 @@ import { DEFAULT_SETTINGS } from "./types";
 import { base64UrlDecodeBytes, base64UrlEncodeBytes } from "./crypto";
 import { normalizeAuthorDisplayMappings } from "./author-display";
 import { normalizeVaultPath } from "./vault";
-import { compressSync, decompressSync, strFromU8, strToU8 } from "fflate";
+import { compressSync, decompressSync, strFromU8, strToU8 } from "fflate/browser";
 
 const IMPORT_VERSION = 1;
 const COMPRESSED_PREFIX = "tc1.";
